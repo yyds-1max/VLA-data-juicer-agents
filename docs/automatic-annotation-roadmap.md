@@ -1,7 +1,7 @@
 # 自动标注板块总体开发路线
 
-> 状态：M0～M2 已冻结；M3、M4 暂不启动
-> 最后更新：2026-07-31
+> 状态：M0～M2 已冻结；M3 本地实现完成、待服务器迁移与验收；M4 延期
+> 最后更新：2026-08-09
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
 
@@ -15,7 +15,7 @@ M0 契约与 Runtime 基线
 → M1.5 Tailwind 4 与 Radix/shadcn 设计系统基线
 → M2 DataPilot 主导的完整后处理与三维人工复核/Fix
 → M3 数据管理、仪表盘与跨页面状态整合
-→ M4 DataPilot/模型辅助复核与 AI 候选 Fix
+→ M4 DataPilot/模型辅助复核与 AI 候选 Fix（延期，不作为当前收尾门禁）
 ```
 
 进入每个里程碑前，先根据仓库、服务器和上一个里程碑的实际结果建立当期任务级计划：
@@ -557,3 +557,25 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   `docs/automatic-annotation-m2-plan.md` 第 18.4 节；
 - M2 至此完整冻结。M3 暂不启动；下一阶段先独立进行小功能、智能体模块和前端
   UI/交互优化，不能借此扩大或改写 M3/M4 范围。
+
+### M3（2026-08-09，本地实现完成，待服务器验收）
+
+- 开发基线固定为 `5253d23`，开发分支为
+  `codex/automatic-annotation-m3`；权威任务级计划为
+  `docs/automatic-annotation-m3-plan.md`；
+- 数据管理页保留 ingestion 状态，并从 `AnnotationStore` 联合展示标注生命周期、
+  内部单元数量、部分完成状态及 Job/Review/历史已验证资产深链；
+- 仪表盘“已标注数据”改为服务端真实聚合，只展示已标注 clip、segment 和覆盖率，
+  不承载逐状态审核队列；
+- 导航数据摘要 API 在原响应中增加 Annotation 生命周期与汇总，不改变原始、拆解、
+  同步扫描事实；显式刷新只重新读取当前事实，不触发 Runtime；
+- Annotation schema 增加不可变历史已验证资产账本。历史
+  `*_trajectory_fix_five.json` 只能在服务停止时通过显式清单、根目录约束、JSON
+  解析和 SHA-256 校验后导入；默认 dry-run，`--apply` 才写入；
+- 所有普通产品按钮统一为“交给 DataPilot”；M3 未修改 Router、
+  NavigationDataAgent、Plan、Runtime、Tracking、后处理或 Fix 业务动作；
+- M4 因模型辅助复核的现实收益和可行性尚不明确而延期，不影响 M3 完成后收口
+  当前自动标注业务链；
+- 当前只完成本地实现与回归。服务器 schema v9 迁移、历史清单 dry-run/apply、
+  页面真实数据统计和公开脱敏验收仍待公司网络恢复后单独执行；在这些门禁通过前，
+  M3 不标记为服务器冻结。

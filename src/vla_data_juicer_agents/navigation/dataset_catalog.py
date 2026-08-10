@@ -11,6 +11,17 @@ from vla_data_juicer_agents.navigation.models import _validate_date
 
 
 ClipStatus = Literal["raw_only", "extracted", "synced", "error"]
+AnnotationLifecycleStatus = Literal[
+    "not_started",
+    "processing",
+    "waiting_initial_annotation",
+    "annotated_pending_review",
+    "verified",
+    "returned",
+    "discarded",
+    "failed",
+    "partial",
+]
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 EXPECTED_SCAN_ERRORS = (
     OSError,
@@ -51,6 +62,54 @@ class SyncSequenceSummary(BaseModel):
     frame_counts: SyncFrameCounts = Field(default_factory=SyncFrameCounts)
 
 
+class AnnotationLifecycleCounts(BaseModel):
+    total: int = 0
+    not_started: int = 0
+    processing: int = 0
+    waiting_initial_annotation: int = 0
+    annotated_pending_review: int = 0
+    verified: int = 0
+    returned: int = 0
+    discarded: int = 0
+    failed: int = 0
+
+    def plus(self, other: "AnnotationLifecycleCounts") -> "AnnotationLifecycleCounts":
+        return AnnotationLifecycleCounts(
+            **{
+                field: getattr(self, field) + getattr(other, field)
+                for field in type(self).model_fields
+            }
+        )
+
+
+class AnnotationLifecycleProjection(BaseModel):
+    status: AnnotationLifecycleStatus = "not_started"
+    counts: AnnotationLifecycleCounts = Field(
+        default_factory=AnnotationLifecycleCounts,
+    )
+    completed_unit_count: int = 0
+    annotated_unit_count: int = 0
+    verified_unit_count: int = 0
+    job_ref: str | None = None
+    review_ref: str | None = None
+    verified_review_ref: str | None = None
+    historical_asset_ref: str | None = None
+    updated_at: str | None = None
+    source: Literal[
+        "none",
+        "native",
+        "historical_import",
+        "mixed",
+    ] = "none"
+
+
+class AnnotationDatasetTotals(BaseModel):
+    annotated_clip_count: int = 0
+    verified_clip_count: int = 0
+    annotated_unit_count: int = 0
+    verified_unit_count: int = 0
+
+
 class ClipSummary(BaseModel):
     date: str
     clip: str
@@ -63,6 +122,7 @@ class ClipSummary(BaseModel):
     sync_frame_counts: SyncFrameCounts = Field(default_factory=SyncFrameCounts)
     status: ClipStatus
     errors: list[str] = Field(default_factory=list)
+    annotation: AnnotationLifecycleProjection | None = None
 
     @field_validator("date")
     @classmethod
@@ -80,6 +140,7 @@ class DateSummary(BaseModel):
     sync_frame_counts: SyncFrameCounts = Field(default_factory=SyncFrameCounts)
     status: ClipStatus = "raw_only"
     clips: list[ClipSummary] = Field(default_factory=list)
+    annotation: AnnotationLifecycleProjection | None = None
 
     @field_validator("date")
     @classmethod
@@ -99,6 +160,9 @@ class DatasetTotals(BaseModel):
 class DatasetSummary(BaseModel):
     totals: DatasetTotals
     sync_distribution: SyncFrameCounts = Field(default_factory=SyncFrameCounts)
+    annotation_totals: AnnotationDatasetTotals = Field(
+        default_factory=AnnotationDatasetTotals,
+    )
     dates: list[DateSummary] = Field(default_factory=list)
 
 
@@ -135,6 +199,123 @@ def scan_navigation_dataset(settings: NavigationSettings | None = None) -> Datas
     )
     sync_distribution = _sum_counts(date.sync_frame_counts for date in dates)
     return DatasetSummary(totals=totals, sync_distribution=sync_distribution, dates=dates)
+
+
+def merge_annotation_lifecycle(
+    summary: DatasetSummary | DateSummary,
+    snapshot: dict[str, Any],
+) -> DatasetSummary | DateSummary:
+    """Merge the AnnotationStore read model without changing ingestion facts."""
+
+    projected = summary.model_copy(deep=True)
+    scopes = {
+        (str(item["dataset_date"]), str(item["source_clip"])): item
+        for item in snapshot.get("scopes", [])
+    }
+    dates = projected.dates if isinstance(projected, DatasetSummary) else [projected]
+    for date in dates:
+        clip_projections: list[AnnotationLifecycleProjection] = []
+        for clip in date.clips:
+            item = scopes.get((clip.date, clip.clip))
+            if item is None:
+                total = len(clip.sequences) if clip.status == "synced" else 0
+                clip.annotation = AnnotationLifecycleProjection(
+                    counts=AnnotationLifecycleCounts(
+                        total=total,
+                        not_started=total,
+                    ),
+                )
+            else:
+                clip.annotation = AnnotationLifecycleProjection.model_validate(item)
+            clip_projections.append(clip.annotation)
+        date.annotation = _aggregate_annotation_lifecycle(clip_projections)
+    if isinstance(projected, DatasetSummary):
+        clip_projections = [
+            clip.annotation
+            for date in projected.dates
+            for clip in date.clips
+            if clip.annotation is not None
+        ]
+        projected.annotation_totals = AnnotationDatasetTotals(
+            annotated_clip_count=sum(
+                projection.annotated_unit_count > 0
+                for projection in clip_projections
+            ),
+            verified_clip_count=sum(
+                projection.status == "verified"
+                for projection in clip_projections
+            ),
+            annotated_unit_count=sum(
+                projection.annotated_unit_count for projection in clip_projections
+            ),
+            verified_unit_count=sum(
+                projection.verified_unit_count for projection in clip_projections
+            ),
+        )
+    return projected
+
+
+def _aggregate_annotation_lifecycle(
+    projections: list[AnnotationLifecycleProjection],
+) -> AnnotationLifecycleProjection:
+    if not projections:
+        return AnnotationLifecycleProjection()
+    statuses = {projection.status for projection in projections}
+    status: AnnotationLifecycleStatus = (
+        next(iter(statuses)) if len(statuses) == 1 else "partial"
+    )
+    counts = AnnotationLifecycleCounts()
+    for projection in projections:
+        counts = counts.plus(projection.counts)
+    sources = {projection.source for projection in projections}
+    source = next(iter(sources)) if len(sources) == 1 else "mixed"
+    updated_values = [
+        projection.updated_at
+        for projection in projections
+        if projection.updated_at is not None
+    ]
+    return AnnotationLifecycleProjection(
+        status=status,
+        counts=counts,
+        completed_unit_count=sum(
+            projection.completed_unit_count for projection in projections
+        ),
+        annotated_unit_count=sum(
+            projection.annotated_unit_count for projection in projections
+        ),
+        verified_unit_count=sum(
+            projection.verified_unit_count for projection in projections
+        ),
+        job_ref=_unique_public_ref(projections, "job_ref"),
+        review_ref=_unique_public_ref(projections, "review_ref"),
+        verified_review_ref=_unique_public_ref(
+            projections,
+            "verified_review_ref",
+        ),
+        historical_asset_ref=_unique_public_ref(
+            projections,
+            "historical_asset_ref",
+        ),
+        updated_at=max(updated_values) if updated_values else None,
+        source=source,
+    )
+
+
+def _unique_public_ref(
+    projections: list[AnnotationLifecycleProjection],
+    field: Literal[
+        "job_ref",
+        "review_ref",
+        "verified_review_ref",
+        "historical_asset_ref",
+    ],
+) -> str | None:
+    values = {
+        value
+        for projection in projections
+        if (value := getattr(projection, field)) is not None
+    }
+    return next(iter(values)) if len(values) == 1 else None
 
 
 def scan_navigation_date(date: str, settings: NavigationSettings | None = None) -> DateSummary:

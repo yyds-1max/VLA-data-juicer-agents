@@ -756,6 +756,47 @@ def test_navigation_dataset_summary_returns_scanned_totals_and_sync_distribution
     assert body["sync_distribution"]["image"] == 2
 
 
+def test_navigation_dataset_summary_joins_annotation_lifecycle_without_changing_ingestion(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_a")
+    _write_sync_file(root, "20270605", "clip_a", "0001", "front.jpg", b"jpg-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+    created = client.app.state.annotation_store.create_job(
+        job_ref="job_" + "7" * 32,
+        dataset_date="20270605",
+        source_clips=["clip_a"],
+        calibration={
+            "profile_ref": "20260529_go2w",
+            "label": "20260529_go2w",
+            "content_sha256": "c" * 64,
+        },
+        snapshot_dir=tmp_path / "calibration",
+        snapshot_files=[],
+        reserved_bytes=1,
+        idempotency_key="dataset-summary-annotation-job",
+    )
+
+    response = client.get("/api/navigation/datasets/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    clip = body["dates"][0]["clips"][0]
+    assert clip["status"] == "synced"
+    assert clip["annotation"]["status"] == "processing"
+    assert clip["annotation"]["job_ref"] == created["job_ref"]
+    assert body["dates"][0]["annotation"]["status"] == "processing"
+    assert body["annotation_totals"] == {
+        "annotated_clip_count": 0,
+        "verified_clip_count": 0,
+        "annotated_unit_count": 0,
+        "verified_unit_count": 0,
+    }
+
+
 def test_navigation_date_returns_clip_detail_and_raw_only_status(tmp_path: Path, monkeypatch):
     root = tmp_path / "VLADatasets"
     _write_dataset_metadata(root / "raw_data" / "20270605" / "raw_clip")

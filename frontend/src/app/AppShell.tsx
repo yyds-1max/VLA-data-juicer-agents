@@ -34,6 +34,11 @@ const TrajectoryFixPage = lazy(() =>
     ({ TrajectoryFixPage }) => ({ default: TrajectoryFixPage }),
   ),
 );
+const HistoricalVerifiedAssetPage = lazy(() =>
+  import("../features/annotation/HistoricalVerifiedAssetPage").then(
+    ({ HistoricalVerifiedAssetPage }) => ({ default: HistoricalVerifiedAssetPage }),
+  ),
+);
 const DataManagementPage = lazy(() =>
   import("../features/console/pages/DataManagementPage").then(({ DataManagementPage }) => ({
     default: DataManagementPage,
@@ -182,6 +187,7 @@ export function AppShell({ children }: AppShellProps) {
               <Route path="jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
               <Route path="reviews" element={<AnnotationReviewsPage />} />
               <Route path="reviews/:reviewRef" element={<TrajectoryFixPage />} />
+              <Route path="verified/:assetRef" element={<HistoricalVerifiedAssetPage />} />
             </Route>
             <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />

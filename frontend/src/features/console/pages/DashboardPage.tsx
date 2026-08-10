@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Database,
   LockKeyhole,
+  RefreshCw,
   ShieldCheck,
   Tags,
 } from "lucide-react";
@@ -145,9 +146,30 @@ export function DashboardPage() {
       ? `${animateInteger(datasetSummary.totals.date_count, animationProgress)} 个日期 · ${animateInteger(datasetSummary.totals.clip_count, animationProgress).toLocaleString("zh-CN")} clips`
       : "暂无导航数据"
     : "暂无导航数据";
+  const annotationTotals = datasetSummary?.annotation_totals;
+  const annotatedClipCount = annotationTotals?.annotated_clip_count ?? 0;
+  const annotationCoverage = datasetSummary?.totals.synced_clip_count
+    ? Math.round((annotatedClipCount / datasetSummary.totals.synced_clip_count) * 100)
+    : 0;
 
   return (
     <section className="mx-auto max-w-[1680px] space-y-4 px-4 py-5 md:px-7 md:py-6" aria-label="VLA 数据闭环仪表盘">
+      <div className="flex justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          disabled={summaryLoading}
+          aria-label={summaryLoading ? "正在刷新仪表盘数据" : "刷新仪表盘数据"}
+          onClick={() => { void reload(); }}
+          className="bg-white text-slate-700 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
+        >
+          <RefreshCw
+            aria-hidden="true"
+            className={summaryLoading ? "animate-spin motion-reduce:animate-none" : ""}
+          />
+          {summaryLoading ? "刷新中" : "刷新"}
+        </Button>
+      </div>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
           title="总数据量"
@@ -160,9 +182,12 @@ export function DashboardPage() {
         />
         <MetricCard
           title="已标注数据"
-          value={animateInteger(856, animationProgress).toLocaleString("zh-CN")}
-          detail={`自动标注覆盖率 ${animateInteger(75, animationProgress)}%`}
+          value={summaryError ? "--" : animateInteger(annotatedClipCount, animationProgress).toLocaleString("zh-CN")}
+          detail={summaryError
+            ? "标注统计暂不可用"
+            : `自动标注覆盖率 ${animateInteger(annotationCoverage, animationProgress)}% · ${animateInteger(annotationTotals?.annotated_unit_count ?? 0, animationProgress)} Segments`}
           icon={Tags}
+          loading={summaryLoading}
         />
         <MetricCard
           title="待解锁批次"

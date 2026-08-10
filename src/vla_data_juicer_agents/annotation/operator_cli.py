@@ -8,6 +8,7 @@ then delegates every mutation to :class:`AnnotationStore`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -152,6 +153,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="New private backup directory beside annotation.sqlite.",
+    )
+    import_history = subparsers.add_parser(
+        "import-history",
+        help="Validate or import historical verified trajectory assets.",
+    )
+    import_history.add_argument(
+        "--finish-data-root",
+        type=Path,
+        required=True,
+    )
+    import_history.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+    )
+    import_history.add_argument(
+        "--apply",
+        action="store_true",
+        help="Persist the validated manifest. Without this flag the command is dry-run.",
     )
     return parser
 
@@ -323,6 +343,133 @@ def _list_recovery(
     }
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _historical_import_manifest(
+    *,
+    finish_data_root: Path,
+    manifest_path: Path,
+) -> tuple[str, list[dict[str, Any]]]:
+    if not finish_data_root.is_absolute() or not manifest_path.is_absolute():
+        raise _OperatorCLIUsageError(
+            "historical import paths must be absolute",
+        )
+    try:
+        root_metadata = finish_data_root.lstat()
+        manifest_metadata = manifest_path.lstat()
+        resolved_root = finish_data_root.resolve(strict=True)
+        resolved_manifest = manifest_path.resolve(strict=True)
+    except OSError as exc:
+        raise _OperatorScopeError("historical import input is unavailable") from exc
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or resolved_root != finish_data_root
+        or stat.S_ISLNK(manifest_metadata.st_mode)
+        or not stat.S_ISREG(manifest_metadata.st_mode)
+        or resolved_manifest != manifest_path
+        or manifest_metadata.st_size > 10 * 1024 * 1024
+    ):
+        raise _OperatorScopeError("historical import input is unsafe")
+    raw_manifest = manifest_path.read_bytes()
+    manifest_sha256 = hashlib.sha256(raw_manifest).hexdigest()
+    try:
+        payload = json.loads(raw_manifest)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _OperatorCLIUsageError("historical import manifest is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {"assets"}:
+        raise _OperatorCLIUsageError("historical import manifest is invalid")
+    raw_assets = payload["assets"]
+    if not isinstance(raw_assets, list) or not raw_assets:
+        raise _OperatorCLIUsageError("historical import manifest is invalid")
+    assets: list[dict[str, Any]] = []
+    scope_totals: dict[tuple[str, str], int] = {}
+    scope_ordinals: set[tuple[str, str, int]] = set()
+    for raw_asset in raw_assets:
+        if not isinstance(raw_asset, dict) or set(raw_asset) != {
+            "dataset_date",
+            "source_clip",
+            "segment_ordinal",
+            "segment_total",
+            "relative_path",
+            "sha256",
+        }:
+            raise _OperatorCLIUsageError("historical import manifest is invalid")
+        dataset_date = raw_asset["dataset_date"]
+        source_clip = raw_asset["source_clip"]
+        ordinal = raw_asset["segment_ordinal"]
+        total = raw_asset["segment_total"]
+        relative_path = raw_asset["relative_path"]
+        expected_sha256 = raw_asset["sha256"]
+        if (
+            not isinstance(dataset_date, str)
+            or _DATE.fullmatch(dataset_date) is None
+            or not isinstance(source_clip, str)
+            or not source_clip
+            or len(source_clip) > 255
+            or any(token in source_clip for token in ("/", "\\", "\r", "\n"))
+            or isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or isinstance(total, bool)
+            or not isinstance(total, int)
+            or ordinal < 1
+            or total < ordinal
+            or not isinstance(relative_path, str)
+            or not relative_path
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        ):
+            raise _OperatorCLIUsageError("historical import manifest is invalid")
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise _OperatorScopeError("historical asset escapes its declared root")
+        candidate = finish_data_root / relative
+        try:
+            candidate_metadata = candidate.lstat()
+            resolved_candidate = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise _OperatorScopeError("historical asset is unavailable") from exc
+        if (
+            stat.S_ISLNK(candidate_metadata.st_mode)
+            or not stat.S_ISREG(candidate_metadata.st_mode)
+            or not resolved_candidate.is_relative_to(resolved_root)
+            or not candidate.name.endswith("_trajectory_fix_five.json")
+        ):
+            raise _OperatorScopeError("historical asset is unsafe")
+        if _sha256_file(candidate) != expected_sha256:
+            raise AnnotationConflictError(
+                "historical_asset_hash_mismatch",
+                "A historical asset no longer matches its manifest.",
+            )
+        try:
+            with candidate.open("r", encoding="utf-8") as stream:
+                json.load(stream)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _OperatorCLIUsageError("historical trajectory JSON is invalid") from exc
+        scope = (dataset_date, source_clip)
+        previous_total = scope_totals.setdefault(scope, total)
+        if previous_total != total or (dataset_date, source_clip, ordinal) in scope_ordinals:
+            raise _OperatorCLIUsageError("historical import manifest is inconsistent")
+        scope_ordinals.add((dataset_date, source_clip, ordinal))
+        assets.append(
+            {
+                "dataset_date": dataset_date,
+                "source_clip": source_clip,
+                "segment_ordinal": ordinal,
+                "segment_total": total,
+                "artifact_sha256": expected_sha256,
+                "private_artifact_path": str(resolved_candidate),
+            }
+        )
+    return manifest_sha256, assets
+
+
 def _execute(args: argparse.Namespace) -> dict[str, Any]:
     annotation_db = Path(args.annotation_db)
     writer_lock = Path(args.writer_lock)
@@ -346,7 +493,6 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
             raise _OperatorScopeError(
                 "the annotation migration backup is outside production scope",
             )
-
     with acquire_annotation_maintenance(annotation_db) as maintenance_lease:
         if args.command == "migrate-schema":
             assert backup_root is not None
@@ -367,6 +513,29 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
             return _list_recovery(
                 annotation_db=annotation_db,
                 writer_lock=writer_lock,
+            )
+        if args.command == "import-history":
+            manifest_sha256, assets = _historical_import_manifest(
+                finish_data_root=Path(args.finish_data_root),
+                manifest_path=Path(args.manifest),
+            )
+            if not args.apply:
+                return {
+                    "status": "historical_import_validated",
+                    "asset_count": len(assets),
+                    "scope_count": len(
+                        {
+                            (item["dataset_date"], item["source_clip"])
+                            for item in assets
+                        }
+                    ),
+                    "manifest_sha256": manifest_sha256,
+                }
+            return _mutation_store(
+                annotation_db,
+            ).import_historical_verified_assets(
+                manifest_sha256=manifest_sha256,
+                assets=assets,
             )
         store = _mutation_store(annotation_db)
         if args.command == "clear-global":

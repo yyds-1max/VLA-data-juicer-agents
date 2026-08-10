@@ -162,6 +162,43 @@ export interface InteractionResponseResult {
 
 export type NavigationDatasetStatus = "raw_only" | "extracted" | "synced" | "error";
 
+export type AnnotationLifecycleStatus =
+  | "not_started"
+  | "processing"
+  | "waiting_initial_annotation"
+  | "annotated_pending_review"
+  | "verified"
+  | "returned"
+  | "discarded"
+  | "failed"
+  | "partial";
+
+export interface AnnotationLifecycleCounts {
+  total: number;
+  not_started: number;
+  processing: number;
+  waiting_initial_annotation: number;
+  annotated_pending_review: number;
+  verified: number;
+  returned: number;
+  discarded: number;
+  failed: number;
+}
+
+export interface AnnotationLifecycleProjection {
+  status: AnnotationLifecycleStatus;
+  counts: AnnotationLifecycleCounts;
+  completed_unit_count: number;
+  annotated_unit_count: number;
+  verified_unit_count: number;
+  job_ref: string | null;
+  review_ref: string | null;
+  verified_review_ref: string | null;
+  historical_asset_ref: string | null;
+  updated_at: string | null;
+  source: "none" | "native" | "historical_import" | "mixed";
+}
+
 export interface NavigationTopicSummary {
   name: string;
   type: string;
@@ -192,6 +229,7 @@ export interface NavigationClipSummary {
   sync_frame_counts: NavigationSyncFrameCounts;
   status: NavigationDatasetStatus;
   errors: string[];
+  annotation?: AnnotationLifecycleProjection | null;
 }
 
 export interface NavigationDateSummary {
@@ -204,6 +242,7 @@ export interface NavigationDateSummary {
   sync_frame_counts: NavigationSyncFrameCounts;
   status: NavigationDatasetStatus;
   clips?: NavigationClipSummary[];
+  annotation?: AnnotationLifecycleProjection | null;
 }
 
 export interface NavigationDatasetTotals {
@@ -218,6 +257,12 @@ export interface NavigationDatasetTotals {
 export interface NavigationDatasetSummary {
   totals: NavigationDatasetTotals;
   sync_distribution: NavigationSyncFrameCounts;
+  annotation_totals?: {
+    annotated_clip_count: number;
+    verified_clip_count: number;
+    annotated_unit_count: number;
+    verified_unit_count: number;
+  };
   dates: NavigationDateSummary[];
 }
 

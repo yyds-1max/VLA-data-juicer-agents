@@ -610,6 +610,108 @@ def migrate_annotation_store_offline(
         }
 
 
+_ANNOTATION_LIFECYCLE_STATES = (
+    "not_started",
+    "processing",
+    "waiting_initial_annotation",
+    "annotated_pending_review",
+    "verified",
+    "returned",
+    "discarded",
+    "failed",
+)
+
+
+def _annotation_empty_job_lifecycle(
+    job_status: str,
+    completion_outcome: Any,
+) -> str:
+    if completion_outcome == "no_processable_targets":
+        return "discarded"
+    if job_status == "waiting_initial_annotation":
+        return "waiting_initial_annotation"
+    if job_status == "failed":
+        return "failed"
+    if job_status == "annotated":
+        return "annotated_pending_review"
+    return "processing"
+
+
+def _annotation_unit_lifecycle(
+    *,
+    job_status: str,
+    completion_outcome: Any,
+    segment_status: str,
+    review_status: str | None,
+    publication_status: str | None,
+) -> str:
+    if segment_status == "skipped" or completion_outcome == "no_processable_targets":
+        return "discarded"
+    if segment_status == "postprocessing_failed":
+        return "failed"
+    if segment_status == "annotated":
+        if review_status is None or review_status == "pending":
+            return "annotated_pending_review"
+        if review_status == "in_progress":
+            return "processing"
+        if review_status == "returned":
+            return "returned"
+        if review_status == "discarded":
+            return "discarded"
+        if review_status == "approved":
+            if publication_status == "succeeded":
+                return "verified"
+            if publication_status == "failed":
+                return "failed"
+            return "processing"
+        raise RuntimeError("annotation review has an unsupported status")
+    if job_status == "failed":
+        return "failed"
+    if job_status == "waiting_initial_annotation":
+        return "waiting_initial_annotation"
+    return "processing"
+
+
+def _annotation_scope_projection(
+    *,
+    unit_states: list[str],
+    annotated_unit_count: int,
+    job_ref: str | None,
+    review_refs: list[str],
+    verified_review_refs: list[str],
+    historical_asset_refs: list[str],
+    updated_at: str,
+    source: str,
+) -> dict[str, Any]:
+    if not unit_states or any(
+        state not in _ANNOTATION_LIFECYCLE_STATES for state in unit_states
+    ):
+        raise RuntimeError("annotation lifecycle contains an unsupported state")
+    unique_states = set(unit_states)
+    status = next(iter(unique_states)) if len(unique_states) == 1 else "partial"
+    counts = {state: 0 for state in _ANNOTATION_LIFECYCLE_STATES}
+    for state in unit_states:
+        counts[state] += 1
+    completed = counts["verified"] + counts["discarded"]
+    return {
+        "status": status,
+        "counts": {"total": len(unit_states), **counts},
+        "completed_unit_count": completed,
+        "annotated_unit_count": annotated_unit_count,
+        "verified_unit_count": counts["verified"],
+        "job_ref": job_ref,
+        "review_ref": review_refs[0] if review_refs else None,
+        "verified_review_ref": (
+            verified_review_refs[0] if verified_review_refs else None
+        ),
+        "historical_asset_ref": (
+            historical_asset_refs[0] if historical_asset_refs else None
+        ),
+        "updated_at": updated_at,
+        "source": source,
+    }
+
+
 class AnnotationStore:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
@@ -1089,6 +1191,304 @@ class AnnotationStore:
                 self._job_projection(connection, int(row["id"]), include_segments=False)
                 for row in rows
             ]
+
+    def asset_lifecycle_snapshot(self) -> dict[str, Any]:
+        """Project native and imported annotation facts by public data scope.
+
+        The projection deliberately follows current source leases.  Cancelled
+        jobs remain in the audit log but cannot shadow a later authoritative
+        job for the same date/clip.
+        """
+
+        with self._connect() as connection:
+            scopes: dict[tuple[str, str], dict[str, Any]] = {}
+            leases = connection.execute(
+                """
+                SELECT l.dataset_date, l.source_clip, j.id AS job_id,
+                       j.job_ref, j.status AS job_status,
+                       j.completion_outcome, j.updated_at
+                FROM annotation_source_leases l
+                JOIN annotation_jobs j ON j.id = l.job_id
+                ORDER BY l.dataset_date, l.source_clip
+                """
+            ).fetchall()
+            for lease in leases:
+                if str(lease["job_status"]) == "cancelled":
+                    continue
+                key = (str(lease["dataset_date"]), str(lease["source_clip"]))
+                segment_rows = connection.execute(
+                    """
+                    SELECT s.id, s.status, s.ordinal, s.updated_at,
+                           r.review_ref, r.status AS review_status,
+                           p.status AS publication_status
+                    FROM annotation_segments s
+                    LEFT JOIN trajectory_revisions t ON t.segment_id = s.id
+                     AND t.revision_number = (
+                        SELECT MAX(latest.revision_number)
+                        FROM trajectory_revisions latest
+                        WHERE latest.segment_id = s.id
+                     )
+                    LEFT JOIN trajectory_review_tasks r
+                      ON r.trajectory_revision_id = t.id
+                    LEFT JOIN compatibility_publications p
+                      ON p.review_id = r.id
+                     AND p.attempt = (
+                        SELECT MAX(latest.attempt)
+                        FROM compatibility_publications latest
+                        WHERE latest.review_id = r.id
+                     )
+                    WHERE s.job_id = ? AND s.source_clip = ?
+                    ORDER BY s.ordinal
+                    """,
+                    (int(lease["job_id"]), str(lease["source_clip"])),
+                ).fetchall()
+                unit_states: list[str] = []
+                review_refs: list[str] = []
+                verified_review_refs: list[str] = []
+                annotated_units = 0
+                latest_update = str(lease["updated_at"])
+                for segment in segment_rows:
+                    segment_status = str(segment["status"])
+                    unit_state = _annotation_unit_lifecycle(
+                        job_status=str(lease["job_status"]),
+                        completion_outcome=lease["completion_outcome"],
+                        segment_status=segment_status,
+                        review_status=(
+                            str(segment["review_status"])
+                            if segment["review_status"] is not None
+                            else None
+                        ),
+                        publication_status=(
+                            str(segment["publication_status"])
+                            if segment["publication_status"] is not None
+                            else None
+                        ),
+                    )
+                    unit_states.append(unit_state)
+                    if segment_status == "annotated":
+                        annotated_units += 1
+                    if segment["review_ref"] is not None:
+                        review_ref = str(segment["review_ref"])
+                        review_refs.append(review_ref)
+                        if unit_state == "verified":
+                            verified_review_refs.append(review_ref)
+                    latest_update = max(latest_update, str(segment["updated_at"]))
+                if not unit_states:
+                    unit_states = [
+                        _annotation_empty_job_lifecycle(
+                            str(lease["job_status"]),
+                            lease["completion_outcome"],
+                        )
+                    ]
+                scopes[key] = _annotation_scope_projection(
+                    unit_states=unit_states,
+                    annotated_unit_count=annotated_units,
+                    job_ref=str(lease["job_ref"]),
+                    review_refs=review_refs,
+                    verified_review_refs=verified_review_refs,
+                    historical_asset_refs=[],
+                    updated_at=latest_update,
+                    source="native",
+                )
+
+            historical_rows = connection.execute(
+                """
+                SELECT asset_ref, dataset_date, source_clip, segment_ordinal,
+                       segment_total, imported_at
+                FROM historical_verified_assets
+                ORDER BY dataset_date, source_clip, segment_ordinal
+                """
+            ).fetchall()
+            historical_groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for row in historical_rows:
+                key = (str(row["dataset_date"]), str(row["source_clip"]))
+                if key in scopes:
+                    continue
+                historical_groups.setdefault(key, []).append(row)
+            for key, rows in historical_groups.items():
+                totals = {int(row["segment_total"]) for row in rows}
+                if len(totals) != 1:
+                    raise RuntimeError(
+                        "historical verified scope has inconsistent segment totals"
+                    )
+                total = totals.pop()
+                ordinals = {int(row["segment_ordinal"]) for row in rows}
+                if len(ordinals) != len(rows) or any(
+                    ordinal < 1 or ordinal > total for ordinal in ordinals
+                ):
+                    raise RuntimeError(
+                        "historical verified scope has invalid segment ordinals"
+                    )
+                unit_states = ["verified"] * len(rows)
+                unit_states.extend(["not_started"] * (total - len(rows)))
+                scopes[key] = _annotation_scope_projection(
+                    unit_states=unit_states,
+                    annotated_unit_count=len(rows),
+                    job_ref=None,
+                    review_refs=[],
+                    verified_review_refs=[],
+                    historical_asset_refs=[str(row["asset_ref"]) for row in rows],
+                    updated_at=max(str(row["imported_at"]) for row in rows),
+                    source="historical_import",
+                )
+            return {
+                "scopes": [
+                    {
+                        "dataset_date": dataset_date,
+                        "source_clip": source_clip,
+                        **projection,
+                    }
+                    for (dataset_date, source_clip), projection in sorted(scopes.items())
+                ]
+            }
+
+    def import_historical_verified_assets(
+        self,
+        *,
+        manifest_sha256: str,
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Idempotently import operator-validated historical compatibility assets."""
+
+        if not _valid_sha256(manifest_sha256) or not assets:
+            raise AnnotationValidationError(
+                "invalid_historical_manifest",
+                "The historical import manifest is invalid.",
+            )
+        imported = 0
+        existing = 0
+        public_refs: list[str] = []
+        with self._write() as connection:
+            for item in assets:
+                dataset_date = item.get("dataset_date")
+                source_clip = item.get("source_clip")
+                segment_ordinal = item.get("segment_ordinal")
+                segment_total = item.get("segment_total")
+                artifact_sha256 = item.get("artifact_sha256")
+                private_artifact_path = item.get("private_artifact_path")
+                if (
+                    not isinstance(dataset_date, str)
+                    or len(dataset_date) != 8
+                    or not dataset_date.isdigit()
+                    or not isinstance(source_clip, str)
+                    or not source_clip
+                    or len(source_clip) > 255
+                    or any(token in source_clip for token in ("/", "\\", "\r", "\n"))
+                    or isinstance(segment_ordinal, bool)
+                    or not isinstance(segment_ordinal, int)
+                    or isinstance(segment_total, bool)
+                    or not isinstance(segment_total, int)
+                    or segment_ordinal < 1
+                    or segment_total < segment_ordinal
+                    or not _valid_sha256(artifact_sha256)
+                    or not isinstance(private_artifact_path, str)
+                    or not Path(private_artifact_path).is_absolute()
+                ):
+                    raise AnnotationValidationError(
+                        "invalid_historical_manifest",
+                        "The historical import manifest is invalid.",
+                    )
+                current = connection.execute(
+                    """
+                    SELECT asset_ref, segment_total, artifact_sha256,
+                           private_artifact_path, manifest_sha256
+                    FROM historical_verified_assets
+                    WHERE dataset_date = ? AND source_clip = ?
+                      AND segment_ordinal = ?
+                    """,
+                    (dataset_date, source_clip, segment_ordinal),
+                ).fetchone()
+                if current is not None:
+                    if (
+                        int(current["segment_total"]) != segment_total
+                        or str(current["artifact_sha256"]) != artifact_sha256
+                        or str(current["private_artifact_path"])
+                        != private_artifact_path
+                    ):
+                        raise AnnotationConflictError(
+                            "historical_asset_conflict",
+                            "A different historical asset already occupies this scope.",
+                        )
+                    existing += 1
+                    public_refs.append(str(current["asset_ref"]))
+                    continue
+                conflicting_scope = connection.execute(
+                    """
+                    SELECT 1
+                    FROM historical_verified_assets
+                    WHERE dataset_date = ? AND source_clip = ?
+                      AND segment_total != ?
+                    LIMIT 1
+                    """,
+                    (dataset_date, source_clip, segment_total),
+                ).fetchone()
+                native_scope = connection.execute(
+                    """
+                    SELECT 1
+                    FROM annotation_source_leases
+                    WHERE dataset_date = ? AND source_clip = ?
+                    LIMIT 1
+                    """,
+                    (dataset_date, source_clip),
+                ).fetchone()
+                if conflicting_scope is not None or native_scope is not None:
+                    raise AnnotationConflictError(
+                        "historical_asset_conflict",
+                        "A different annotation authority already occupies this scope.",
+                    )
+                asset_ref = _new_ref("verified_asset")
+                connection.execute(
+                    """
+                    INSERT INTO historical_verified_assets (
+                        asset_ref, dataset_date, source_clip, segment_ordinal,
+                        segment_total, artifact_sha256, private_artifact_path,
+                        manifest_sha256, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        asset_ref,
+                        dataset_date,
+                        source_clip,
+                        segment_ordinal,
+                        segment_total,
+                        artifact_sha256,
+                        private_artifact_path,
+                        manifest_sha256,
+                        _now(),
+                    ),
+                )
+                imported += 1
+                public_refs.append(asset_ref)
+        return {
+            "status": "historical_verified_assets_imported",
+            "imported": imported,
+            "existing": existing,
+            "asset_refs": public_refs,
+        }
+
+    def get_historical_verified_asset(self, asset_ref: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT asset_ref, dataset_date, source_clip, segment_ordinal,
+                       segment_total, artifact_sha256, imported_at
+                FROM historical_verified_assets
+                WHERE asset_ref = ?
+                """,
+                (asset_ref,),
+            ).fetchone()
+            if row is None:
+                raise AnnotationNotFoundError("historical verified asset not found")
+            return {
+                "asset_ref": str(row["asset_ref"]),
+                "dataset_date": str(row["dataset_date"]),
+                "source_clip": str(row["source_clip"]),
+                "segment_ordinal": int(row["segment_ordinal"]),
+                "segment_total": int(row["segment_total"]),
+                "content_sha256": str(row["artifact_sha256"]),
+                "provenance": "historical_import",
+                "imported_at": str(row["imported_at"]),
+            }
 
     def public_event_cursor(self) -> int:
         with self._connect() as connection:

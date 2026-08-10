@@ -9,15 +9,19 @@ import {
   Files,
   Images,
   Layers3,
+  RefreshCw,
   Search,
   X,
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, type MouseEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useStore } from "zustand";
 
 import { getSyncImages, getSyncImageUrl } from "../../../api/client";
 import type {
+  AnnotationLifecycleProjection,
+  AnnotationLifecycleStatus,
   NavigationClipSummary,
   NavigationDatasetStatus,
   NavigationDateSummary,
@@ -65,6 +69,7 @@ const statusTones: Record<NavigationDatasetStatus, StatusTone> = {
 
 type DataSurface = "navigation" | "robotic_arm";
 type StatusFilter = "all" | NavigationDatasetStatus;
+type AnnotationStatusFilter = "all" | AnnotationLifecycleStatus;
 
 const dataSurfaces = [
   { value: "navigation", label: "导航数据" },
@@ -78,6 +83,38 @@ const statusOptions = [
   { value: "synced", label: "已同步" },
   { value: "error", label: "异常" },
 ] satisfies Array<{ value: StatusFilter; label: string }>;
+
+const annotationStatusLabels: Record<AnnotationLifecycleStatus, string> = {
+  not_started: "尚未标注",
+  processing: "处理中",
+  waiting_initial_annotation: "待首帧标注",
+  annotated_pending_review: "已标注 / 待复核",
+  verified: "已验证",
+  returned: "已退回",
+  discarded: "已废弃",
+  failed: "处理失败",
+  partial: "部分完成",
+};
+
+const annotationStatusTones: Record<AnnotationLifecycleStatus, StatusTone> = {
+  not_started: "neutral",
+  processing: "info",
+  waiting_initial_annotation: "warning",
+  annotated_pending_review: "warning",
+  verified: "success",
+  returned: "warning",
+  discarded: "neutral",
+  failed: "danger",
+  partial: "info",
+};
+
+const annotationStatusOptions = [
+  { value: "all", label: "全部标注状态" },
+  ...Object.entries(annotationStatusLabels).map(([value, label]) => ({
+    value: value as AnnotationLifecycleStatus,
+    label,
+  })),
+] satisfies Array<{ value: AnnotationStatusFilter; label: string }>;
 
 function formatCount(value: number) {
   return value.toLocaleString();
@@ -169,6 +206,59 @@ function StatusCell({ status }: { status: NavigationDatasetStatus }) {
   return <StatusTag tone={statusTones[status]}>{statusLabels[status]}</StatusTag>;
 }
 
+function AnnotationStatusCell({
+  projection,
+}: {
+  projection: AnnotationLifecycleProjection | null | undefined;
+}) {
+  const status = projection?.status ?? "not_started";
+  const total = projection?.counts.total ?? 0;
+  const annotated = projection?.annotated_unit_count ?? 0;
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <StatusTag tone={annotationStatusTones[status]}>
+        {annotationStatusLabels[status]}
+      </StatusTag>
+      {total > 0 ? (
+        <span className="text-[11px] tabular-nums text-slate-400">
+          已标注 {annotated}/{total}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function annotationDeepLink(
+  projection: AnnotationLifecycleProjection | null | undefined,
+): { href: string; label: string } | null {
+  if (!projection) return null;
+  if (projection.status === "verified" && projection.verified_review_ref) {
+    return {
+      href: `/annotation/reviews/${encodeURIComponent(projection.verified_review_ref)}`,
+      label: "查看已验证版本",
+    };
+  }
+  if (projection.historical_asset_ref) {
+    return {
+      href: `/annotation/verified/${encodeURIComponent(projection.historical_asset_ref)}`,
+      label: "查看已验证版本",
+    };
+  }
+  if (projection.review_ref) {
+    return {
+      href: `/annotation/reviews/${encodeURIComponent(projection.review_ref)}`,
+      label: projection.status === "annotated_pending_review" ? "进入人工复核" : "查看复核",
+    };
+  }
+  if (projection.job_ref) {
+    return {
+      href: `/annotation/jobs/${encodeURIComponent(projection.job_ref)}`,
+      label: projection.status === "waiting_initial_annotation" ? "进入标注" : "查看任务",
+    };
+  }
+  return null;
+}
+
 function getScrollbarProximity(element: HTMLElement, clientX: number, clientY: number) {
   const rect = element.getBoundingClientRect();
   const proximityPx = 28;
@@ -230,17 +320,19 @@ function useScrollbarProximity() {
 function ClipRows({
   clips,
   highlightedClip,
+  onOpenAnnotation,
   onViewSyncImages,
 }: {
   clips: NavigationClipSummary[];
   highlightedClip: string | null;
+  onOpenAnnotation: (href: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
   const clipScrollbar = useScrollbarProximity();
 
   return (
     <tr className="border-b border-slate-200 bg-slate-50/55">
-      <td colSpan={8} className="px-0 py-0">
+      <td colSpan={10} className="px-0 py-0">
         {clips.length === 0 ? (
           <div className="border-l-2 border-blue-200 px-16 py-6 text-sm text-slate-500">该日期暂无 clip 明细。</div>
         ) : (
@@ -253,7 +345,7 @@ function ClipRows({
             onPointerLeave={clipScrollbar.onPointerLeave}
             onPointerMove={clipScrollbar.onPointerMove}
           >
-            <table className="w-full min-w-[1060px] text-left text-sm">
+            <table className="w-full min-w-[1240px] text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr className="h-10 border-b border-slate-200/90 bg-slate-50/80">
                   <th className="pl-16 pr-3 font-medium">clip 名称</th>
@@ -263,7 +355,8 @@ function ClipRows({
                   <th className="pr-3 font-medium">tmp_dir</th>
                   <th className="pr-3 font-medium">sync_data</th>
                   <th className="pr-3 font-medium">同步图像帧</th>
-                  <th className="pr-3 font-medium">状态</th>
+                  <th className="pr-3 font-medium">数据状态</th>
+                  <th className="pr-3 font-medium">标注状态</th>
                   <th className="pr-4 text-right font-medium">操作</th>
                 </tr>
               </thead>
@@ -293,16 +386,33 @@ function ClipRows({
                       <td className="pr-3">
                         <StatusCell status={clip.status} />
                       </td>
+                      <td className="pr-3">
+                        <AnnotationStatusCell projection={clip.annotation} />
+                      </td>
                       <td className="pr-4 text-right">
-                        <button
-                          className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-[color,background-color] duration-150 hover:bg-blue-50 hover:text-blue-700 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-45 motion-reduce:transition-none"
-                          disabled={clip.sync_frame_counts.image === 0}
-                          aria-label={`查看 ${clip.clip} 同步图像`}
-                          onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
-                          type="button"
-                        >
-                          查看同步图像
-                        </button>
+                        <div className="flex justify-end gap-1">
+                          <button
+                            className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-[color,background-color] duration-150 hover:bg-blue-50 hover:text-blue-700 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-45 motion-reduce:transition-none"
+                            disabled={clip.sync_frame_counts.image === 0}
+                            aria-label={`查看 ${clip.clip} 同步图像`}
+                            onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
+                            type="button"
+                          >
+                            同步图像
+                          </button>
+                          {annotationDeepLink(clip.annotation) ? (
+                            <button
+                              className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
+                              onClick={() => {
+                                const link = annotationDeepLink(clip.annotation);
+                                if (link) onOpenAnnotation(link.href);
+                              }}
+                              type="button"
+                            >
+                              {annotationDeepLink(clip.annotation)?.label}
+                            </button>
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -320,12 +430,14 @@ function DatasetTable({
   dates,
   expandedDate,
   highlightedClip,
+  onOpenAnnotation,
   onToggleDate,
   onViewSyncImages,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
   highlightedClip: string | null;
+  onOpenAnnotation: (href: string) => void;
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
@@ -348,7 +460,7 @@ function DatasetTable({
         onPointerLeave={datasetScrollbar.onPointerLeave}
         onPointerMove={datasetScrollbar.onPointerMove}
       >
-        <table className="w-full min-w-[1040px] text-left text-sm">
+        <table className="w-full min-w-[1220px] text-left text-sm">
           <thead className="text-xs text-slate-500">
             <tr className="h-11 border-b border-slate-200 bg-white">
               <th className="pl-4 pr-3 font-medium sm:pl-5">日期</th>
@@ -358,13 +470,15 @@ function DatasetTable({
               <th className="pr-3 font-medium">已拆解 clip</th>
               <th className="pr-3 font-medium">同步 clip 数</th>
               <th className="pr-3 font-medium">同步图像帧</th>
-              <th className="pr-5 font-medium">状态</th>
+              <th className="pr-3 font-medium">数据状态</th>
+              <th className="pr-3 font-medium">标注状态</th>
+              <th className="pr-5 text-right font-medium">操作</th>
             </tr>
           </thead>
           <tbody>
             {dates.length === 0 ? (
               <tr>
-                <td colSpan={8} className="h-[19rem] px-4 text-center text-sm text-slate-500">
+                <td colSpan={10} className="h-[19rem] px-4 text-center text-sm text-slate-500">
                   <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-400">
                     <Layers3 aria-hidden="true" className="size-5" />
                   </span>
@@ -399,11 +513,28 @@ function DatasetTable({
                     <td className="pr-3 text-slate-500">{formatCount(date.extracted_clip_count)}</td>
                     <td className="pr-3 text-slate-500">{formatCount(date.synced_clip_count)}</td>
                     <td className="pr-3 text-slate-500">{formatCount(date.sync_frame_counts.image)}</td>
-                    <td className="pr-5">
+                    <td className="pr-3">
                       <StatusCell status={date.status} />
                     </td>
+                    <td className="pr-3">
+                      <AnnotationStatusCell projection={date.annotation} />
+                    </td>
+                    <td className="pr-5 text-right">
+                      {annotationDeepLink(date.annotation) ? (
+                        <button
+                          className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
+                          onClick={() => {
+                            const link = annotationDeepLink(date.annotation);
+                            if (link) onOpenAnnotation(link.href);
+                          }}
+                          type="button"
+                        >
+                          {annotationDeepLink(date.annotation)?.label}
+                        </button>
+                      ) : null}
+                    </td>
                   </tr>
-                  {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
+                  {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onOpenAnnotation={onOpenAnnotation} onViewSyncImages={onViewSyncImages} /> : null}
                 </Fragment>
               );
             })}
@@ -492,7 +623,9 @@ function SearchSuggestions({
 }
 
 function NavigationListToolbar({
+  annotationStatus,
   dates,
+  refreshing,
   query,
   showSuggestions,
   status,
@@ -500,11 +633,15 @@ function NavigationListToolbar({
   onClearQuery,
   onFocusQuery,
   onOpenDataPilot,
+  onRefresh,
   onSelectClip,
   onSelectDate,
   onStatusChange,
+  onAnnotationStatusChange,
 }: {
+  annotationStatus: AnnotationStatusFilter;
   dates: NavigationDateSummary[];
+  refreshing: boolean;
   query: string;
   showSuggestions: boolean;
   status: StatusFilter;
@@ -512,9 +649,11 @@ function NavigationListToolbar({
   onClearQuery: () => void;
   onFocusQuery: () => void;
   onOpenDataPilot: () => void;
+  onRefresh: () => void;
   onSelectClip: (date: string, clip: string) => void;
   onSelectDate: (date: string) => void;
   onStatusChange: (status: StatusFilter) => void;
+  onAnnotationStatusChange: (status: AnnotationStatusFilter) => void;
 }) {
   return (
     <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5 lg:flex-row lg:items-center">
@@ -559,6 +698,35 @@ function NavigationListToolbar({
           ))}
         </SelectContent>
       </Select>
+
+      <Select
+        value={annotationStatus}
+        onValueChange={(value) => onAnnotationStatusChange(value as AnnotationStatusFilter)}
+      >
+        <SelectTrigger aria-label="标注状态筛选" className="h-10 w-full bg-white shadow-none lg:w-48">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="start" position="popper">
+          {annotationStatusOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <ConsoleButton
+        aria-label={refreshing ? "正在刷新数据资产" : "刷新数据资产"}
+        className="h-10"
+        disabled={refreshing}
+        onClick={onRefresh}
+      >
+        <RefreshCw
+          aria-hidden="true"
+          className={`size-4 ${refreshing ? "animate-spin motion-reduce:animate-none" : ""}`}
+        />
+        {refreshing ? "刷新中" : "刷新"}
+      </ConsoleButton>
 
       <ConsoleButton className="h-10 lg:ml-auto" variant="primary" onClick={onOpenDataPilot}>
         <Bot aria-hidden="true" className="size-4" />
@@ -895,8 +1063,10 @@ function SyncImageDrawer({
 
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
   void onPlaceholderAction;
+  const navigate = useNavigate();
   const [activeSurface, setActiveSurface] = useState<DataSurface>("navigation");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [annotationStatusFilter, setAnnotationStatusFilter] = useState<AnnotationStatusFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
   const [highlightedClip, setHighlightedClip] = useState<{ date: string; clip: string } | null>(null);
@@ -935,6 +1105,16 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
         return false;
       }
 
+      if (
+        annotationStatusFilter !== "all"
+        && (date.annotation?.status ?? "not_started") !== annotationStatusFilter
+        && !(date.clips ?? []).some(
+          (clip) => (clip.annotation?.status ?? "not_started") === annotationStatusFilter,
+        )
+      ) {
+        return false;
+      }
+
       if (!query) {
         return true;
       }
@@ -949,7 +1129,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
       return (date.clips ?? []).some((clip) => clip.clip.toLowerCase().includes(query));
     });
-  }, [dates, matchingClipDate, searchQuery, statusFilter]);
+  }, [annotationStatusFilter, dates, matchingClipDate, searchQuery, statusFilter]);
   const effectiveExpandedDate = matchingClipDate?.date ?? expandedDate;
   const activeInvocation =
     activeInvocationId && pendingInvocation?.invocationId === activeInvocationId
@@ -1071,8 +1251,10 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
           <section className="min-h-[31rem] border-y border-slate-200 bg-white" data-testid="navigation-dataset-surface">
             <NavigationListToolbar
+              annotationStatus={annotationStatusFilter}
               dates={dates}
               query={searchQuery}
+              refreshing={loading}
               showSuggestions={showSearchSuggestions}
               status={statusFilter}
               onChangeQuery={(query) => {
@@ -1091,10 +1273,16 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
                 }
               }}
               onOpenDataPilot={handleOpenDataPilotDialog}
+              onRefresh={() => void reload()}
               onSelectDate={handleSelectSearchDate}
               onSelectClip={handleSelectSearchClip}
               onStatusChange={(status) => {
                 setStatusFilter(status);
+                setExpandedDate(null);
+                setHighlightedClip(null);
+              }}
+              onAnnotationStatusChange={(status) => {
+                setAnnotationStatusFilter(status);
                 setExpandedDate(null);
                 setHighlightedClip(null);
               }}
@@ -1126,6 +1314,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
                 dates={visibleDates}
                 expandedDate={effectiveExpandedDate}
                 highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
+                onOpenAnnotation={(href) => navigate(href)}
                 onToggleDate={handleToggleDate}
                 onViewSyncImages={handleViewSyncImages}
               />

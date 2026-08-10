@@ -272,6 +272,24 @@ test("dashboard renders navigation dataset summary metrics and distribution", as
   expect(screen.getByText("最近事件")).toBeVisible();
 });
 
+test("dashboard uses the annotation fact source for its aggregate metric", async () => {
+  const summary = navigationDatasetSummaryFixture();
+  summary.annotation_totals = {
+    annotated_clip_count: 1,
+    verified_clip_count: 1,
+    annotated_unit_count: 6,
+    verified_unit_count: 6,
+  };
+  apiMocks.getNavigationDatasetSummary.mockResolvedValueOnce(summary);
+
+  await renderAppWithDashboardSettled();
+
+  expect(screen.getByText("已标注数据")).toBeVisible();
+  expect(screen.getByText("自动标注覆盖率 100% · 6 Segments")).toBeVisible();
+  expect(screen.queryByText("待轨迹复核")).not.toBeInTheDocument();
+  expect(screen.queryByText("已退回")).not.toBeInTheDocument();
+});
+
 test("dashboard metric chart displays success rate and loss together", async () => {
   await renderAppWithDashboardSettled();
 
@@ -452,6 +470,70 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+});
+
+test("data management keeps ingestion and annotation facts separate and refresh preserves the view", async () => {
+  const summary = navigationDatasetSummaryFixture();
+  const counts = {
+    total: 2,
+    not_started: 1,
+    processing: 0,
+    waiting_initial_annotation: 0,
+    annotated_pending_review: 0,
+    verified: 1,
+    returned: 0,
+    discarded: 0,
+    failed: 0,
+  };
+  summary.dates[0].annotation = {
+    status: "partial",
+    counts,
+    completed_unit_count: 1,
+    annotated_unit_count: 1,
+    verified_unit_count: 1,
+    job_ref: null,
+    review_ref: null,
+    verified_review_ref: null,
+    historical_asset_ref: "verified_asset_0123456789abcdef0123456789abcdef",
+    updated_at: "2026-08-09T00:00:00Z",
+    source: "historical_import",
+  };
+  summary.dates[0].clips![0].annotation = {
+    ...summary.dates[0].annotation,
+    status: "verified",
+    counts: { ...counts, total: 1, not_started: 0 },
+  };
+  summary.dates[0].clips![1].annotation = {
+    ...summary.dates[0].annotation,
+    status: "not_started",
+    counts: { ...counts, total: 0, verified: 0, not_started: 0 },
+    completed_unit_count: 0,
+    annotated_unit_count: 0,
+    verified_unit_count: 0,
+    historical_asset_ref: null,
+    source: "none",
+  };
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue(summary);
+
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByRole("columnheader", { name: "数据状态" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "标注状态" })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "标注状态筛选" }));
+  fireEvent.click(screen.getByRole("option", { name: "部分完成" }));
+  expect(screen.getByText("20270515")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "展开 20270515" }));
+  expect(screen.getAllByRole("button", { name: "查看已验证版本" })).toHaveLength(2);
+
+  fireEvent.click(screen.getByRole("button", { name: "刷新数据资产" }));
+  await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2));
+  expect(screen.getByRole("combobox", { name: "标注状态筛选" })).toHaveTextContent("部分完成");
+  expect(screen.getByRole("button", { name: "收起 20270515" })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "标注状态筛选" }));
+  fireEvent.click(screen.getByRole("option", { name: "已验证" }));
+  expect(screen.getByText("20270515")).toBeVisible();
 });
 
 test("data management sends selected clips through a new visible DataPilot session", async () => {

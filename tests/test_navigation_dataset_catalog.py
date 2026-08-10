@@ -8,6 +8,7 @@ from vla_data_juicer_agents.navigation import dataset_catalog
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.dataset_catalog import (
     list_sync_images,
+    merge_annotation_lifecycle,
     resolve_sync_image_path,
     scan_navigation_dataset,
     scan_navigation_date,
@@ -87,6 +88,75 @@ def test_summary_uses_raw_data_as_source_of_truth_and_ignores_orphan_clip_data(t
     assert summary.sync_distribution.image == 1
     assert [date.date for date in summary.dates] == ["20270605"]
     assert [clip.clip for clip in summary.dates[0].clips] == ["clip_a", "clip_b"]
+
+
+def test_annotation_lifecycle_is_merged_without_changing_ingestion_facts(
+    tmp_path: Path,
+):
+    root = tmp_path / "VLADatasets"
+    write_metadata(root / "raw_data" / "20270605" / "clip_a")
+    write_metadata(root / "raw_data" / "20270605" / "clip_b")
+    touch_files(
+        root / "clip_data" / "20270605" / "clip_a" / "sync_data" / "0001" / "fisheye_front",
+        ["1.jpg"],
+    )
+    touch_files(
+        root / "clip_data" / "20270605" / "clip_a" / "sync_data" / "0002" / "fisheye_front",
+        ["1.jpg"],
+    )
+    summary = scan_navigation_dataset(settings_for(root))
+    original = summary.model_dump(mode="json")
+
+    projected = merge_annotation_lifecycle(
+        summary,
+        {
+            "scopes": [
+                {
+                    "dataset_date": "20270605",
+                    "source_clip": "clip_a",
+                    "status": "partial",
+                    "counts": {
+                        "total": 2,
+                        "not_started": 0,
+                        "processing": 0,
+                        "waiting_initial_annotation": 0,
+                        "annotated_pending_review": 0,
+                        "verified": 1,
+                        "returned": 1,
+                        "discarded": 0,
+                        "failed": 0,
+                    },
+                    "completed_unit_count": 1,
+                    "annotated_unit_count": 2,
+                    "verified_unit_count": 1,
+                    "job_ref": "job_" + "1" * 32,
+                    "review_ref": "review_" + "2" * 32,
+                    "verified_review_ref": None,
+                    "historical_asset_ref": None,
+                    "updated_at": "2026-08-09T00:00:00+00:00",
+                    "source": "native",
+                }
+            ]
+        },
+    )
+
+    assert summary.model_dump(mode="json") == original
+    clip_a, clip_b = projected.dates[0].clips
+    assert clip_a.status == "synced"
+    assert clip_a.annotation is not None
+    assert clip_a.annotation.status == "partial"
+    assert clip_a.annotation.annotated_unit_count == 2
+    assert clip_b.annotation is not None
+    assert clip_b.annotation.status == "not_started"
+    assert clip_b.annotation.counts.total == 0
+    assert projected.dates[0].annotation is not None
+    assert projected.dates[0].annotation.status == "partial"
+    assert projected.annotation_totals.model_dump() == {
+        "annotated_clip_count": 1,
+        "verified_clip_count": 0,
+        "annotated_unit_count": 2,
+        "verified_unit_count": 1,
+    }
 
 
 def test_scan_ignores_symlinked_raw_clip_directory_that_escapes_dataset_root(tmp_path: Path):

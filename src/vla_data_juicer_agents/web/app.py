@@ -33,6 +33,7 @@ from vla_data_juicer_agents.annotation.workflow_coordinator import (
 )
 from vla_data_juicer_agents.navigation.dataset_catalog import (
     list_sync_images,
+    merge_annotation_lifecycle,
     resolve_sync_image_path,
     scan_navigation_dataset,
     scan_navigation_date,
@@ -324,14 +325,22 @@ def create_app(
         @app.get("/api/navigation/datasets/summary")
         async def navigation_dataset_summary() -> dict[str, Any]:
             try:
-                return scan_navigation_dataset().model_dump(mode="json")
+                summary = scan_navigation_dataset()
+                return merge_annotation_lifecycle(
+                    summary,
+                    annotation_store.asset_lifecycle_snapshot(),
+                ).model_dump(mode="json")
             except (ValueError, FileNotFoundError) as exc:
                 _raise_navigation_http_error(exc)
 
         @app.get("/api/navigation/datasets/{date}")
         async def navigation_date_summary(date: str) -> dict[str, Any]:
             try:
-                return scan_navigation_date(date).model_dump(mode="json")
+                summary = scan_navigation_date(date)
+                return merge_annotation_lifecycle(
+                    summary,
+                    annotation_store.asset_lifecycle_snapshot(),
+                ).model_dump(mode="json")
             except (ValueError, FileNotFoundError) as exc:
                 _raise_navigation_http_error(exc)
 

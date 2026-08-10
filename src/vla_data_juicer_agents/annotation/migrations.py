@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_ANNOTATION_SCHEMA_VERSION = 8
+LATEST_ANNOTATION_SCHEMA_VERSION = 9
 
 
 class UnsupportedAnnotationSchemaVersionError(RuntimeError):
@@ -1569,6 +1569,52 @@ def _migration_008_public_domain_events(
     )
 
 
+def _migration_009_historical_verified_assets(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE historical_verified_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_ref TEXT NOT NULL UNIQUE,
+            dataset_date TEXT NOT NULL,
+            source_clip TEXT NOT NULL,
+            segment_ordinal INTEGER NOT NULL CHECK (segment_ordinal > 0),
+            segment_total INTEGER NOT NULL CHECK (
+                segment_total > 0 AND segment_ordinal <= segment_total
+            ),
+            artifact_sha256 TEXT NOT NULL CHECK (length(artifact_sha256) = 64),
+            private_artifact_path TEXT NOT NULL UNIQUE,
+            manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+            imported_at TEXT NOT NULL,
+            UNIQUE (dataset_date, source_clip, segment_ordinal)
+        );
+
+        CREATE INDEX idx_historical_verified_scope
+        ON historical_verified_assets (
+            dataset_date, source_clip, segment_ordinal
+        );
+
+        CREATE TRIGGER historical_verified_assets_no_update
+        BEFORE UPDATE ON historical_verified_assets BEGIN
+            SELECT RAISE(ABORT, 'historical verified assets are immutable');
+        END;
+        CREATE TRIGGER historical_verified_assets_no_delete
+        BEFORE DELETE ON historical_verified_assets BEGIN
+            SELECT RAISE(ABORT, 'historical verified assets are immutable');
+        END;
+
+        UPDATE annotation_migration_safety
+        SET schema_version = 9,
+            status = 'pending_integrity_check',
+            verified_at = NULL
+        WHERE singleton = 1 AND schema_version = 8;
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "annotation_m1", _migration_001_annotation_m1),
     (2, "runtime_step_evidence", _migration_002_runtime_step_evidence),
@@ -1597,5 +1643,10 @@ _MIGRATIONS = (
         8,
         "public_domain_events",
         _migration_008_public_domain_events,
+    ),
+    (
+        9,
+        "historical_verified_assets",
+        _migration_009_historical_verified_assets,
     ),
 )
