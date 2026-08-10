@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import threading
@@ -10,10 +11,18 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.annotation.api import create_annotation_router
@@ -332,6 +341,78 @@ def create_app(
                 ).model_dump(mode="json")
             except (ValueError, FileNotFoundError) as exc:
                 _raise_navigation_http_error(exc)
+
+        @app.get("/api/navigation/datasets/events/cursor")
+        async def navigation_dataset_event_cursor() -> dict[str, int]:
+            return {"cursor": store.navigation_dataset_event_cursor()}
+
+        @app.get("/api/navigation/datasets/events")
+        async def navigation_dataset_events(
+            request: Request,
+            after_seq: int = Query(default=0, ge=0),
+            last_event_id: str | None = Header(
+                default=None,
+                alias="Last-Event-ID",
+                max_length=32,
+            ),
+        ) -> StreamingResponse:
+            cursor = after_seq
+            if last_event_id is not None:
+                try:
+                    resumed_cursor = int(last_event_id, 10)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Last-Event-ID must be a non-negative integer",
+                    ) from exc
+                if resumed_cursor < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Last-Event-ID must be a non-negative integer",
+                    )
+                cursor = max(cursor, resumed_cursor)
+
+            async def stream():
+                nonlocal cursor
+                loop = asyncio.get_running_loop()
+                heartbeat_at = loop.time() + 15.0
+                yield "retry: 1000\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    events = await asyncio.to_thread(
+                        store.list_navigation_dataset_events_after,
+                        after_seq=cursor,
+                    )
+                    for event in events:
+                        cursor = int(event["seq"])
+                        payload = json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        yield (
+                            f"id: {cursor}\n"
+                            "event: navigation_dataset\n"
+                            f"data: {payload}\n\n"
+                        )
+                    now = loop.time()
+                    if now >= heartbeat_at:
+                        yield ": keepalive\n\n"
+                        heartbeat_at = now + 15.0
+                    if not events:
+                        await asyncio.sleep(0.25)
+
+            return StreamingResponse(
+                stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         @app.get("/api/navigation/datasets/{date}")
         async def navigation_date_summary(date: str) -> dict[str, Any]:

@@ -285,7 +285,9 @@ test("dashboard uses the annotation fact source for its aggregate metric", async
   await renderAppWithDashboardSettled();
 
   expect(screen.getByText("已标注数据")).toBeVisible();
-  expect(screen.getByText("自动标注覆盖率 100% · 6 Segments")).toBeVisible();
+  expect(
+    screen.getByText("标注覆盖率 100.0% · 1/1 clips · 6 Segments"),
+  ).toBeVisible();
   expect(screen.queryByText("待轨迹复核")).not.toBeInTheDocument();
   expect(screen.queryByText("已退回")).not.toBeInTheDocument();
 });

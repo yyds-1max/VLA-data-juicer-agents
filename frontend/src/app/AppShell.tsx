@@ -6,6 +6,7 @@ import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import { AnnotationDomainEventBridge } from "../features/annotation/AnnotationDomainEventBridge";
+import { NavigationDatasetEventBridge } from "../features/console/NavigationDatasetEventBridge";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
 import { cn } from "../lib/utils";
 
@@ -154,6 +155,7 @@ export function AppShell({ children }: AppShellProps) {
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
       <AnnotationDomainEventBridge />
+      <NavigationDatasetEventBridge />
       <ConsoleSidebar
         activePage={activePage}
         collapsed={sidebarCollapsed}

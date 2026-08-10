@@ -148,8 +148,9 @@ export function DashboardPage() {
     : "暂无导航数据";
   const annotationTotals = datasetSummary?.annotation_totals;
   const annotatedClipCount = annotationTotals?.annotated_clip_count ?? 0;
-  const annotationCoverage = datasetSummary?.totals.synced_clip_count
-    ? Math.round((annotatedClipCount / datasetSummary.totals.synced_clip_count) * 100)
+  const syncedClipCount = datasetSummary?.totals.synced_clip_count ?? 0;
+  const annotationCoverage = syncedClipCount
+    ? (annotatedClipCount / syncedClipCount) * 100
     : 0;
 
   return (
@@ -185,7 +186,7 @@ export function DashboardPage() {
           value={summaryError ? "--" : animateInteger(annotatedClipCount, animationProgress).toLocaleString("zh-CN")}
           detail={summaryError
             ? "标注统计暂不可用"
-            : `自动标注覆盖率 ${animateInteger(annotationCoverage, animationProgress)}% · ${animateInteger(annotationTotals?.annotated_unit_count ?? 0, animationProgress)} Segments`}
+            : `标注覆盖率 ${annotationCoverage.toFixed(1)}% · ${annotatedClipCount.toLocaleString("zh-CN")}/${syncedClipCount.toLocaleString("zh-CN")} clips · ${animateInteger(annotationTotals?.annotated_unit_count ?? 0, animationProgress)} Segments`}
           icon={Tags}
           loading={summaryLoading}
         />

@@ -201,6 +201,53 @@ def test_store_persists_timeline_events(tmp_path: Path):
     assert detail.events[1].type == "tool_end"
 
 
+def test_store_projects_navigation_dataset_events_with_a_durable_cursor(
+    tmp_path: Path,
+):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="处理 20270605")
+
+    store.append_timeline_event(
+        session.id,
+        {
+            "type": "task_state_updated",
+            "timestamp": "2026-08-10T10:00:00+00:00",
+            "payload": {
+                "task_ref": "DP-TEST",
+                "dataset_date": "20270605",
+                "status": "active",
+                "phase": "拆解与同步",
+                "state_revision": 4,
+            },
+        },
+    )
+    store.append_timeline_event(
+        session.id,
+        {
+            "type": "tool_end",
+            "timestamp": "2026-08-10T10:00:01+00:00",
+            "payload": {"status": "completed"},
+        },
+    )
+
+    assert store.navigation_dataset_event_cursor() == 1
+    events = store.list_navigation_dataset_events_after(after_seq=0)
+    assert events == [
+        {
+            "seq": 1,
+            "event_ref": events[0]["event_ref"],
+            "event_kind": "navigation.task.changed",
+            "dataset_date": "20270605",
+            "state_revision": 4,
+            "occurred_at": "2026-08-10T10:00:00+00:00",
+            "task_ref": "DP-TEST",
+            "status": "active",
+            "phase": "拆解与同步",
+        }
+    ]
+    assert store.list_navigation_dataset_events_after(after_seq=1) == []
+
+
 def test_projected_progress_stream_is_durable_and_idempotent(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="streamed progress")

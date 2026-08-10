@@ -1512,12 +1512,15 @@ class AnnotationStore:
             rows = connection.execute(
                 """
                 SELECT
-                    seq, event_ref, event_kind, aggregate_kind,
-                    job_ref, segment_ref, review_ref,
-                    state_revision, status, occurred_at
-                FROM annotation_public_events
-                WHERE seq > ?
-                ORDER BY seq
+                    events.seq, events.event_ref, events.event_kind,
+                    events.aggregate_kind, events.job_ref,
+                    events.segment_ref, events.review_ref,
+                    events.state_revision, events.status, events.occurred_at,
+                    jobs.dataset_date
+                FROM annotation_public_events AS events
+                JOIN annotation_jobs AS jobs ON jobs.job_ref = events.job_ref
+                WHERE events.seq > ?
+                ORDER BY events.seq
                 LIMIT ?
                 """,
                 (after_seq, limit),
@@ -1546,6 +1549,7 @@ class AnnotationStore:
                     "state_revision": int(row["state_revision"]),
                     "status": str(row["status"]),
                     "occurred_at": str(row["occurred_at"]),
+                    "dataset_date": str(row["dataset_date"]),
                 }
                 for row in rows
             ]

@@ -2,19 +2,28 @@ import "@testing-library/jest-dom/vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getNavigationDatasetSummary } from "../../api/client";
-import type { NavigationDatasetSummary } from "../../api/types";
+import {
+  getNavigationDatasetDate,
+  getNavigationDatasetSummary,
+} from "../../api/client";
+import type {
+  NavigationDatasetSummary,
+  NavigationDateSummary,
+} from "../../api/types";
 import {
   getNavigationDatasetSummaryCached,
   resetNavigationDatasetSummaryCache,
+  scheduleNavigationDatasetDateRefresh,
   useNavigationDatasetSummary,
 } from "./navigationDatasetSummaryCache";
 
 vi.mock("../../api/client", () => ({
+  getNavigationDatasetDate: vi.fn(),
   getNavigationDatasetSummary: vi.fn(),
 }));
 
 const getSummaryMock = vi.mocked(getNavigationDatasetSummary);
+const getDateMock = vi.mocked(getNavigationDatasetDate);
 
 function summary(totalDurationNs: number): NavigationDatasetSummary {
   return {
@@ -46,9 +55,31 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function dateSummary(status: "raw_only" | "extracted" | "synced"): NavigationDateSummary {
+  const synced = status === "synced";
+  const extracted = synced || status === "extracted";
+  return {
+    date: "20270605",
+    clip_count: 1,
+    total_duration_ns: 100,
+    raw_message_count: 10,
+    extracted_clip_count: extracted ? 1 : 0,
+    synced_clip_count: synced ? 1 : 0,
+    sync_frame_counts: {
+      image: synced ? 8 : 0,
+      pointcloud: 0,
+      odom: 0,
+      grid_map: 0,
+    },
+    status,
+    clips: [],
+  };
+}
+
 describe("navigation dataset summary cache", () => {
   beforeEach(() => {
     resetNavigationDatasetSummaryCache();
+    getDateMock.mockReset();
     getSummaryMock.mockReset();
   });
 
@@ -177,5 +208,45 @@ describe("navigation dataset summary cache", () => {
 
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
+  });
+
+  it("refreshes only the affected date when a background task advances", async () => {
+    vi.useFakeTimers();
+    const initial = summary(100);
+    initial.dates = [dateSummary("raw_only")];
+    initial.totals = {
+      date_count: 1,
+      clip_count: 1,
+      total_duration_ns: 100,
+      raw_message_count: 10,
+      extracted_clip_count: 0,
+      synced_clip_count: 0,
+    };
+    getSummaryMock.mockResolvedValue(initial);
+    getDateMock.mockResolvedValue(dateSummary("synced"));
+    const { result } = renderHook(() => useNavigationDatasetSummary());
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.summary?.dates[0].status).toBe("raw_only");
+
+    act(() => {
+      scheduleNavigationDatasetDateRefresh("20270605");
+      vi.advanceTimersByTime(250);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getDateMock).toHaveBeenCalledWith("20270605");
+    expect(getSummaryMock).toHaveBeenCalledTimes(1);
+    expect(result.current.summary).toMatchObject({
+      totals: { extracted_clip_count: 1, synced_clip_count: 1 },
+      sync_distribution: { image: 8 },
+      dates: [{ status: "synced" }],
+    });
+    vi.useRealTimers();
   });
 });

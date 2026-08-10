@@ -13,6 +13,7 @@ export type AnnotationDomainEvent = {
   job_ref?: string;
   segment_ref?: string;
   review_ref?: string;
+  dataset_date?: string;
   state_revision: number;
   status: string;
   occurred_at: string;
@@ -63,6 +64,7 @@ export function parseAnnotationDomainEvent(raw: string): AnnotationDomainEvent |
         || value.aggregate_kind === "review"
       )
       || !Number.isSafeInteger(value.state_revision)
+      || (value.dataset_date !== undefined && !/^\d{8}$/.test(value.dataset_date))
       || typeof value.status !== "string"
       || typeof value.occurred_at !== "string"
     ) {

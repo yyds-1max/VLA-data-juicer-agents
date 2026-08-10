@@ -756,6 +756,15 @@ def test_navigation_dataset_summary_returns_scanned_totals_and_sync_distribution
     assert body["sync_distribution"]["image"] == 2
 
 
+def test_navigation_dataset_event_cursor_is_public_and_starts_empty(tmp_path: Path):
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/events/cursor")
+
+    assert response.status_code == 200
+    assert response.json() == {"cursor": 0}
+
+
 def test_navigation_dataset_summary_joins_annotation_lifecycle_without_changing_ingestion(
     tmp_path: Path,
     monkeypatch,
