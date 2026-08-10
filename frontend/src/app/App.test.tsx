@@ -276,6 +276,7 @@ test("dashboard uses the annotation fact source for its aggregate metric", async
   const summary = navigationDatasetSummaryFixture();
   summary.annotation_totals = {
     annotated_clip_count: 1,
+    annotated_duration_ns: 1_500_000_000,
     verified_clip_count: 1,
     annotated_unit_count: 6,
     verified_unit_count: 6,
@@ -285,6 +286,7 @@ test("dashboard uses the annotation fact source for its aggregate metric", async
   await renderAppWithDashboardSettled();
 
   expect(screen.getByText("已标注数据")).toBeVisible();
+  expect(screen.getByText("1.5 秒")).toBeVisible();
   expect(
     screen.getByText("标注覆盖率 100.0% · 1/1 clips · 6 Segments"),
   ).toBeVisible();
@@ -344,7 +346,7 @@ test("dashboard shows honest empty and error states and can retry the summary", 
   apiMocks.getNavigationDatasetSummary.mockResolvedValueOnce(emptySummary);
 
   const emptyView = render(<App routerMode="declarative" />);
-  expect(await screen.findByText("0 秒")).toBeVisible();
+  expect(await screen.findAllByText("0 秒")).toHaveLength(2);
   expect(screen.getByText("暂无导航数据")).toBeVisible();
   emptyView.unmount();
 });

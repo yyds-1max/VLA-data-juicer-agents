@@ -153,6 +153,7 @@ def test_annotation_lifecycle_is_merged_without_changing_ingestion_facts(
     assert projected.dates[0].annotation.status == "partial"
     assert projected.annotation_totals.model_dump() == {
         "annotated_clip_count": 1,
+        "annotated_duration_ns": 2_500_000_000,
         "verified_clip_count": 0,
         "annotated_unit_count": 2,
         "verified_unit_count": 1,

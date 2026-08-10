@@ -113,6 +113,10 @@ function aggregateNavigationDatasetSummary(
         (total, clip) => total + Number((clip.annotation?.annotated_unit_count ?? 0) > 0),
         0,
       ),
+      annotated_duration_ns: clips.reduce(
+        (total, clip) => total + ((clip.annotation?.annotated_unit_count ?? 0) > 0 ? clip.duration_ns : 0),
+        0,
+      ),
       verified_clip_count: clips.reduce(
         (total, clip) => total + Number(clip.annotation?.status === "verified"),
         0,

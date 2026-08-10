@@ -148,9 +148,11 @@ export function DashboardPage() {
     : "暂无导航数据";
   const annotationTotals = datasetSummary?.annotation_totals;
   const annotatedClipCount = annotationTotals?.annotated_clip_count ?? 0;
+  const annotatedDurationNs = annotationTotals?.annotated_duration_ns ?? 0;
   const syncedClipCount = datasetSummary?.totals.synced_clip_count ?? 0;
-  const annotationCoverage = syncedClipCount
-    ? (annotatedClipCount / syncedClipCount) * 100
+  const animatedAnnotatedClipCount = animateInteger(annotatedClipCount, animationProgress);
+  const animatedAnnotationCoverage = syncedClipCount
+    ? (animatedAnnotatedClipCount / syncedClipCount) * 100
     : 0;
 
   return (
@@ -183,10 +185,10 @@ export function DashboardPage() {
         />
         <MetricCard
           title="已标注数据"
-          value={summaryError ? "--" : animateInteger(annotatedClipCount, animationProgress).toLocaleString("zh-CN")}
+          value={summaryError ? "--" : formatAnimatedDuration(annotatedDurationNs, animationProgress)}
           detail={summaryError
             ? "标注统计暂不可用"
-            : `标注覆盖率 ${annotationCoverage.toFixed(1)}% · ${annotatedClipCount.toLocaleString("zh-CN")}/${syncedClipCount.toLocaleString("zh-CN")} clips · ${animateInteger(annotationTotals?.annotated_unit_count ?? 0, animationProgress)} Segments`}
+            : `标注覆盖率 ${animatedAnnotationCoverage.toFixed(1)}% · ${animatedAnnotatedClipCount.toLocaleString("zh-CN")}/${syncedClipCount.toLocaleString("zh-CN")} clips · ${animateInteger(annotationTotals?.annotated_unit_count ?? 0, animationProgress)} Segments`}
           icon={Tags}
           loading={summaryLoading}
         />

@@ -105,6 +105,7 @@ class AnnotationLifecycleProjection(BaseModel):
 
 class AnnotationDatasetTotals(BaseModel):
     annotated_clip_count: int = 0
+    annotated_duration_ns: int = 0
     verified_clip_count: int = 0
     annotated_unit_count: int = 0
     verified_unit_count: int = 0
@@ -240,6 +241,13 @@ def merge_annotation_lifecycle(
             annotated_clip_count=sum(
                 projection.annotated_unit_count > 0
                 for projection in clip_projections
+            ),
+            annotated_duration_ns=sum(
+                clip.duration_ns
+                for date in projected.dates
+                for clip in date.clips
+                if clip.annotation is not None
+                and clip.annotation.annotated_unit_count > 0
             ),
             verified_clip_count=sum(
                 projection.status == "verified"

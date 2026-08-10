@@ -800,6 +800,7 @@ def test_navigation_dataset_summary_joins_annotation_lifecycle_without_changing_
     assert body["dates"][0]["annotation"]["status"] == "processing"
     assert body["annotation_totals"] == {
         "annotated_clip_count": 0,
+        "annotated_duration_ns": 0,
         "verified_clip_count": 0,
         "annotated_unit_count": 0,
         "verified_unit_count": 0,

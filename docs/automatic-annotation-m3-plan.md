@@ -112,6 +112,9 @@ dates[].annotation
 dates[].clips[].annotation
 ```
 
+`annotation_totals.annotated_duration_ns` 按与“已标注 clips”相同的口径汇总
+这些 clips 在导航数据目录中的原始采集时长；缺少可关联 metadata 时不推测时长。
+
 因此仪表盘和数据管理页读取完全相同的聚合结果。Annotation Jobs/Reviews 页面仍
 读取现有 `/api/annotation` 领域 API。
 

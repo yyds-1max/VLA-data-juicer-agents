@@ -259,6 +259,7 @@ export interface NavigationDatasetSummary {
   sync_distribution: NavigationSyncFrameCounts;
   annotation_totals?: {
     annotated_clip_count: number;
+    annotated_duration_ns: number;
     verified_clip_count: number;
     annotated_unit_count: number;
     verified_unit_count: number;
