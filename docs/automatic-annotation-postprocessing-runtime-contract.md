@@ -1,9 +1,9 @@
-# 自动标注 M2：导航后处理隐式运行契约
+# 自动标注：导航后处理 Runtime 契约
 
-> 状态：M2 服务器 Golden 前的权威运行契约  
+> 状态：生产运行与变更验收的长期权威契约
 > 盘点日期：2026-07-30  
 > 适用 Runtime：`navigation_odom_v1`  
-> 上位计划：`docs/automatic-annotation-m2-plan.md`
+> 开发背景：`docs/automatic-annotation-development-summary.md`
 
 ## 1. 目的与边界
 
@@ -36,11 +36,11 @@ Golden、修改脚本或猜测成功来消除冲突。
 
 ## 3. 端到端链路
 
-M2 后处理从已提交且完成 Tracking 的 M1 staging 开始：
+导航后处理从已提交且完成 Tracking 的 Annotation staging 开始：
 
 ```text
-M1 tracked staging
-→ 全新 M2 attempt
+tracked staging
+→ 全新 postprocessing attempt
 → 构造 ${dataset_date}_temp
 → 复制选中 tracked segments、maps、metadata
 → 构造 job-private clip_data 镜像
