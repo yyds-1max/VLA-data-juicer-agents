@@ -35,6 +35,10 @@ from vla_data_juicer_agents.annotation.maintenance import (
 from vla_data_juicer_agents.annotation.navigation_gateway import (
     AnnotationNavigationGateway,
 )
+from vla_data_juicer_agents.annotation.models import (
+    AnnotationConflictError,
+    AnnotationValidationError,
+)
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.annotation.worker import AnnotationWorker
 from vla_data_juicer_agents.annotation.workflow_coordinator import (
@@ -51,6 +55,7 @@ from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
     CreateSessionRequest,
+    CreateDatasetReleaseRequest,
     CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
@@ -413,6 +418,74 @@ def create_app(
                     "X-Accel-Buffering": "no",
                 },
             )
+
+        @app.get("/api/navigation/datasets/releases")
+        async def navigation_dataset_releases() -> dict[str, Any]:
+            try:
+                summary = scan_navigation_dataset()
+                return {
+                    "releases": [
+                        annotation_store.dataset_release_candidate(
+                            dataset_date=date.date,
+                            managed_clips=[
+                                {
+                                    "source_clip": clip.clip,
+                                    "status": clip.status,
+                                    "duration_ns": clip.duration_ns,
+                                }
+                                for clip in date.clips
+                            ],
+                        )
+                        for date in summary.dates
+                    ]
+                }
+            except (ValueError, FileNotFoundError) as exc:
+                _raise_navigation_http_error(exc)
+
+        @app.post("/api/navigation/datasets/releases/{date}")
+        async def create_navigation_dataset_release(
+            date: str,
+            request: CreateDatasetReleaseRequest,
+            idempotency_key: str = Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=200,
+            ),
+        ) -> dict[str, Any]:
+            try:
+                date_summary = scan_navigation_date(date)
+                managed_clips = [
+                    {
+                        "source_clip": clip.clip,
+                        "status": clip.status,
+                        "duration_ns": clip.duration_ns,
+                    }
+                    for clip in date_summary.clips
+                ]
+                return annotation_store.create_dataset_release(
+                    dataset_date=date,
+                    managed_clips=managed_clips,
+                    expected_scope_manifest_sha256=(
+                        request.expected_scope_manifest_sha256
+                    ),
+                    note=request.note,
+                    idempotency_key=idempotency_key,
+                )
+            except AnnotationConflictError as exc:
+                detail: dict[str, Any] = {
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+                if exc.current is not None:
+                    detail["current"] = exc.current
+                raise HTTPException(status_code=409, detail=detail) from exc
+            except AnnotationValidationError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            except (ValueError, FileNotFoundError) as exc:
+                _raise_navigation_http_error(exc)
 
         @app.get("/api/navigation/datasets/{date}")
         async def navigation_date_summary(date: str) -> dict[str, Any]:

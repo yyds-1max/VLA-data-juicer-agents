@@ -178,6 +178,13 @@ class CreateSessionRequest(BaseModel):
         return self
 
 
+class CreateDatasetReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_scope_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class CreateTurnRequest(CreateSessionRequest):
     entrypoint: Literal["chat"] = "chat"
     invocation_id: str | None = Field(default=None, max_length=200)

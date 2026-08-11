@@ -114,27 +114,42 @@ def test_annotation_lifecycle_is_merged_without_changing_ingestion_facts(
                 {
                     "dataset_date": "20270605",
                     "source_clip": "clip_a",
-                    "status": "partial",
-                    "counts": {
-                        "total": 2,
-                        "not_started": 0,
-                        "processing": 0,
-                        "waiting_initial_annotation": 0,
-                        "annotated_pending_review": 0,
-                        "verified": 1,
-                        "returned": 1,
-                        "discarded": 0,
-                        "failed": 0,
+                    "annotation": {
+                        "status": "annotated",
+                        "counts": {
+                            "total": 2,
+                            "not_started": 0,
+                            "processing": 0,
+                            "waiting_initial_annotation": 0,
+                            "annotated": 2,
+                            "failed": 0,
+                        },
+                        "completed_unit_count": 2,
+                        "annotated_unit_count": 2,
+                        "job_ref": "job_" + "1" * 32,
+                        "historical_asset_ref": None,
+                        "updated_at": "2026-08-09T00:00:00+00:00",
+                        "source": "native",
                     },
-                    "completed_unit_count": 1,
-                    "annotated_unit_count": 2,
-                    "verified_unit_count": 1,
-                    "job_ref": "job_" + "1" * 32,
-                    "review_ref": "review_" + "2" * 32,
-                    "verified_review_ref": None,
-                    "historical_asset_ref": None,
-                    "updated_at": "2026-08-09T00:00:00+00:00",
-                    "source": "native",
+                    "review": {
+                        "status": "partial",
+                        "counts": {
+                            "total": 2,
+                            "pending": 0,
+                            "in_progress": 0,
+                            "returned": 1,
+                            "verified": 1,
+                            "discarded": 0,
+                        },
+                        "resolved_unit_count": 1,
+                        "verified_unit_count": 1,
+                        "publishable_verified_unit_count": 1,
+                        "review_ref": None,
+                        "verified_review_ref": None,
+                        "historical_asset_ref": None,
+                        "updated_at": "2026-08-09T00:00:00+00:00",
+                        "source": "native",
+                    },
                 }
             ]
         },
@@ -144,13 +159,14 @@ def test_annotation_lifecycle_is_merged_without_changing_ingestion_facts(
     clip_a, clip_b = projected.dates[0].clips
     assert clip_a.status == "synced"
     assert clip_a.annotation is not None
-    assert clip_a.annotation.status == "partial"
+    assert clip_a.annotation.status == "annotated"
     assert clip_a.annotation.annotated_unit_count == 2
-    assert clip_b.annotation is not None
-    assert clip_b.annotation.status == "not_started"
-    assert clip_b.annotation.counts.total == 0
-    assert projected.dates[0].annotation is not None
-    assert projected.dates[0].annotation.status == "partial"
+    assert clip_a.review is not None
+    assert clip_a.review.status == "partial"
+    assert clip_b.annotation is None
+    assert clip_b.review is None
+    assert projected.dates[0].annotation is None
+    assert projected.dates[0].review is None
     assert projected.annotation_totals.model_dump() == {
         "annotated_clip_count": 1,
         "annotated_duration_ns": 2_500_000_000,
@@ -158,6 +174,79 @@ def test_annotation_lifecycle_is_merged_without_changing_ingestion_facts(
         "annotated_unit_count": 2,
         "verified_unit_count": 1,
     }
+
+
+def test_date_review_projection_counts_unreviewed_synced_units_and_is_not_releasable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "VLADatasets"
+    for clip in ("clip_a", "clip_b"):
+        write_metadata(root / "raw_data" / "20270605" / clip)
+        touch_files(
+            root
+            / "clip_data"
+            / "20270605"
+            / clip
+            / "sync_data"
+            / "0001"
+            / "fisheye_front",
+            ["1.jpg"],
+        )
+    summary = scan_navigation_dataset(settings_for(root))
+    annotated = {
+        "status": "annotated",
+        "counts": {
+            "total": 1,
+            "not_started": 0,
+            "processing": 0,
+            "waiting_initial_annotation": 0,
+            "annotated": 1,
+            "failed": 0,
+        },
+        "completed_unit_count": 1,
+        "annotated_unit_count": 1,
+        "updated_at": "2026-08-09T00:00:00+00:00",
+        "source": "historical_import",
+    }
+    projected = merge_annotation_lifecycle(
+        summary,
+        {
+            "scopes": [
+                {
+                    "dataset_date": "20270605",
+                    "source_clip": "clip_a",
+                    "annotation": annotated,
+                    "review": {
+                        "status": "verified",
+                        "counts": {
+                            "total": 1,
+                            "pending": 0,
+                            "in_progress": 0,
+                            "returned": 0,
+                            "verified": 1,
+                            "discarded": 0,
+                        },
+                        "resolved_unit_count": 1,
+                        "verified_unit_count": 1,
+                        "publishable_verified_unit_count": 1,
+                        "updated_at": "2026-08-09T00:00:00+00:00",
+                        "source": "historical_import",
+                    },
+                }
+            ],
+            "releases": [],
+        },
+    )
+
+    date = projected.dates[0]
+    assert date.annotation is not None
+    assert date.annotation.status == "processing"
+    assert date.review is not None
+    assert date.review.status == "partial"
+    assert date.review.counts.total == 2
+    assert date.review.counts.pending == 1
+    assert date.review.resolved_unit_count == 1
+    assert date.release.status == "not_ready"
 
 
 def test_scan_ignores_symlinked_raw_clip_directory_that_escapes_dataset_root(tmp_path: Path):
@@ -194,6 +283,7 @@ def test_date_scan_reports_raw_only_extracted_and_synced_statuses(tmp_path: Path
     assert by_clip["raw_clip"].status == "raw_only"
     assert by_clip["extracted_clip"].status == "extracted"
     assert by_clip["synced_clip"].status == "synced"
+    assert date_summary.status == "raw_only"
     assert by_clip["synced_clip"].has_tmp_dir is True
     assert by_clip["synced_clip"].has_sync_data is True
     assert by_clip["synced_clip"].sync_frame_counts.model_dump() == {

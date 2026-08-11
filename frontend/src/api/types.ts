@@ -164,24 +164,17 @@ export type NavigationDatasetStatus = "raw_only" | "extracted" | "synced" | "err
 
 export type AnnotationLifecycleStatus =
   | "not_started"
-  | "processing"
   | "waiting_initial_annotation"
-  | "annotated_pending_review"
-  | "verified"
-  | "returned"
-  | "discarded"
-  | "failed"
-  | "partial";
+  | "processing"
+  | "annotated"
+  | "failed";
 
 export interface AnnotationLifecycleCounts {
   total: number;
   not_started: number;
-  processing: number;
   waiting_initial_annotation: number;
-  annotated_pending_review: number;
-  verified: number;
-  returned: number;
-  discarded: number;
+  processing: number;
+  annotated: number;
   failed: number;
 }
 
@@ -190,13 +183,58 @@ export interface AnnotationLifecycleProjection {
   counts: AnnotationLifecycleCounts;
   completed_unit_count: number;
   annotated_unit_count: number;
-  verified_unit_count: number;
   job_ref: string | null;
+  historical_asset_ref: string | null;
+  updated_at: string | null;
+  source: "none" | "native" | "historical_import" | "mixed";
+}
+
+export type ReviewLifecycleStatus =
+  | "pending"
+  | "in_progress"
+  | "returned"
+  | "verified"
+  | "discarded"
+  | "partial"
+  | "completed";
+
+export interface ReviewLifecycleCounts {
+  total: number;
+  pending: number;
+  in_progress: number;
+  returned: number;
+  verified: number;
+  discarded: number;
+}
+
+export interface ReviewLifecycleProjection {
+  status: ReviewLifecycleStatus;
+  counts: ReviewLifecycleCounts;
+  resolved_unit_count: number;
+  verified_unit_count: number;
+  publishable_verified_unit_count: number;
   review_ref: string | null;
   verified_review_ref: string | null;
   historical_asset_ref: string | null;
   updated_at: string | null;
-  source: "none" | "native" | "historical_import" | "mixed";
+  source: "native" | "historical_import" | "mixed";
+}
+
+export type DatasetReleaseStatus = "not_ready" | "ready" | "released";
+
+export interface DatasetReleaseProjection {
+  status: DatasetReleaseStatus;
+  release_ref: string | null;
+  source_clip_count: number;
+  total_duration_ns: number;
+  verified_unit_count: number;
+  discarded_unit_count: number;
+  scope_manifest_sha256: string | null;
+  note: string | null;
+  actor_kind: string | null;
+  deployment_instance: string | null;
+  released_at: string | null;
+  updated_at: string | null;
 }
 
 export interface NavigationTopicSummary {
@@ -230,6 +268,7 @@ export interface NavigationClipSummary {
   status: NavigationDatasetStatus;
   errors: string[];
   annotation?: AnnotationLifecycleProjection | null;
+  review?: ReviewLifecycleProjection | null;
 }
 
 export interface NavigationDateSummary {
@@ -243,6 +282,12 @@ export interface NavigationDateSummary {
   status: NavigationDatasetStatus;
   clips?: NavigationClipSummary[];
   annotation?: AnnotationLifecycleProjection | null;
+  review?: ReviewLifecycleProjection | null;
+  release?: DatasetReleaseProjection;
+}
+
+export interface NavigationDatasetRelease extends DatasetReleaseProjection {
+  dataset_date: string;
 }
 
 export interface NavigationDatasetTotals {

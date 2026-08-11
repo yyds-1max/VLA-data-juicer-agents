@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -974,6 +975,73 @@ def test_navigation_invalid_request_does_not_echo_private_error(
     )
     assert str(tmp_path) not in response.text
     assert "sk-abcdefghijklmnop" not in response.text
+
+
+def test_navigation_dataset_release_api_lists_and_records_ready_date(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = make_client(tmp_path)
+    artifact = tmp_path / "finish" / "segment_trajectory_fix_five.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"frame":1}', encoding="utf-8")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    client.app.state.annotation_store.import_historical_verified_assets(
+        manifest_sha256="a" * 64,
+        assets=[
+            {
+                "dataset_date": "20260623",
+                "source_clip": "clip_a",
+                "segment_ordinal": 1,
+                "segment_total": 1,
+                "artifact_sha256": artifact_sha,
+                "private_artifact_path": str(artifact),
+            }
+        ],
+    )
+    clip = SimpleNamespace(clip="clip_a", status="synced", duration_ns=3_000)
+    date = SimpleNamespace(date="20260623", clips=[clip])
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_navigation_dataset",
+        lambda: SimpleNamespace(dates=[date]),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_navigation_date",
+        lambda requested_date: date,
+    )
+
+    listing = client.get("/api/navigation/datasets/releases")
+
+    assert listing.status_code == 200
+    candidate = listing.json()["releases"][0]
+    assert candidate["status"] == "ready"
+    assert candidate["scope_manifest_sha256"]
+
+    released = client.post(
+        "/api/navigation/datasets/releases/20260623",
+        headers={"Idempotency-Key": "release-api"},
+        json={
+            "expected_scope_manifest_sha256": candidate["scope_manifest_sha256"],
+            "note": None,
+        },
+    )
+    replay = client.post(
+        "/api/navigation/datasets/releases/20260623",
+        headers={"Idempotency-Key": "release-api"},
+        json={
+            "expected_scope_manifest_sha256": candidate["scope_manifest_sha256"],
+            "note": None,
+        },
+    )
+
+    assert released.status_code == 200
+    assert released.json()["status"] == "released"
+    assert replay.json() == released.json()
+    assert client.get("/api/navigation/datasets/releases").json()["releases"][0][
+        "status"
+    ] == "released"
 
 
 def _create_session(client: TestClient) -> str:

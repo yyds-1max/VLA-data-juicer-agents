@@ -8,6 +8,7 @@ import {
   Database,
   Files,
   Images,
+  Info,
   Layers3,
   RefreshCw,
   Search,
@@ -15,23 +16,43 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, type MouseEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useStore } from "zustand";
 
-import { getSyncImages, getSyncImageUrl } from "../../../api/client";
+import {
+  createNavigationDatasetRelease,
+  getNavigationDatasetReleases,
+  getSyncImages,
+  getSyncImageUrl,
+} from "../../../api/client";
 import type {
   AnnotationLifecycleProjection,
   AnnotationLifecycleStatus,
+  DatasetReleaseProjection,
   NavigationClipSummary,
   NavigationDatasetStatus,
   NavigationDateSummary,
   NavigationSyncImageListing,
+  NavigationDatasetRelease,
+  ReviewLifecycleProjection,
+  ReviewLifecycleStatus,
 } from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { ConsoleSlidingTabs } from "../../../components/console/ConsoleSlidingTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
 import { Input } from "../../../components/ui/input";
+import { Button } from "../../../components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "../../../components/ui/popover";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../../../components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -70,6 +91,7 @@ const statusTones: Record<NavigationDatasetStatus, StatusTone> = {
 type DataSurface = "navigation" | "robotic_arm";
 type StatusFilter = "all" | NavigationDatasetStatus;
 type AnnotationStatusFilter = "all" | AnnotationLifecycleStatus;
+type ReviewStatusFilter = "all" | ReviewLifecycleStatus;
 
 const dataSurfaces = [
   { value: "navigation", label: "导航数据" },
@@ -86,26 +108,38 @@ const statusOptions = [
 
 const annotationStatusLabels: Record<AnnotationLifecycleStatus, string> = {
   not_started: "尚未标注",
-  processing: "处理中",
   waiting_initial_annotation: "待首帧标注",
-  annotated_pending_review: "已标注 / 待复核",
-  verified: "已验证",
-  returned: "已退回",
-  discarded: "已废弃",
-  failed: "处理失败",
-  partial: "部分完成",
+  processing: "处理中",
+  annotated: "已标注",
+  failed: "标注异常",
 };
 
 const annotationStatusTones: Record<AnnotationLifecycleStatus, StatusTone> = {
   not_started: "neutral",
   processing: "info",
   waiting_initial_annotation: "warning",
-  annotated_pending_review: "warning",
-  verified: "success",
-  returned: "warning",
-  discarded: "neutral",
+  annotated: "success",
   failed: "danger",
+};
+
+const reviewStatusLabels: Record<ReviewLifecycleStatus, string> = {
+  pending: "待复核",
+  in_progress: "修正中",
+  returned: "已退回",
+  verified: "已验证",
+  discarded: "已废弃",
+  partial: "部分完成",
+  completed: "复核完成",
+};
+
+const reviewStatusTones: Record<ReviewLifecycleStatus, StatusTone> = {
+  pending: "warning",
+  in_progress: "info",
+  returned: "warning",
+  verified: "success",
+  discarded: "neutral",
   partial: "info",
+  completed: "success",
 };
 
 const annotationStatusOptions = [
@@ -115,6 +149,14 @@ const annotationStatusOptions = [
     label,
   })),
 ] satisfies Array<{ value: AnnotationStatusFilter; label: string }>;
+
+const reviewStatusOptions = [
+  { value: "all", label: "全部复核状态" },
+  ...Object.entries(reviewStatusLabels).map(([value, label]) => ({
+    value: value as ReviewLifecycleStatus,
+    label,
+  })),
+] satisfies Array<{ value: ReviewStatusFilter; label: string }>;
 
 function formatCount(value: number) {
   return value.toLocaleString();
@@ -211,7 +253,10 @@ function AnnotationStatusCell({
 }: {
   projection: AnnotationLifecycleProjection | null | undefined;
 }) {
-  const status = projection?.status ?? "not_started";
+  if (!projection) {
+    return <span className="text-sm text-slate-400">—</span>;
+  }
+  const status = projection.status;
   const total = projection?.counts.total ?? 0;
   const annotated = projection?.annotated_unit_count ?? 0;
   return (
@@ -228,35 +273,75 @@ function AnnotationStatusCell({
   );
 }
 
-function annotationDeepLink(
-  projection: AnnotationLifecycleProjection | null | undefined,
-): { href: string; label: string } | null {
-  if (!projection) return null;
-  if (projection.status === "verified" && projection.verified_review_ref) {
-    return {
-      href: `/annotation/reviews/${encodeURIComponent(projection.verified_review_ref)}`,
-      label: "查看已验证版本",
-    };
+function ReviewStatusCell({ projection }: { projection: ReviewLifecycleProjection | null | undefined }) {
+  if (!projection) {
+    return <span className="text-sm text-slate-400">—</span>;
   }
-  if (projection.historical_asset_ref) {
-    return {
-      href: `/annotation/verified/${encodeURIComponent(projection.historical_asset_ref)}`,
-      label: "查看已验证版本",
-    };
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <StatusTag tone={reviewStatusTones[projection.status]}>
+        {reviewStatusLabels[projection.status]}
+      </StatusTag>
+      <span className="text-[11px] tabular-nums text-slate-400">
+        已完成 {projection.resolved_unit_count}/{projection.counts.total}
+      </span>
+    </div>
+  );
+}
+
+function ReleaseStatusCell({ projection }: { projection: DatasetReleaseProjection | null | undefined }) {
+  if (!projection || projection.status === "not_ready") {
+    return <span className="text-sm text-slate-400">—</span>;
   }
-  if (projection.review_ref) {
-    return {
-      href: `/annotation/reviews/${encodeURIComponent(projection.review_ref)}`,
-      label: projection.status === "annotated_pending_review" ? "进入人工复核" : "查看复核",
-    };
-  }
-  if (projection.job_ref) {
-    return {
-      href: `/annotation/jobs/${encodeURIComponent(projection.job_ref)}`,
-      label: projection.status === "waiting_initial_annotation" ? "进入标注" : "查看任务",
-    };
-  }
-  return null;
+  return (
+    <StatusTag tone={projection.status === "released" ? "success" : "warning"}>
+      {projection.status === "released" ? "已发布" : "待发布"}
+    </StatusTag>
+  );
+}
+
+function DetailsPopover({
+  label,
+  title,
+  rows,
+}: {
+  label: string;
+  title: string;
+  rows: Array<{ label: string; value: string }>;
+}) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          aria-label={label}
+          className="h-7 px-2 text-xs text-slate-500 hover:bg-blue-50 hover:text-blue-700 active:translate-y-px"
+        >
+          <Info aria-hidden="true" className="size-3.5" />
+          详情
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        sideOffset={8}
+        className="w-[min(22rem,calc(100vw-2rem))] rounded-xl border-slate-200 p-0 shadow-xl shadow-slate-950/8"
+      >
+        <div className="border-b border-slate-100 px-4 py-3">
+          <p className="truncate text-sm font-semibold text-slate-950">{title}</p>
+          <p className="mt-0.5 text-xs text-slate-500">数据资产详情</p>
+        </div>
+        <dl className="space-y-2 px-4 py-4 text-xs">
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-start justify-between gap-4">
+              <dt className="shrink-0 text-slate-500">{row.label}</dt>
+              <dd className="min-w-0 break-words text-right font-medium text-slate-800">{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 function getScrollbarProximity(element: HTMLElement, clientX: number, clientY: number) {
@@ -320,19 +405,17 @@ function useScrollbarProximity() {
 function ClipRows({
   clips,
   highlightedClip,
-  onOpenAnnotation,
   onViewSyncImages,
 }: {
   clips: NavigationClipSummary[];
   highlightedClip: string | null;
-  onOpenAnnotation: (href: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
   const clipScrollbar = useScrollbarProximity();
 
   return (
     <tr className="border-b border-slate-200 bg-slate-50/55">
-      <td colSpan={10} className="px-0 py-0">
+      <td colSpan={9} className="px-0 py-0">
         {clips.length === 0 ? (
           <div className="border-l-2 border-blue-200 px-16 py-6 text-sm text-slate-500">该日期暂无 clip 明细。</div>
         ) : (
@@ -345,18 +428,17 @@ function ClipRows({
             onPointerLeave={clipScrollbar.onPointerLeave}
             onPointerMove={clipScrollbar.onPointerMove}
           >
-            <table className="w-full min-w-[1240px] text-left text-sm">
+            <table className="w-full min-w-[1180px] text-left text-sm">
               <thead className="text-xs text-slate-500">
                 <tr className="h-10 border-b border-slate-200/90 bg-slate-50/80">
                   <th className="pl-16 pr-3 font-medium">clip 名称</th>
                   <th className="pr-3 font-medium">时长</th>
-                  <th className="pr-3 font-medium">topic 摘要</th>
-                  <th className="pr-3 font-medium">raw 消息</th>
                   <th className="pr-3 font-medium">tmp_dir</th>
                   <th className="pr-3 font-medium">sync_data</th>
-                  <th className="pr-3 font-medium">同步图像帧</th>
                   <th className="pr-3 font-medium">数据状态</th>
                   <th className="pr-3 font-medium">标注状态</th>
+                  <th className="pr-3 font-medium">修正 / 复核</th>
+                  <th className="pr-3 font-medium">详情</th>
                   <th className="pr-4 text-right font-medium">操作</th>
                 </tr>
               </thead>
@@ -376,18 +458,27 @@ function ClipRows({
                         {clip.clip}
                       </td>
                       <td className="pr-3 text-slate-500">{formatDuration(clip.duration_ns)}</td>
-                      <td className="max-w-[18rem] truncate pr-3 text-slate-500" title={formatTopics(clip.topics)}>
-                        {formatTopics(clip.topics)}
-                      </td>
-                      <td className="pr-3 text-slate-500">{formatCount(clip.raw_message_count)}</td>
                       <td className="pr-3 text-slate-500">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
                       <td className="pr-3 text-slate-500">{clip.has_sync_data ? "已存在" : "缺失"}</td>
-                      <td className="pr-3 text-slate-500">{formatCount(clip.sync_frame_counts.image)}</td>
                       <td className="pr-3">
                         <StatusCell status={clip.status} />
                       </td>
                       <td className="pr-3">
                         <AnnotationStatusCell projection={clip.annotation} />
+                      </td>
+                      <td className="pr-3">
+                        <ReviewStatusCell projection={clip.review} />
+                      </td>
+                      <td className="pr-3">
+                        <DetailsPopover
+                          label={`查看 ${clip.clip} 详情`}
+                          title={clip.clip}
+                          rows={[
+                            { label: "topic 摘要", value: formatTopics(clip.topics) },
+                            { label: "raw 消息", value: formatCount(clip.raw_message_count) },
+                            { label: "同步图像帧", value: formatCount(clip.sync_frame_counts.image) },
+                          ]}
+                        />
                       </td>
                       <td className="pr-4 text-right">
                         <div className="flex justify-end gap-1">
@@ -400,18 +491,6 @@ function ClipRows({
                           >
                             同步图像
                           </button>
-                          {annotationDeepLink(clip.annotation) ? (
-                            <button
-                              className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
-                              onClick={() => {
-                                const link = annotationDeepLink(clip.annotation);
-                                if (link) onOpenAnnotation(link.href);
-                              }}
-                              type="button"
-                            >
-                              {annotationDeepLink(clip.annotation)?.label}
-                            </button>
-                          ) : null}
                         </div>
                       </td>
                     </tr>
@@ -430,14 +509,12 @@ function DatasetTable({
   dates,
   expandedDate,
   highlightedClip,
-  onOpenAnnotation,
   onToggleDate,
   onViewSyncImages,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
   highlightedClip: string | null;
-  onOpenAnnotation: (href: string) => void;
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
@@ -460,25 +537,24 @@ function DatasetTable({
         onPointerLeave={datasetScrollbar.onPointerLeave}
         onPointerMove={datasetScrollbar.onPointerMove}
       >
-        <table className="w-full min-w-[1220px] text-left text-sm">
+        <table className="w-full min-w-[1240px] text-left text-sm">
           <thead className="text-xs text-slate-500">
             <tr className="h-11 border-b border-slate-200 bg-white">
               <th className="pl-4 pr-3 font-medium sm:pl-5">日期</th>
               <th className="pr-3 font-medium">clip 数</th>
               <th className="pr-3 font-medium">总时长</th>
-              <th className="pr-3 font-medium">raw 消息</th>
-              <th className="pr-3 font-medium">已拆解 clip</th>
-              <th className="pr-3 font-medium">同步 clip 数</th>
-              <th className="pr-3 font-medium">同步图像帧</th>
               <th className="pr-3 font-medium">数据状态</th>
               <th className="pr-3 font-medium">标注状态</th>
+              <th className="pr-3 font-medium">修正 / 复核</th>
+              <th className="pr-3 font-medium">训练发布</th>
+              <th className="pr-3 font-medium">详情</th>
               <th className="pr-5 text-right font-medium">操作</th>
             </tr>
           </thead>
           <tbody>
             {dates.length === 0 ? (
               <tr>
-                <td colSpan={10} className="h-[19rem] px-4 text-center text-sm text-slate-500">
+                <td colSpan={9} className="h-[19rem] px-4 text-center text-sm text-slate-500">
                   <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-400">
                     <Layers3 aria-hidden="true" className="size-5" />
                   </span>
@@ -509,32 +585,33 @@ function DatasetTable({
                     </td>
                     <td className="pr-3 text-slate-500">{formatCount(date.clip_count)}</td>
                     <td className="pr-3 text-slate-500">{formatDuration(date.total_duration_ns)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(date.raw_message_count)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(date.extracted_clip_count)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(date.synced_clip_count)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(date.sync_frame_counts.image)}</td>
                     <td className="pr-3">
                       <StatusCell status={date.status} />
                     </td>
                     <td className="pr-3">
                       <AnnotationStatusCell projection={date.annotation} />
                     </td>
-                    <td className="pr-5 text-right">
-                      {annotationDeepLink(date.annotation) ? (
-                        <button
-                          className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
-                          onClick={() => {
-                            const link = annotationDeepLink(date.annotation);
-                            if (link) onOpenAnnotation(link.href);
-                          }}
-                          type="button"
-                        >
-                          {annotationDeepLink(date.annotation)?.label}
-                        </button>
-                      ) : null}
+                    <td className="pr-3">
+                      <ReviewStatusCell projection={date.review} />
                     </td>
+                    <td className="pr-3">
+                      <ReleaseStatusCell projection={date.release} />
+                    </td>
+                    <td className="pr-3">
+                      <DetailsPopover
+                        label={`查看 ${date.date} 详情`}
+                        title={date.date}
+                        rows={[
+                          { label: "raw 消息", value: formatCount(date.raw_message_count) },
+                          { label: "已拆解 clips", value: formatCount(date.extracted_clip_count) },
+                          { label: "已同步 clips", value: formatCount(date.synced_clip_count) },
+                          { label: "同步图像帧", value: formatCount(date.sync_frame_counts.image) },
+                        ]}
+                      />
+                    </td>
+                    <td className="pr-5 text-right" />
                   </tr>
-                  {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onOpenAnnotation={onOpenAnnotation} onViewSyncImages={onViewSyncImages} /> : null}
+                  {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
                 </Fragment>
               );
             })}
@@ -629,6 +706,7 @@ function NavigationListToolbar({
   query,
   showSuggestions,
   status,
+  reviewStatus,
   onChangeQuery,
   onClearQuery,
   onFocusQuery,
@@ -638,6 +716,7 @@ function NavigationListToolbar({
   onSelectDate,
   onStatusChange,
   onAnnotationStatusChange,
+  onReviewStatusChange,
 }: {
   annotationStatus: AnnotationStatusFilter;
   dates: NavigationDateSummary[];
@@ -645,6 +724,7 @@ function NavigationListToolbar({
   query: string;
   showSuggestions: boolean;
   status: StatusFilter;
+  reviewStatus: ReviewStatusFilter;
   onChangeQuery: (query: string) => void;
   onClearQuery: () => void;
   onFocusQuery: () => void;
@@ -654,6 +734,7 @@ function NavigationListToolbar({
   onSelectDate: (date: string) => void;
   onStatusChange: (status: StatusFilter) => void;
   onAnnotationStatusChange: (status: AnnotationStatusFilter) => void;
+  onReviewStatusChange: (status: ReviewStatusFilter) => void;
 }) {
   return (
     <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5 lg:flex-row lg:items-center">
@@ -700,6 +781,22 @@ function NavigationListToolbar({
       </Select>
 
       <Select
+        value={reviewStatus}
+        onValueChange={(value) => onReviewStatusChange(value as ReviewStatusFilter)}
+      >
+        <SelectTrigger aria-label="复核状态筛选" className="h-10 w-full bg-white shadow-none lg:w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="start" position="popper">
+          {reviewStatusOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <Select
         value={annotationStatus}
         onValueChange={(value) => onAnnotationStatusChange(value as AnnotationStatusFilter)}
       >
@@ -730,9 +827,184 @@ function NavigationListToolbar({
 
       <ConsoleButton className="h-10 lg:ml-auto" variant="primary" onClick={onOpenDataPilot}>
         <Bot aria-hidden="true" className="size-4" />
-        交给 DataPilot
+        交给DataPilot
       </ConsoleButton>
     </div>
+  );
+}
+
+function DatasetReleaseView({
+  dates,
+  loading,
+  error,
+  onRefresh,
+}: {
+  dates: NavigationDateSummary[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => Promise<unknown>;
+}) {
+  const [tab, setTab] = useState<"ready" | "released">("ready");
+  const [releaseRecords, setReleaseRecords] = useState<NavigationDatasetRelease[] | null>(null);
+  const [releaseLoading, setReleaseLoading] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<NavigationDateSummary | null>(null);
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+  const releaseByDate = new Map((releaseRecords ?? []).map((release) => [release.dataset_date, release]));
+  const rows = dates
+    .map((date) => ({ ...date, release: releaseByDate.get(date.date) ?? date.release }))
+    .filter((date) => date.release?.status === tab);
+
+  async function reloadReleases() {
+    setReleaseLoading(true);
+    setReleaseError(null);
+    try {
+      setReleaseRecords(await getNavigationDatasetReleases());
+    } catch (caught) {
+      setReleaseError(caught instanceof Error ? caught.message : "训练发布信息加载失败，请刷新后重试。");
+    } finally {
+      setReleaseLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reloadReleases();
+  }, []);
+
+  async function handleRelease() {
+    const release = selectedDate?.release;
+    if (!selectedDate || !release?.scope_manifest_sha256) {
+      setReleaseError("发布范围尚未就绪，请刷新后重试。");
+      return;
+    }
+    setSubmitting(true);
+    setReleaseError(null);
+    try {
+      await createNavigationDatasetRelease(
+        selectedDate.date,
+        release.scope_manifest_sha256,
+        note.trim() || null,
+        createReleaseIdempotencyKey(),
+      );
+      setSelectedDate(null);
+      setNote("");
+      await onRefresh();
+      await reloadReleases();
+    } catch (caught) {
+      setReleaseError(caught instanceof Error ? caught.message : "正式发布失败，请刷新后重试。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <section className="min-h-[34rem] border-y border-slate-200 bg-white">
+      <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+        <div>
+          <h2 className="text-base font-semibold text-slate-900">训练数据发布</h2>
+          <p className="mt-1 text-xs text-slate-500">发布只登记该日期可供模型训练选择，不移动数据或启动训练。</p>
+        </div>
+        <ConsoleButton disabled={loading || releaseLoading} onClick={() => void Promise.all([onRefresh(), reloadReleases()])}>
+          <RefreshCw aria-hidden="true" className={`size-4 ${loading || releaseLoading ? "animate-spin" : ""}`} />
+          {loading || releaseLoading ? "刷新中" : "刷新"}
+        </ConsoleButton>
+      </div>
+      <div className="border-b border-slate-200 px-4 pt-3 sm:px-5">
+        <ConsoleSlidingTabs
+          aria-label="训练发布状态"
+          value={tab}
+          items={[
+            { value: "ready", label: "待发布" },
+            { value: "released", label: "已发布" },
+          ]}
+          listClassName="sm:min-w-52"
+          onValueChange={(value) => setTab(value as "ready" | "released")}
+        />
+      </div>
+      {error || (releaseError && selectedDate === null) ? (
+        <div className="p-8 text-center text-sm text-rose-600" role="alert">{error ?? releaseError}</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[940px] text-left text-sm">
+            <thead className="text-xs text-slate-500">
+              <tr className="h-11 border-b border-slate-200">
+                <th className="pl-5 pr-3 font-medium">日期</th>
+                <th className="pr-3 font-medium">clips</th>
+                <th className="pr-3 font-medium">总时长</th>
+                <th className="pr-3 font-medium">已验证</th>
+                <th className="pr-3 font-medium">已废弃</th>
+                <th className="pr-3 font-medium">状态</th>
+                <th className="pr-3 font-medium">详情</th>
+                <th className="pr-5 text-right font-medium">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr><td colSpan={8} className="h-64 text-center text-slate-500">当前没有{tab === "ready" ? "待发布" : "已发布"}的日期。</td></tr>
+              ) : rows.map((date) => {
+                const release = date.release!;
+                return (
+                  <tr key={date.date} className="h-16 border-b border-slate-100 hover:bg-blue-50/35">
+                    <td className="pl-5 pr-3 font-medium text-slate-800">{date.date}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(release.source_clip_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatDuration(release.total_duration_ns)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(release.verified_unit_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(release.discarded_unit_count)}</td>
+                    <td className="pr-3"><ReleaseStatusCell projection={release} /></td>
+                    <td className="pr-3">
+                      <DetailsPopover
+                        label={`查看 ${date.date} 发布详情`}
+                        title={date.date}
+                        rows={[
+                          { label: "范围摘要", value: release.scope_manifest_sha256?.slice(0, 12) ?? "—" },
+                          { label: "发布时间", value: release.released_at ?? "—" },
+                          { label: "发布备注", value: release.note ?? "—" },
+                        ]}
+                      />
+                    </td>
+                    <td className="pr-5 text-right">
+                      {release.status === "ready" ? (
+                        <ConsoleButton variant="primary" onClick={() => { setSelectedDate(date); setReleaseError(null); }}>
+                          正式发布
+                        </ConsoleButton>
+                      ) : null}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Dialog open={selectedDate !== null} onOpenChange={(open) => { if (!open && !submitting) setSelectedDate(null); }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>正式发布 {selectedDate?.date}</DialogTitle>
+            <DialogDescription>
+              发布后，该日期将允许被模型训练模块选择；不会移动数据、重新生成轨迹或自动启动训练。
+            </DialogDescription>
+          </DialogHeader>
+          <label className="space-y-2 text-sm text-slate-700">
+            <span className="font-medium">发布备注（可选）</span>
+            <textarea
+              className="min-h-24 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              maxLength={1000}
+              value={note}
+              onChange={(event) => setNote(event.target.value)}
+            />
+          </label>
+          {releaseError ? <p className="text-sm text-rose-600" role="alert">{releaseError}</p> : null}
+          <DialogFooter>
+            <DialogClose asChild><Button type="button" variant="outline" disabled={submitting}>取消</Button></DialogClose>
+            <Button type="button" disabled={submitting} onClick={() => void handleRelease()}>
+              {submitting ? "发布中" : "确认发布"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
   );
 }
 
@@ -1064,9 +1336,12 @@ function SyncImageDrawer({
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
   void onPlaceholderAction;
   const navigate = useNavigate();
+  const location = useLocation();
+  const releaseSurface = location.pathname === "/data/releases";
   const [activeSurface, setActiveSurface] = useState<DataSurface>("navigation");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [annotationStatusFilter, setAnnotationStatusFilter] = useState<AnnotationStatusFilter>("all");
+  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
   const [highlightedClip, setHighlightedClip] = useState<{ date: string; clip: string } | null>(null);
@@ -1115,6 +1390,14 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
         return false;
       }
 
+      if (
+        reviewStatusFilter !== "all"
+        && date.review?.status !== reviewStatusFilter
+        && !(date.clips ?? []).some((clip) => clip.review?.status === reviewStatusFilter)
+      ) {
+        return false;
+      }
+
       if (!query) {
         return true;
       }
@@ -1129,7 +1412,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
       return (date.clips ?? []).some((clip) => clip.clip.toLowerCase().includes(query));
     });
-  }, [annotationStatusFilter, dates, matchingClipDate, searchQuery, statusFilter]);
+  }, [annotationStatusFilter, dates, matchingClipDate, reviewStatusFilter, searchQuery, statusFilter]);
   const effectiveExpandedDate = matchingClipDate?.date ?? expandedDate;
   const activeInvocation =
     activeInvocationId && pendingInvocation?.invocationId === activeInvocationId
@@ -1232,6 +1515,21 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   return (
     <section className="mx-auto max-w-360 space-y-4 px-3 pb-28 pt-2 md:px-4 lg:px-5">
+      <ConsoleSlidingTabs
+        aria-label="数据管理页面"
+        value={releaseSurface ? "releases" : "assets"}
+        items={[
+          { value: "assets", label: "数据资产" },
+          { value: "releases", label: "训练发布" },
+        ]}
+        listClassName="sm:min-w-60"
+        onValueChange={(value) => navigate(value === "releases" ? "/data/releases" : "/data")}
+      />
+
+      {releaseSurface ? (
+        <DatasetReleaseView dates={dates} loading={loading} error={error} onRefresh={reload} />
+      ) : (
+        <>
       <DataSurfaceSwitch activeSurface={activeSurface} onChange={setActiveSurface} />
 
       {activeSurface === "navigation" ? (
@@ -1257,6 +1555,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
               refreshing={loading}
               showSuggestions={showSearchSuggestions}
               status={statusFilter}
+              reviewStatus={reviewStatusFilter}
               onChangeQuery={(query) => {
                 setSearchQuery(query);
                 setShowSearchSuggestions(true);
@@ -1283,6 +1582,11 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
               }}
               onAnnotationStatusChange={(status) => {
                 setAnnotationStatusFilter(status);
+                setExpandedDate(null);
+                setHighlightedClip(null);
+              }}
+              onReviewStatusChange={(status) => {
+                setReviewStatusFilter(status);
                 setExpandedDate(null);
                 setHighlightedClip(null);
               }}
@@ -1314,7 +1618,6 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
                 dates={visibleDates}
                 expandedDate={effectiveExpandedDate}
                 highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
-                onOpenAnnotation={(href) => navigate(href)}
                 onToggleDate={handleToggleDate}
                 onViewSyncImages={handleViewSyncImages}
               />
@@ -1335,6 +1638,8 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
         onConfirm={handleConfirmDataPilot}
         onSelectionChange={handleDataPilotSelectionChange}
       />
+        </>
+      )}
     </section>
   );
 }
@@ -1344,4 +1649,11 @@ function createInvocationId(): string {
     return `navigation-${crypto.randomUUID()}`;
   }
   return `navigation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createReleaseIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `dataset-release-${crypto.randomUUID()}`;
+  }
+  return `dataset-release-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }

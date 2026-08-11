@@ -11,6 +11,7 @@ from vla_data_juicer_agents.annotation import operator_cli
 from vla_data_juicer_agents.annotation.models import AnnotationConflictError
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.annotation.store import _annotation_unit_lifecycle
+from vla_data_juicer_agents.annotation.store import _review_unit_lifecycle
 
 
 def _trajectory(path: Path, payload: dict[str, object]) -> str:
@@ -38,25 +39,17 @@ def _asset(
 
 
 @pytest.mark.parametrize(
-    ("segment_status", "review_status", "publication_status", "expected"),
+    ("segment_status", "expected"),
     [
-        ("pending_initial_annotation", None, None, "waiting_initial_annotation"),
-        ("tracking", None, None, "processing"),
-        ("postprocessing_failed", None, None, "failed"),
-        ("skipped", None, None, "discarded"),
-        ("annotated", "pending", None, "annotated_pending_review"),
-        ("annotated", "in_progress", None, "processing"),
-        ("annotated", "returned", None, "returned"),
-        ("annotated", "discarded", None, "discarded"),
-        ("annotated", "approved", "queued", "processing"),
-        ("annotated", "approved", "failed", "failed"),
-        ("annotated", "approved", "succeeded", "verified"),
+        ("pending_initial_annotation", "waiting_initial_annotation"),
+        ("tracking", "processing"),
+        ("postprocessing_failed", "failed"),
+        ("skipped", "annotated"),
+        ("annotated", "annotated"),
     ],
 )
 def test_native_annotation_unit_lifecycle_mapping(
     segment_status: str,
-    review_status: str | None,
-    publication_status: str | None,
     expected: str,
 ) -> None:
     assert _annotation_unit_lifecycle(
@@ -69,8 +62,31 @@ def test_native_annotation_unit_lifecycle_mapping(
         ),
         completion_outcome=None,
         segment_status=segment_status,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("segment_status", "review_status", "expected"),
+    [
+        ("tracking", None, None),
+        ("skipped", None, "discarded"),
+        ("annotated", None, "pending"),
+        ("annotated", "pending", "pending"),
+        ("annotated", "in_progress", "in_progress"),
+        ("annotated", "returned", "returned"),
+        ("annotated", "discarded", "discarded"),
+        ("annotated", "approved", "verified"),
+    ],
+)
+def test_native_review_unit_lifecycle_mapping(
+    segment_status: str,
+    review_status: str | None,
+    expected: str | None,
+) -> None:
+    assert _review_unit_lifecycle(
+        segment_status=segment_status,
+        completion_outcome=None,
         review_status=review_status,
-        publication_status=publication_status,
     ) == expected
 
 
@@ -92,9 +108,13 @@ def test_historical_verified_import_is_idempotent_and_projects_no_private_path(
         assets=assets[:1],
     )
     partial_scope = store.asset_lifecycle_snapshot()["scopes"][0]
-    assert partial_scope["status"] == "partial"
-    assert partial_scope["counts"]["verified"] == 1
-    assert partial_scope["counts"]["not_started"] == 1
+    assert partial_scope["annotation"]["status"] == "processing"
+    assert partial_scope["annotation"]["counts"]["annotated"] == 1
+    assert partial_scope["annotation"]["counts"]["not_started"] == 1
+    assert partial_scope["review"]["status"] == "partial"
+    assert partial_scope["review"]["counts"]["total"] == 2
+    assert partial_scope["review"]["counts"]["pending"] == 1
+    assert partial_scope["review"]["counts"]["verified"] == 1
 
     created = store.import_historical_verified_assets(
         manifest_sha256="a" * 64,
@@ -112,35 +132,18 @@ def test_historical_verified_import_is_idempotent_and_projects_no_private_path(
     assert replay["existing"] == 2
     assert replay["asset_refs"] == created["asset_refs"]
     snapshot = store.asset_lifecycle_snapshot()
-    assert snapshot == {
-        "scopes": [
-            {
-                "dataset_date": "20260623",
-                "source_clip": "20260623_145550",
-                "status": "verified",
-                "counts": {
-                    "total": 2,
-                    "not_started": 0,
-                    "processing": 0,
-                    "waiting_initial_annotation": 0,
-                    "annotated_pending_review": 0,
-                    "verified": 2,
-                    "returned": 0,
-                    "discarded": 0,
-                    "failed": 0,
-                },
-                "completed_unit_count": 2,
-                "annotated_unit_count": 2,
-                "verified_unit_count": 2,
-                "job_ref": None,
-                "review_ref": None,
-                "verified_review_ref": None,
-                "historical_asset_ref": created["asset_refs"][0],
-                "updated_at": snapshot["scopes"][0]["updated_at"],
-                "source": "historical_import",
-            }
-        ]
-    }
+    assert snapshot["releases"] == []
+    assert len(snapshot["scopes"]) == 1
+    scope = snapshot["scopes"][0]
+    assert scope["dataset_date"] == "20260623"
+    assert scope["source_clip"] == "20260623_145550"
+    assert scope["annotation"]["status"] == "annotated"
+    assert scope["annotation"]["counts"]["annotated"] == 2
+    assert scope["annotation"]["historical_asset_ref"] == created["asset_refs"][0]
+    assert scope["review"]["status"] == "verified"
+    assert scope["review"]["counts"]["verified"] == 2
+    assert scope["review"]["publishable_verified_unit_count"] == 2
+    assert scope["review"]["source"] == "historical_import"
     public_asset = store.get_historical_verified_asset(created["asset_refs"][0])
     assert public_asset["content_sha256"] == first_sha
     assert public_asset["segment_ordinal"] == 1
@@ -342,8 +345,120 @@ def test_native_annotation_authority_supersedes_historical_projection(
     )
 
     scope = store.asset_lifecycle_snapshot()["scopes"][0]
-    assert scope["source"] == "native"
-    assert scope["job_ref"] == created["job_ref"]
-    assert scope["status"] == "processing"
-    assert scope["verified_unit_count"] == 0
-    assert scope["historical_asset_ref"] is None
+    assert scope["annotation"]["source"] == "native"
+    assert scope["annotation"]["job_ref"] == created["job_ref"]
+    assert scope["annotation"]["status"] == "processing"
+    assert scope["annotation"]["historical_asset_ref"] is None
+    assert scope["review"] is None
+
+
+def test_dataset_release_is_scope_bound_idempotent_and_immutable(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    artifacts = [
+        tmp_path / "finish" / f"segment-{ordinal}_trajectory_fix_five.json"
+        for ordinal in (1, 2)
+    ]
+    for ordinal, artifact in enumerate(artifacts, start=1):
+        _trajectory(artifact, {"frame": ordinal})
+    store.import_historical_verified_assets(
+        manifest_sha256="a" * 64,
+        assets=[
+            _asset(artifact, ordinal=ordinal, total=2)
+            for ordinal, artifact in enumerate(artifacts, start=1)
+        ],
+    )
+    managed_clips = [
+        {
+            "source_clip": "20260623_145550",
+            "status": "synced",
+            "duration_ns": 12_345,
+        }
+    ]
+
+    candidate = store.dataset_release_candidate(
+        dataset_date="20260623",
+        managed_clips=managed_clips,
+    )
+
+    assert candidate["status"] == "ready"
+    assert candidate["verified_unit_count"] == 2
+    assert candidate["discarded_unit_count"] == 0
+    assert candidate["note"] is None
+    with pytest.raises(AnnotationConflictError) as stale:
+        store.create_dataset_release(
+            dataset_date="20260623",
+            managed_clips=managed_clips,
+            expected_scope_manifest_sha256="b" * 64,
+            note=None,
+            idempotency_key="release-stale-scope",
+        )
+    assert stale.value.code == "release_scope_changed"
+
+    released = store.create_dataset_release(
+        dataset_date="20260623",
+        managed_clips=managed_clips,
+        expected_scope_manifest_sha256=candidate["scope_manifest_sha256"],
+        note="  ",
+        idempotency_key="release-date",
+    )
+    replay = store.create_dataset_release(
+        dataset_date="20260623",
+        managed_clips=managed_clips,
+        expected_scope_manifest_sha256=candidate["scope_manifest_sha256"],
+        note=None,
+        idempotency_key="release-date",
+    )
+
+    assert replay == released
+    assert released["status"] == "released"
+    assert released["note"] is None
+    assert store.asset_lifecycle_snapshot()["releases"] == [released]
+    with sqlite3.connect(store.db_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE dataset_releases SET note = 'changed'",
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("DELETE FROM dataset_releases")
+
+
+def test_dataset_release_requires_verified_publishable_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    monkeypatch.setattr(
+        store,
+        "asset_lifecycle_snapshot",
+        lambda: {
+            "scopes": [
+                {
+                    "dataset_date": "20260623",
+                    "source_clip": "clip",
+                    "annotation": {
+                        "status": "annotated",
+                        "counts": {"total": 2},
+                    },
+                    "review": {
+                        "status": "discarded",
+                        "counts": {"total": 2, "verified": 0, "discarded": 2},
+                        "publishable_verified_unit_count": 0,
+                    },
+                }
+            ],
+            "releases": [],
+        },
+    )
+
+    candidate = store.dataset_release_candidate(
+        dataset_date="20260623",
+        managed_clips=[
+            {"source_clip": "clip", "status": "synced", "duration_ns": 1}
+        ],
+    )
+
+    assert candidate["status"] == "not_ready"
+    assert candidate["verified_unit_count"] == 0
+    assert candidate["discarded_unit_count"] == 2

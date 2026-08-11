@@ -118,7 +118,7 @@ function aggregateNavigationDatasetSummary(
         0,
       ),
       verified_clip_count: clips.reduce(
-        (total, clip) => total + Number(clip.annotation?.status === "verified"),
+        (total, clip) => total + Number((clip.review?.verified_unit_count ?? 0) > 0),
         0,
       ),
       annotated_unit_count: clips.reduce(
@@ -126,7 +126,7 @@ function aggregateNavigationDatasetSummary(
         0,
       ),
       verified_unit_count: clips.reduce(
-        (total, clip) => total + (clip.annotation?.verified_unit_count ?? 0),
+        (total, clip) => total + (clip.review?.verified_unit_count ?? 0),
         0,
       ),
     },

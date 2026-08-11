@@ -501,7 +501,9 @@ def test_import_history_defaults_to_dry_run_then_applies_without_path_leak(
     assert applied_payload["result"]["imported"] == 1
     assert applied_payload["result"]["existing"] == 0
     assert str(tmp_path) not in applied.out
-    assert store.asset_lifecycle_snapshot()["scopes"][0]["status"] == "verified"
+    scope = store.asset_lifecycle_snapshot()["scopes"][0]
+    assert scope["annotation"]["status"] == "annotated"
+    assert scope["review"]["status"] == "verified"
 
 
 def test_list_recovery_rejects_database_symlink_without_leaking_path(

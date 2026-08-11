@@ -3,6 +3,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 
 import {
   createSession,
+  createNavigationDatasetRelease,
+  getNavigationDatasetReleases,
   getNavigationDatasetSummary,
   getSession,
   getSyncImages,
@@ -23,6 +25,8 @@ import { App } from "./App";
 
 vi.mock("../api/client", () => ({
   createSession: vi.fn(),
+  createNavigationDatasetRelease: vi.fn(),
+  getNavigationDatasetReleases: vi.fn(),
   getNavigationDatasetSummary: vi.fn(),
   getSyncImages: vi.fn(),
   getSyncImageUrl: vi.fn(),
@@ -35,6 +39,8 @@ vi.mock("../api/client", () => ({
 
 const apiMocks = vi.mocked({
   createSession,
+  createNavigationDatasetRelease,
+  getNavigationDatasetReleases,
   getNavigationDatasetSummary,
   getSyncImages,
   getSyncImageUrl,
@@ -210,6 +216,22 @@ beforeEach(() => {
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
   apiMocks.getNavigationDatasetSummary.mockResolvedValue(navigationDatasetSummaryFixture());
+  apiMocks.getNavigationDatasetReleases.mockResolvedValue([]);
+  apiMocks.createNavigationDatasetRelease.mockResolvedValue({
+    dataset_date: "20270515",
+    status: "released",
+    release_ref: "release_0123456789abcdef0123456789abcdef",
+    source_clip_count: 1,
+    total_duration_ns: 1_500_000_000,
+    verified_unit_count: 1,
+    discarded_unit_count: 0,
+    scope_manifest_sha256: "a".repeat(64),
+    note: null,
+    actor_kind: "manual_web",
+    deployment_instance: "test",
+    released_at: "2026-08-10T00:00:00Z",
+    updated_at: "2026-08-10T00:00:00Z",
+  });
   apiMocks.getSyncImages.mockResolvedValue({
     date: "20270515",
     clip: "clip_a",
@@ -443,7 +465,9 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getByTestId("navigation-process-stepper")).toBeVisible();
   expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
   expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
-  expect(screen.getByRole("columnheader", { name: "raw 消息" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "详情" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "查看 20270515 详情" }));
+  expect(screen.getByText("raw 消息")).toBeVisible();
   expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[60vh]", "overflow-auto");
   expect(screen.getByTestId("navigation-dataset-surface")).toHaveClass("border-y", "bg-white");
   const datasetScroll = screen.getByTestId("navigation-dataset-scroll");
@@ -468,9 +492,12 @@ test("data management renders navigation dataset date and clip details", async (
   fireEvent.click(screen.getByRole("button", { name: "展开 20270515" }));
 
   expect(screen.getByRole("columnheader", { name: "clip 名称" })).toBeVisible();
-  expect(screen.getByRole("columnheader", { name: "topic 摘要" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "tmp_dir" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "sync_data" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_a 详情" }));
+  expect(screen.getByText("topic 摘要")).toBeVisible();
   expect(screen.getByTestId("navigation-clip-scroll")).toHaveClass("console-soft-scrollbar", "max-h-80", "overflow-auto");
-  expect(screen.getByText("clip_a")).toBeVisible();
+  expect(screen.getAllByText("clip_a")[0]).toBeVisible();
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
@@ -483,19 +510,25 @@ test("data management keeps ingestion and annotation facts separate and refresh 
     not_started: 1,
     processing: 0,
     waiting_initial_annotation: 0,
-    annotated_pending_review: 0,
-    verified: 1,
-    returned: 0,
-    discarded: 0,
+    annotated: 1,
     failed: 0,
   };
   summary.dates[0].annotation = {
-    status: "partial",
+    status: "processing",
     counts,
     completed_unit_count: 1,
     annotated_unit_count: 1,
-    verified_unit_count: 1,
     job_ref: null,
+    historical_asset_ref: "verified_asset_0123456789abcdef0123456789abcdef",
+    updated_at: "2026-08-09T00:00:00Z",
+    source: "historical_import",
+  };
+  summary.dates[0].review = {
+    status: "partial",
+    counts: { total: 2, pending: 0, in_progress: 0, returned: 0, verified: 1, discarded: 0 },
+    resolved_unit_count: 1,
+    verified_unit_count: 1,
+    publishable_verified_unit_count: 1,
     review_ref: null,
     verified_review_ref: null,
     historical_asset_ref: "verified_asset_0123456789abcdef0123456789abcdef",
@@ -504,19 +537,24 @@ test("data management keeps ingestion and annotation facts separate and refresh 
   };
   summary.dates[0].clips![0].annotation = {
     ...summary.dates[0].annotation,
-    status: "verified",
+    status: "annotated",
     counts: { ...counts, total: 1, not_started: 0 },
+  };
+  summary.dates[0].clips![0].review = {
+    ...summary.dates[0].review,
+    status: "verified",
+    counts: { total: 1, pending: 0, in_progress: 0, returned: 0, verified: 1, discarded: 0 },
   };
   summary.dates[0].clips![1].annotation = {
     ...summary.dates[0].annotation,
     status: "not_started",
-    counts: { ...counts, total: 0, verified: 0, not_started: 0 },
+    counts: { ...counts, total: 0, annotated: 0, not_started: 0 },
     completed_unit_count: 0,
     annotated_unit_count: 0,
-    verified_unit_count: 0,
     historical_asset_ref: null,
     source: "none",
   };
+  summary.dates[0].clips![1].review = null;
   apiMocks.getNavigationDatasetSummary.mockResolvedValue(summary);
 
   await renderAppWithDashboardSettled();
@@ -524,26 +562,69 @@ test("data management keeps ingestion and annotation facts separate and refresh 
   expect(await screen.findByRole("columnheader", { name: "数据状态" })).toBeVisible();
   expect(screen.getByRole("columnheader", { name: "标注状态" })).toBeVisible();
 
-  fireEvent.click(screen.getByRole("combobox", { name: "标注状态筛选" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "复核状态筛选" }));
   fireEvent.click(screen.getByRole("option", { name: "部分完成" }));
   expect(screen.getByText("20270515")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "展开 20270515" }));
-  expect(screen.getAllByRole("button", { name: "查看已验证版本" })).toHaveLength(2);
+  expect(screen.queryByRole("button", { name: "查看已验证版本" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
 
   fireEvent.click(screen.getByRole("button", { name: "刷新数据资产" }));
   await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2));
-  expect(screen.getByRole("combobox", { name: "标注状态筛选" })).toHaveTextContent("部分完成");
+  expect(screen.getByRole("combobox", { name: "复核状态筛选" })).toHaveTextContent("部分完成");
   expect(screen.getByRole("button", { name: "收起 20270515" })).toBeVisible();
 
-  fireEvent.click(screen.getByRole("combobox", { name: "标注状态筛选" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "复核状态筛选" }));
   fireEvent.click(screen.getByRole("option", { name: "已验证" }));
   expect(screen.getByText("20270515")).toBeVisible();
+});
+
+test("data management records a date-level training release with an optional note", async () => {
+  const summary = navigationDatasetSummaryFixture();
+  const release = {
+    dataset_date: "20270515",
+    status: "ready" as const,
+    release_ref: null,
+    source_clip_count: 2,
+    total_duration_ns: 3_500_000_000,
+    verified_unit_count: 1,
+    discarded_unit_count: 1,
+    scope_manifest_sha256: "a".repeat(64),
+    note: null,
+    actor_kind: null,
+    deployment_instance: null,
+    released_at: null,
+    updated_at: "2026-08-10T00:00:00Z",
+  };
+  summary.dates[0].release = release;
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue(summary);
+  apiMocks.getNavigationDatasetReleases.mockResolvedValue([release]);
+
+  window.history.replaceState({}, "", "/data/releases");
+  render(<App routerMode="declarative" />);
+
+  expect(await screen.findByRole("heading", { name: "训练数据发布" })).toBeVisible();
+  expect(window.location.pathname).toBe("/data/releases");
+  expect(screen.getByRole("tab", { name: "待发布" })).toHaveAttribute("data-state", "active");
+  fireEvent.click(screen.getByRole("button", { name: "查看 20270515 发布详情" }));
+  expect(screen.getByText("范围摘要")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "正式发布" }));
+  expect(screen.getByText(/允许被模型训练模块选择/)).toBeVisible();
+  expect(screen.getByText("发布备注（可选）")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "确认发布" }));
+
+  await waitFor(() => expect(apiMocks.createNavigationDatasetRelease).toHaveBeenCalledWith(
+    "20270515",
+    "a".repeat(64),
+    null,
+    expect.stringMatching(/^dataset-release-/),
+  ));
 });
 
 test("data management sends selected clips through a new visible DataPilot session", async () => {
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
 
   const confirm = screen.getByRole("button", { name: "确定" });
   expect(confirm).toBeDisabled();
@@ -588,7 +669,7 @@ test("data management shortcut claims a double click only once", async () => {
   apiMocks.submitTurn.mockReturnValue(pendingTurn.promise);
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
 
@@ -644,7 +725,7 @@ test("data management shortcut creates and submits despite another session waiti
 
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
@@ -665,7 +746,7 @@ test("data management shortcut retries submit in the session it already created"
     .mockResolvedValueOnce("turn-retry");
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
@@ -709,7 +790,7 @@ test("changing selection after a failed shortcut creates a new invocation and se
 
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
@@ -1044,7 +1125,7 @@ test("annotation page exposes the M2 DataPilot-owned processing entry", async ()
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
   expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
   expect(screen.getByText(/仍可提交数据范围，由 DataPilot 检查事实并说明阻塞/)).toBeVisible();
-  expect(screen.getByRole("button", { name: "交给 DataPilot" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "交给DataPilot" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();
   expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
   expect(window.location.pathname).toBe("/annotation/jobs");
@@ -1082,7 +1163,7 @@ test("annotation shortcut submits a new session despite another session's active
 
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));

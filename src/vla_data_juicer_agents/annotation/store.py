@@ -612,13 +612,17 @@ def migrate_annotation_store_offline(
 
 _ANNOTATION_LIFECYCLE_STATES = (
     "not_started",
-    "processing",
     "waiting_initial_annotation",
-    "annotated_pending_review",
-    "verified",
-    "returned",
-    "discarded",
+    "processing",
+    "annotated",
     "failed",
+)
+_REVIEW_LIFECYCLE_STATES = (
+    "pending",
+    "in_progress",
+    "returned",
+    "verified",
+    "discarded",
 )
 
 
@@ -627,13 +631,13 @@ def _annotation_empty_job_lifecycle(
     completion_outcome: Any,
 ) -> str:
     if completion_outcome == "no_processable_targets":
-        return "discarded"
+        return "annotated"
     if job_status == "waiting_initial_annotation":
         return "waiting_initial_annotation"
     if job_status == "failed":
         return "failed"
     if job_status == "annotated":
-        return "annotated_pending_review"
+        return "annotated"
     return "processing"
 
 
@@ -642,29 +646,13 @@ def _annotation_unit_lifecycle(
     job_status: str,
     completion_outcome: Any,
     segment_status: str,
-    review_status: str | None,
-    publication_status: str | None,
 ) -> str:
     if segment_status == "skipped" or completion_outcome == "no_processable_targets":
-        return "discarded"
+        return "annotated"
     if segment_status == "postprocessing_failed":
         return "failed"
     if segment_status == "annotated":
-        if review_status is None or review_status == "pending":
-            return "annotated_pending_review"
-        if review_status == "in_progress":
-            return "processing"
-        if review_status == "returned":
-            return "returned"
-        if review_status == "discarded":
-            return "discarded"
-        if review_status == "approved":
-            if publication_status == "succeeded":
-                return "verified"
-            if publication_status == "failed":
-                return "failed"
-            return "processing"
-        raise RuntimeError("annotation review has an unsupported status")
+        return "annotated"
     if job_status == "failed":
         return "failed"
     if job_status == "waiting_initial_annotation":
@@ -672,10 +660,30 @@ def _annotation_unit_lifecycle(
     return "processing"
 
 
+def _review_unit_lifecycle(
+    *,
+    segment_status: str,
+    completion_outcome: Any,
+    review_status: str | None,
+) -> str | None:
+    if segment_status == "skipped" or completion_outcome == "no_processable_targets":
+        return "discarded"
+    if segment_status != "annotated":
+        return None
+    if review_status is None or review_status == "pending":
+        return "pending"
+    if review_status in {"in_progress", "returned", "discarded"}:
+        return review_status
+    if review_status == "approved":
+        return "verified"
+    raise RuntimeError("annotation review has an unsupported status")
+
+
 def _annotation_scope_projection(
     *,
-    unit_states: list[str],
-    annotated_unit_count: int,
+    annotation_states: list[str],
+    review_states: list[str],
+    publishable_verified_unit_count: int,
     job_ref: str | None,
     review_refs: list[str],
     verified_review_refs: list[str],
@@ -683,32 +691,87 @@ def _annotation_scope_projection(
     updated_at: str,
     source: str,
 ) -> dict[str, Any]:
-    if not unit_states or any(
-        state not in _ANNOTATION_LIFECYCLE_STATES for state in unit_states
+    if not annotation_states or any(
+        state not in _ANNOTATION_LIFECYCLE_STATES for state in annotation_states
     ):
         raise RuntimeError("annotation lifecycle contains an unsupported state")
-    unique_states = set(unit_states)
-    status = next(iter(unique_states)) if len(unique_states) == 1 else "partial"
-    counts = {state: 0 for state in _ANNOTATION_LIFECYCLE_STATES}
-    for state in unit_states:
-        counts[state] += 1
-    completed = counts["verified"] + counts["discarded"]
-    return {
-        "status": status,
-        "counts": {"total": len(unit_states), **counts},
-        "completed_unit_count": completed,
-        "annotated_unit_count": annotated_unit_count,
-        "verified_unit_count": counts["verified"],
+    annotation_counts = {state: 0 for state in _ANNOTATION_LIFECYCLE_STATES}
+    for state in annotation_states:
+        annotation_counts[state] += 1
+    annotation_statuses = set(annotation_states)
+    if "failed" in annotation_statuses:
+        annotation_status = "failed"
+    elif annotation_statuses == {"annotated"}:
+        annotation_status = "annotated"
+    elif annotation_statuses == {"not_started"}:
+        annotation_status = "not_started"
+    elif annotation_statuses == {"waiting_initial_annotation"}:
+        annotation_status = "waiting_initial_annotation"
+    else:
+        annotation_status = "processing"
+    annotation = {
+        "status": annotation_status,
+        "counts": {"total": len(annotation_states), **annotation_counts},
+        "completed_unit_count": annotation_counts["annotated"],
+        "annotated_unit_count": annotation_counts["annotated"],
         "job_ref": job_ref,
-        "review_ref": review_refs[0] if review_refs else None,
-        "verified_review_ref": (
-            verified_review_refs[0] if verified_review_refs else None
-        ),
         "historical_asset_ref": (
             historical_asset_refs[0] if historical_asset_refs else None
         ),
         "updated_at": updated_at,
         "source": source,
+    }
+    review: dict[str, Any] | None = None
+    if review_states:
+        if any(state not in _REVIEW_LIFECYCLE_STATES for state in review_states):
+            raise RuntimeError("review lifecycle contains an unsupported state")
+        review_counts = {state: 0 for state in _REVIEW_LIFECYCLE_STATES}
+        for state in review_states:
+            review_counts[state] += 1
+        missing_review_units = len(annotation_states) - len(review_states)
+        if missing_review_units < 0:
+            raise RuntimeError("review lifecycle contains more units than annotation")
+        # An aggregate scope may already contain reviewed units while other
+        # annotation units have not reached review creation yet. Keep the
+        # denominator aligned with the annotation scope and project those
+        # not-yet-created review units as pending at the aggregate level.
+        review_counts["pending"] += missing_review_units
+        review_statuses = set(review_states)
+        if missing_review_units:
+            review_status = "partial"
+        elif len(review_statuses) == 1:
+            review_status = next(iter(review_statuses))
+        elif review_counts["verified"] + review_counts["discarded"] == len(
+            review_states
+        ):
+            review_status = "completed"
+        else:
+            review_status = "partial"
+        review = {
+            "status": review_status,
+            "counts": {"total": len(annotation_states), **review_counts},
+            "resolved_unit_count": (
+                review_counts["verified"] + review_counts["discarded"]
+            ),
+            "verified_unit_count": review_counts["verified"],
+            "publishable_verified_unit_count": publishable_verified_unit_count,
+            "review_ref": review_refs[0] if len(review_refs) == 1 else None,
+            "verified_review_ref": (
+                verified_review_refs[0]
+                if len(verified_review_refs) == 1
+                else None
+            ),
+            "historical_asset_ref": (
+                historical_asset_refs[0]
+                if len(historical_asset_refs) == 1
+                else None
+            ),
+            "updated_at": updated_at,
+            "source": source,
+        }
+    return {
+        "annotation": annotation,
+        "review": review,
     }
 
 
@@ -1242,47 +1305,53 @@ class AnnotationStore:
                     """,
                     (int(lease["job_id"]), str(lease["source_clip"])),
                 ).fetchall()
-                unit_states: list[str] = []
+                annotation_states: list[str] = []
+                review_states: list[str] = []
                 review_refs: list[str] = []
                 verified_review_refs: list[str] = []
-                annotated_units = 0
+                publishable_verified_units = 0
                 latest_update = str(lease["updated_at"])
                 for segment in segment_rows:
                     segment_status = str(segment["status"])
-                    unit_state = _annotation_unit_lifecycle(
+                    annotation_state = _annotation_unit_lifecycle(
                         job_status=str(lease["job_status"]),
                         completion_outcome=lease["completion_outcome"],
                         segment_status=segment_status,
-                        review_status=(
-                            str(segment["review_status"])
-                            if segment["review_status"] is not None
-                            else None
-                        ),
-                        publication_status=(
-                            str(segment["publication_status"])
-                            if segment["publication_status"] is not None
-                            else None
-                        ),
                     )
-                    unit_states.append(unit_state)
-                    if segment_status == "annotated":
-                        annotated_units += 1
+                    review_status = (
+                        str(segment["review_status"])
+                        if segment["review_status"] is not None
+                        else None
+                    )
+                    review_state = _review_unit_lifecycle(
+                        segment_status=segment_status,
+                        completion_outcome=lease["completion_outcome"],
+                        review_status=review_status,
+                    )
+                    annotation_states.append(annotation_state)
+                    if review_state is not None:
+                        review_states.append(review_state)
                     if segment["review_ref"] is not None:
                         review_ref = str(segment["review_ref"])
                         review_refs.append(review_ref)
-                        if unit_state == "verified":
+                        if review_state == "verified":
                             verified_review_refs.append(review_ref)
+                            if str(segment["publication_status"] or "") == "succeeded":
+                                publishable_verified_units += 1
                     latest_update = max(latest_update, str(segment["updated_at"]))
-                if not unit_states:
-                    unit_states = [
+                if not annotation_states:
+                    annotation_states = [
                         _annotation_empty_job_lifecycle(
                             str(lease["job_status"]),
                             lease["completion_outcome"],
                         )
                     ]
+                    if lease["completion_outcome"] == "no_processable_targets":
+                        review_states = ["discarded"]
                 scopes[key] = _annotation_scope_projection(
-                    unit_states=unit_states,
-                    annotated_unit_count=annotated_units,
+                    annotation_states=annotation_states,
+                    review_states=review_states,
+                    publishable_verified_unit_count=publishable_verified_units,
                     job_ref=str(lease["job_ref"]),
                     review_refs=review_refs,
                     verified_review_refs=verified_review_refs,
@@ -1319,11 +1388,13 @@ class AnnotationStore:
                     raise RuntimeError(
                         "historical verified scope has invalid segment ordinals"
                     )
-                unit_states = ["verified"] * len(rows)
-                unit_states.extend(["not_started"] * (total - len(rows)))
+                annotation_states = ["annotated"] * len(rows)
+                annotation_states.extend(["not_started"] * (total - len(rows)))
+                review_states = ["verified"] * len(rows)
                 scopes[key] = _annotation_scope_projection(
-                    unit_states=unit_states,
-                    annotated_unit_count=len(rows),
+                    annotation_states=annotation_states,
+                    review_states=review_states,
+                    publishable_verified_unit_count=len(rows),
                     job_ref=None,
                     review_refs=[],
                     verified_review_refs=[],
@@ -1331,6 +1402,17 @@ class AnnotationStore:
                     updated_at=max(str(row["imported_at"]) for row in rows),
                     source="historical_import",
                 )
+            release_rows = connection.execute(
+                """
+                SELECT release_ref, dataset_date, scope_manifest_sha256,
+                       source_clip_count, total_duration_ns,
+                       verified_unit_count, discarded_unit_count, note,
+                       actor_kind, deployment_instance, released_at
+                FROM dataset_releases
+                WHERE domain = 'navigation'
+                ORDER BY dataset_date
+                """
+            ).fetchall()
             return {
                 "scopes": [
                     {
@@ -1339,8 +1421,295 @@ class AnnotationStore:
                         **projection,
                     }
                     for (dataset_date, source_clip), projection in sorted(scopes.items())
-                ]
+                ],
+                "releases": [
+                    {
+                        "dataset_date": str(row["dataset_date"]),
+                        "status": "released",
+                        "release_ref": str(row["release_ref"]),
+                        "scope_manifest_sha256": str(row["scope_manifest_sha256"]),
+                        "source_clip_count": int(row["source_clip_count"]),
+                        "total_duration_ns": int(row["total_duration_ns"]),
+                        "verified_unit_count": int(row["verified_unit_count"]),
+                        "discarded_unit_count": int(row["discarded_unit_count"]),
+                        "note": row["note"],
+                        "actor_kind": str(row["actor_kind"]),
+                        "deployment_instance": str(row["deployment_instance"]),
+                        "released_at": str(row["released_at"]),
+                        "updated_at": str(row["released_at"]),
+                    }
+                    for row in release_rows
+                ],
             }
+
+    def dataset_release_candidate(
+        self,
+        *,
+        dataset_date: str,
+        managed_clips: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if (
+            len(dataset_date) != 8
+            or not dataset_date.isdigit()
+            or not managed_clips
+        ):
+            raise AnnotationValidationError(
+                "invalid_release_scope",
+                "The dataset release scope is invalid.",
+            )
+        snapshot = self.asset_lifecycle_snapshot()
+        released = next(
+            (
+                item
+                for item in snapshot.get("releases", [])
+                if item.get("dataset_date") == dataset_date
+            ),
+            None,
+        )
+        if released is not None:
+            return dict(released)
+        scopes = {
+            (str(item["dataset_date"]), str(item["source_clip"])): item
+            for item in snapshot.get("scopes", [])
+        }
+        entries: list[dict[str, Any]] = []
+        verified_total = 0
+        discarded_total = 0
+        publishable_verified_total = 0
+        ready = True
+        total_duration_ns = 0
+        seen_clips: set[str] = set()
+        for clip in sorted(managed_clips, key=lambda item: str(item.get("source_clip"))):
+            source_clip = clip.get("source_clip")
+            status = clip.get("status")
+            duration_ns = clip.get("duration_ns")
+            if (
+                not isinstance(source_clip, str)
+                or not source_clip
+                or source_clip in seen_clips
+                or any(token in source_clip for token in ("/", "\\", "\r", "\n"))
+                or isinstance(duration_ns, bool)
+                or not isinstance(duration_ns, int)
+                or duration_ns < 0
+            ):
+                raise AnnotationValidationError(
+                    "invalid_release_scope",
+                    "The dataset release scope is invalid.",
+                )
+            seen_clips.add(source_clip)
+            total_duration_ns += duration_ns
+            scope = scopes.get((dataset_date, source_clip))
+            annotation = scope.get("annotation") if scope is not None else None
+            review = scope.get("review") if scope is not None else None
+            annotation_total = int(
+                ((annotation or {}).get("counts") or {}).get("total", 0)
+            )
+            review_counts = (review or {}).get("counts") or {}
+            review_total = int(review_counts.get("total", 0))
+            verified = int(review_counts.get("verified", 0))
+            discarded = int(review_counts.get("discarded", 0))
+            publishable_verified = int(
+                (review or {}).get("publishable_verified_unit_count", 0)
+            )
+            clip_ready = (
+                status == "synced"
+                and annotation is not None
+                and annotation.get("status") == "annotated"
+                and review is not None
+                and annotation_total > 0
+                and review_total == annotation_total
+                and verified + discarded == review_total
+                and publishable_verified == verified
+            )
+            ready = ready and clip_ready
+            verified_total += verified
+            discarded_total += discarded
+            publishable_verified_total += publishable_verified
+            entries.append(
+                {
+                    "source_clip": source_clip,
+                    "duration_ns": duration_ns,
+                    "data_status": status,
+                    "annotation_status": (
+                        annotation.get("status") if annotation is not None else None
+                    ),
+                    "annotation_unit_count": annotation_total,
+                    "review_status": review.get("status") if review is not None else None,
+                    "verified_unit_count": verified,
+                    "discarded_unit_count": discarded,
+                    "publishable_verified_unit_count": publishable_verified,
+                    "updated_at": (
+                        review.get("updated_at")
+                        if review is not None
+                        else (annotation or {}).get("updated_at")
+                    ),
+                }
+            )
+        ready = ready and verified_total > 0
+        scope_payload = {
+            "contract": "navigation_dataset_release_v1",
+            "dataset_date": dataset_date,
+            "clips": entries,
+        }
+        scope_sha256 = _payload_hash(scope_payload)
+        updated_values = [
+            str(entry["updated_at"])
+            for entry in entries
+            if entry["updated_at"] is not None
+        ]
+        return {
+            "dataset_date": dataset_date,
+            "status": "ready" if ready else "not_ready",
+            "release_ref": None,
+            "scope_manifest_sha256": scope_sha256,
+            "source_clip_count": len(entries),
+            "total_duration_ns": total_duration_ns,
+            "verified_unit_count": verified_total,
+            "discarded_unit_count": discarded_total,
+            "publishable_verified_unit_count": publishable_verified_total,
+            "note": None,
+            "actor_kind": None,
+            "deployment_instance": None,
+            "released_at": None,
+            "updated_at": max(updated_values) if updated_values else None,
+            "scope": scope_payload,
+        }
+
+    def create_dataset_release(
+        self,
+        *,
+        dataset_date: str,
+        managed_clips: list[dict[str, Any]],
+        expected_scope_manifest_sha256: str,
+        note: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        normalized_note = note.strip() if isinstance(note, str) else None
+        normalized_note = normalized_note or None
+        if normalized_note is not None and len(normalized_note) > 1000:
+            raise AnnotationValidationError(
+                "invalid_release_note",
+                "The release note must not exceed 1000 characters.",
+            )
+        request_payload = {
+            "dataset_date": dataset_date,
+            "scope_manifest_sha256": expected_scope_manifest_sha256,
+            "note": normalized_note,
+        }
+        replay = self.replay_receipt(
+            idempotency_key=idempotency_key,
+            operation="create_dataset_release",
+            request_payload=request_payload,
+        )
+        if replay is not None:
+            return replay
+        candidate = self.dataset_release_candidate(
+            dataset_date=dataset_date,
+            managed_clips=managed_clips,
+        )
+        if candidate["status"] == "released":
+            raise AnnotationConflictError(
+                "dataset_already_released",
+                "The dataset date has already been released.",
+                current=candidate,
+            )
+        if candidate["status"] != "ready":
+            raise AnnotationConflictError(
+                "dataset_not_ready_for_release",
+                "The dataset date is not ready for training release.",
+                current=candidate,
+            )
+        if candidate["scope_manifest_sha256"] != expected_scope_manifest_sha256:
+            raise AnnotationConflictError(
+                "release_scope_changed",
+                "The dataset release scope changed; refresh before retrying.",
+                current=candidate,
+            )
+
+        def create(connection: sqlite3.Connection) -> dict[str, Any]:
+            existing = connection.execute(
+                """
+                SELECT release_ref FROM dataset_releases
+                WHERE domain = 'navigation' AND dataset_date = ?
+                """,
+                (dataset_date,),
+            ).fetchone()
+            if existing is not None:
+                raise AnnotationConflictError(
+                    "dataset_already_released",
+                    "The dataset date has already been released.",
+                )
+            # The outer candidate check gives a fast and useful conflict to
+            # the caller. Re-read it after BEGIN IMMEDIATE has acquired the
+            # writer lock so a concurrent review/publication mutation cannot
+            # make the release stale between validation and insertion.
+            locked_candidate = self.dataset_release_candidate(
+                dataset_date=dataset_date,
+                managed_clips=managed_clips,
+            )
+            if locked_candidate["status"] != "ready":
+                raise AnnotationConflictError(
+                    "dataset_not_ready_for_release",
+                    "The dataset date is not ready for training release.",
+                    current=locked_candidate,
+                )
+            if (
+                locked_candidate["scope_manifest_sha256"]
+                != expected_scope_manifest_sha256
+            ):
+                raise AnnotationConflictError(
+                    "release_scope_changed",
+                    "The dataset release scope changed; refresh before retrying.",
+                    current=locked_candidate,
+                )
+            released_at = _now()
+            release_ref = _new_ref("dataset_release")
+            connection.execute(
+                """
+                INSERT INTO dataset_releases (
+                    release_ref, domain, dataset_date, scope_manifest_sha256,
+                    scope_json, source_clip_count, total_duration_ns,
+                    verified_unit_count, discarded_unit_count, note,
+                    actor_kind, deployment_instance, released_at
+                ) VALUES (?, 'navigation', ?, ?, ?, ?, ?, ?, ?, ?,
+                          'manual_web', ?, ?)
+                """,
+                (
+                    release_ref,
+                    dataset_date,
+                    expected_scope_manifest_sha256,
+                    _canonical_json(locked_candidate["scope"]),
+                    locked_candidate["source_clip_count"],
+                    locked_candidate["total_duration_ns"],
+                    locked_candidate["verified_unit_count"],
+                    locked_candidate["discarded_unit_count"],
+                    normalized_note,
+                    self.deployment_instance,
+                    released_at,
+                ),
+            )
+            return {
+                "dataset_date": dataset_date,
+                "status": "released",
+                "release_ref": release_ref,
+                "scope_manifest_sha256": expected_scope_manifest_sha256,
+                "source_clip_count": locked_candidate["source_clip_count"],
+                "total_duration_ns": locked_candidate["total_duration_ns"],
+                "verified_unit_count": locked_candidate["verified_unit_count"],
+                "discarded_unit_count": locked_candidate["discarded_unit_count"],
+                "note": normalized_note,
+                "actor_kind": "manual_web",
+                "deployment_instance": self.deployment_instance,
+                "released_at": released_at,
+                "updated_at": released_at,
+            }
+
+        return self.mutate(
+            idempotency_key=idempotency_key,
+            operation="create_dataset_release",
+            request_payload=request_payload,
+            callback=create,
+        )
 
     def import_historical_verified_assets(
         self,

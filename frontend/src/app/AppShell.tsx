@@ -182,6 +182,7 @@ export function AppShell({ children }: AppShellProps) {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/data/releases" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/annotation" element={<AnnotationWorkspaceLayout />}>
               <Route index element={<Navigate to="/annotation/jobs" replace />} />
               <Route path="jobs" element={<AnnotationPage />} />

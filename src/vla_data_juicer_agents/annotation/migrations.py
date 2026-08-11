@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_ANNOTATION_SCHEMA_VERSION = 9
+LATEST_ANNOTATION_SCHEMA_VERSION = 10
 
 
 class UnsupportedAnnotationSchemaVersionError(RuntimeError):
@@ -1615,6 +1615,51 @@ def _migration_009_historical_verified_assets(
     )
 
 
+def _migration_010_dataset_releases(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE dataset_releases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            release_ref TEXT NOT NULL UNIQUE,
+            domain TEXT NOT NULL CHECK (domain = 'navigation'),
+            dataset_date TEXT NOT NULL,
+            scope_manifest_sha256 TEXT NOT NULL CHECK (
+                length(scope_manifest_sha256) = 64
+            ),
+            scope_json TEXT NOT NULL,
+            source_clip_count INTEGER NOT NULL CHECK (source_clip_count > 0),
+            total_duration_ns INTEGER NOT NULL CHECK (total_duration_ns >= 0),
+            verified_unit_count INTEGER NOT NULL CHECK (verified_unit_count > 0),
+            discarded_unit_count INTEGER NOT NULL CHECK (discarded_unit_count >= 0),
+            note TEXT CHECK (note IS NULL OR length(note) <= 1000),
+            actor_kind TEXT NOT NULL CHECK (actor_kind = 'manual_web'),
+            deployment_instance TEXT NOT NULL,
+            released_at TEXT NOT NULL,
+            UNIQUE (domain, dataset_date)
+        );
+
+        CREATE TRIGGER dataset_releases_no_update
+        BEFORE UPDATE ON dataset_releases BEGIN
+            SELECT RAISE(ABORT, 'dataset releases are immutable');
+        END;
+        CREATE TRIGGER dataset_releases_no_delete
+        BEFORE DELETE ON dataset_releases BEGIN
+            SELECT RAISE(ABORT, 'dataset releases are immutable');
+        END;
+
+        UPDATE annotation_migration_safety
+        SET schema_version = 10,
+            status = 'pending_integrity_check',
+            verified_at = NULL
+        WHERE singleton = 1 AND schema_version = 9;
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "annotation_m1", _migration_001_annotation_m1),
     (2, "runtime_step_evidence", _migration_002_runtime_step_evidence),
@@ -1649,4 +1694,5 @@ _MIGRATIONS = (
         "historical_verified_assets",
         _migration_009_historical_verified_assets,
     ),
+    (10, "dataset_releases", _migration_010_dataset_releases),
 )
