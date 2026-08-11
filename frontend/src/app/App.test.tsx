@@ -418,6 +418,9 @@ test("desktop sidebar collapse follows navigation and persists across remounts",
   expect(collapseButton.parentElement).toHaveClass("hidden", "md:flex");
   expect(collapseButton.className).not.toContain("focus:ring");
   expect(collapseButton.className).not.toContain("ring-console-cyan");
+  const dataSubpages = screen.getByRole("list", { name: "数据管理子页面" });
+  expect(dataSubpages).toHaveClass("md:max-h-20", "md:opacity-100");
+  expect(dataSubpages).not.toHaveClass("md:hidden");
 
   fireEvent.click(collapseButton);
 
@@ -431,6 +434,8 @@ test("desktop sidebar collapse follows navigation and persists across remounts",
   expect(dashboardNavButton).not.toHaveClass("md:justify-center");
   expect(dashboardNavButton.querySelector("span")).toHaveClass("md:opacity-0");
   expect(screen.getByText("演示用户").parentElement).toHaveClass("md:opacity-0");
+  expect(dataSubpages).toHaveClass("md:max-h-0", "md:opacity-0", "md:-translate-x-1");
+  expect(dataSubpages).not.toHaveClass("md:hidden");
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
@@ -444,6 +449,7 @@ test("desktop sidebar collapse follows navigation and persists across remounts",
   expect(screen.getByTestId("console-sidebar")).toHaveAttribute("data-collapsed", "false");
   expect(screen.getByTestId("console-main")).toHaveClass("md:ml-64");
   expect(window.localStorage.getItem("vla-console-sidebar")).toBe("expanded");
+  expect(screen.getByRole("list", { name: "数据管理子页面" })).toHaveClass("md:max-h-20", "md:opacity-100");
 });
 
 test("data management renders navigation dataset date and clip details", async () => {
@@ -474,7 +480,7 @@ test("data management renders navigation dataset date and clip details", async (
   const reviewFilter = screen.getByRole("combobox", { name: "复核状态筛选" });
   expect(annotationFilter.compareDocumentPosition(reviewFilter) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   for (const unavailableStatus of screen.getAllByText("—")) {
-    expect(unavailableStatus).toHaveClass("w-full", "text-center");
+    expect(unavailableStatus).toHaveClass("inline-flex", "min-w-14", "justify-center");
   }
   fireEvent.click(screen.getByRole("button", { name: "查看 20270515 详情" }));
   expect(screen.getByText("raw 消息")).toBeVisible();

@@ -142,8 +142,8 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                     <ul
                       aria-label="数据管理子页面"
                       className={cn(
-                        "mt-1 flex gap-1 md:ml-5 md:flex-col md:border-l md:border-[#dfe3eb] md:pl-3",
-                        collapsed && "md:hidden",
+                        "mt-1 flex gap-1 md:ml-5 md:max-h-20 md:translate-x-0 md:flex-col md:overflow-hidden md:border-l md:border-[#dfe3eb] md:pl-3 md:opacity-100 md:transition-[max-height,opacity,transform,margin,border-color] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+                        collapsed && "md:pointer-events-none md:mt-0 md:max-h-0 md:-translate-x-1 md:border-transparent md:opacity-0",
                       )}
                     >
                       {dataManagementSubpages.map((subpage) => {
@@ -154,7 +154,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                               type="button"
                               aria-current={isActive ? "page" : undefined}
                               className={cn(
-                                "flex h-8 w-max min-w-24 items-center rounded-lg px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:w-full md:min-w-0",
+                                "flex h-8 w-max min-w-24 items-center whitespace-nowrap rounded-lg px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:w-full md:min-w-0",
                                 isActive && "bg-[#e9eefc] text-[#3156c8] hover:bg-[#e9eefc] hover:text-[#2849ad]",
                               )}
                               onClick={() => navigate(subpage.path)}

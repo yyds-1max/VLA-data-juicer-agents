@@ -254,7 +254,7 @@ function AnnotationStatusCell({
   projection: AnnotationLifecycleProjection | null | undefined;
 }) {
   if (!projection) {
-    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
+    return <span className="inline-flex min-w-14 justify-center text-sm text-slate-400">—</span>;
   }
   const status = projection.status;
   const total = projection?.counts.total ?? 0;
@@ -275,7 +275,7 @@ function AnnotationStatusCell({
 
 function ReviewStatusCell({ projection }: { projection: ReviewLifecycleProjection | null | undefined }) {
   if (!projection) {
-    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
+    return <span className="inline-flex min-w-14 justify-center text-sm text-slate-400">—</span>;
   }
   return (
     <div className="flex flex-col items-start gap-1">
@@ -291,7 +291,7 @@ function ReviewStatusCell({ projection }: { projection: ReviewLifecycleProjectio
 
 function ReleaseStatusCell({ projection }: { projection: DatasetReleaseProjection | null | undefined }) {
   if (!projection || projection.status === "not_ready") {
-    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
+    return <span className="inline-flex min-w-14 justify-center text-sm text-slate-400">—</span>;
   }
   return (
     <StatusTag tone={projection.status === "released" ? "success" : "warning"}>
