@@ -39,6 +39,7 @@ import type {
 } from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
+import { ConsoleListTabs } from "../../../components/console/ConsoleListTabs";
 import { ConsoleSlidingTabs } from "../../../components/console/ConsoleSlidingTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
 import { Input } from "../../../components/ui/input";
@@ -897,7 +898,7 @@ function DatasetReleaseView({
   }
 
   return (
-    <section className="min-h-[34rem] border-y border-slate-200 bg-white">
+    <section className="min-h-[34rem] border-y border-slate-200 bg-white" data-testid="dataset-release-surface">
       <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
         <div>
           <h2 className="text-base font-semibold text-slate-900">训练数据发布</h2>
@@ -908,23 +909,39 @@ function DatasetReleaseView({
           {loading || releaseLoading ? "刷新中" : "刷新"}
         </ConsoleButton>
       </div>
-      <div className="border-b border-slate-200 px-4 pt-3 sm:px-5">
-        <ConsoleSlidingTabs
+      <div className="border-b border-slate-200 px-4 sm:px-5">
+        <ConsoleListTabs
           aria-label="训练发布状态"
+          idPrefix="dataset-release-tab"
+          panelId="dataset-release-panel"
           value={tab}
           items={[
             { value: "ready", label: "待发布" },
             { value: "released", label: "已发布" },
           ]}
-          listClassName="sm:min-w-52"
           onValueChange={(value) => setTab(value as "ready" | "released")}
         />
       </div>
       {error || (releaseError && selectedDate === null) ? (
         <div className="p-8 text-center text-sm text-rose-600" role="alert">{error ?? releaseError}</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[940px] text-left text-sm">
+        <div
+          id="dataset-release-panel"
+          role="tabpanel"
+          aria-labelledby={`dataset-release-tab-${tab}`}
+          className="console-soft-scrollbar overflow-x-auto"
+        >
+          <table className="w-full min-w-[960px] table-fixed text-left text-sm">
+            <colgroup>
+              <col style={{ width: "14%" }} />
+              <col style={{ width: "8%" }} />
+              <col style={{ width: "15%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "12%" }} />
+              <col style={{ width: "12%" }} />
+              <col style={{ width: "19%" }} />
+            </colgroup>
             <thead className="text-xs text-slate-500">
               <tr className="h-11 border-b border-slate-200">
                 <th className="pl-5 pr-3 font-medium">日期</th>
@@ -945,10 +962,10 @@ function DatasetReleaseView({
                 return (
                   <tr key={date.date} className="h-16 border-b border-slate-100 hover:bg-blue-50/35">
                     <td className="pl-5 pr-3 font-medium text-slate-800">{date.date}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(release.source_clip_count)}</td>
-                    <td className="pr-3 text-slate-500">{formatDuration(release.total_duration_ns)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(release.verified_unit_count)}</td>
-                    <td className="pr-3 text-slate-500">{formatCount(release.discarded_unit_count)}</td>
+                    <td className="pr-3 tabular-nums text-slate-500">{formatCount(release.source_clip_count)}</td>
+                    <td className="pr-3 tabular-nums text-slate-500">{formatDuration(release.total_duration_ns)}</td>
+                    <td className="pr-3 tabular-nums text-slate-500">{formatCount(release.verified_unit_count)}</td>
+                    <td className="pr-3 tabular-nums text-slate-500">{formatCount(release.discarded_unit_count)}</td>
                     <td className="pr-3"><ReleaseStatusCell projection={release} /></td>
                     <td className="pr-3">
                       <DetailsPopover

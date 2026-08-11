@@ -522,13 +522,18 @@ test("data management renders navigation dataset date and clip details", async (
 test("data management exposes asset and training release subpages in the sidebar", async () => {
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  expect(await screen.findByRole("button", { name: "数据资产" })).toHaveAttribute("aria-current", "page");
+  const assetsSubpage = await screen.findByRole("button", { name: "数据资产" });
+  expect(assetsSubpage).toHaveAttribute("aria-current", "page");
+  expect(assetsSubpage).toHaveClass("before:scale-y-100", "bg-white/55");
+  expect(assetsSubpage).not.toHaveClass("rounded-lg", "bg-[#e9eefc]");
 
   fireEvent.click(screen.getByRole("button", { name: "训练发布" }));
 
   expect(await screen.findByRole("heading", { name: "训练数据发布" })).toBeVisible();
   expect(window.location.pathname).toBe("/data/releases");
-  expect(screen.getByRole("button", { name: "训练发布" })).toHaveAttribute("aria-current", "page");
+  const releasesSubpage = screen.getByRole("button", { name: "训练发布" });
+  expect(releasesSubpage).toHaveAttribute("aria-current", "page");
+  expect(releasesSubpage).toHaveClass("before:scale-y-100", "bg-white/55");
   expect(screen.getByRole("button", { name: "数据资产" })).not.toHaveAttribute("aria-current");
 });
 
@@ -634,7 +639,35 @@ test("data management records a date-level training release with an optional not
 
   expect(await screen.findByRole("heading", { name: "训练数据发布" })).toBeVisible();
   expect(window.location.pathname).toBe("/data/releases");
-  expect(screen.getByRole("tab", { name: "待发布" })).toHaveAttribute("data-state", "active");
+  const readyTab = screen.getByRole("tab", { name: "待发布" });
+  expect(readyTab).toHaveAttribute("aria-selected", "true");
+  expect(readyTab).toHaveClass("after:scale-x-100", "after:origin-center");
+  expect(screen.getByTestId("dataset-release-surface")).not.toHaveClass("rounded-xl", "shadow-sm");
+  const releaseTable = screen.getByRole("table");
+  expect(releaseTable).toHaveClass("table-fixed", "min-w-[960px]");
+  expect(Array.from(releaseTable.querySelectorAll("col"), (column) => column.getAttribute("style"))).toEqual([
+    "width: 14%;",
+    "width: 8%;",
+    "width: 15%;",
+    "width: 10%;",
+    "width: 10%;",
+    "width: 12%;",
+    "width: 12%;",
+    "width: 19%;",
+  ]);
+  fireEvent.click(screen.getByRole("tab", { name: "已发布" }));
+  expect(screen.getByText("当前没有已发布的日期。")).toBeVisible();
+  expect(Array.from(releaseTable.querySelectorAll("col"), (column) => column.getAttribute("style"))).toEqual([
+    "width: 14%;",
+    "width: 8%;",
+    "width: 15%;",
+    "width: 10%;",
+    "width: 10%;",
+    "width: 12%;",
+    "width: 12%;",
+    "width: 19%;",
+  ]);
+  fireEvent.click(readyTab);
   fireEvent.click(screen.getByRole("button", { name: "查看 20270515 发布详情" }));
   expect(screen.getByText("范围摘要")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "正式发布" }));

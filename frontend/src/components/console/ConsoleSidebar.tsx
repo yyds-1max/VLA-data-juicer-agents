@@ -154,8 +154,8 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                               type="button"
                               aria-current={isActive ? "page" : undefined}
                               className={cn(
-                                "flex h-8 w-max min-w-24 items-center whitespace-nowrap rounded-lg px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:w-full md:min-w-0",
-                                isActive && "bg-[#e9eefc] text-[#3156c8] hover:bg-[#e9eefc] hover:text-[#2849ad]",
+                                "relative flex h-8 w-max min-w-24 items-center whitespace-nowrap rounded-md px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 before:absolute before:-left-[13px] before:inset-y-2 before:w-0.5 before:scale-y-0 before:rounded-full before:bg-[#3156c8] before:transition-transform before:duration-150 hover:bg-white/65 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none motion-reduce:before:transition-none md:w-full md:min-w-0",
+                                isActive && "bg-white/55 font-semibold text-[#3156c8] before:scale-y-100 hover:bg-white/70 hover:text-[#2849ad]",
                               )}
                               onClick={() => navigate(subpage.path)}
                             >
