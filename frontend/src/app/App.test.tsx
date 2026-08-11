@@ -466,6 +466,16 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
   expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
   expect(screen.getByRole("columnheader", { name: "详情" })).toBeVisible();
+  expect(screen.queryByRole("columnheader", { name: "操作" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab", { name: "数据资产" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "数据资产" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("button", { name: "训练发布" })).not.toHaveAttribute("aria-current");
+  const annotationFilter = screen.getByRole("combobox", { name: "标注状态筛选" });
+  const reviewFilter = screen.getByRole("combobox", { name: "复核状态筛选" });
+  expect(annotationFilter.compareDocumentPosition(reviewFilter) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  for (const unavailableStatus of screen.getAllByText("—")) {
+    expect(unavailableStatus).toHaveClass("w-full", "text-center");
+  }
   fireEvent.click(screen.getByRole("button", { name: "查看 20270515 详情" }));
   expect(screen.getByText("raw 消息")).toBeVisible();
   expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[60vh]", "overflow-auto");
@@ -501,6 +511,19 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+});
+
+test("data management exposes asset and training release subpages in the sidebar", async () => {
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByRole("button", { name: "数据资产" })).toHaveAttribute("aria-current", "page");
+
+  fireEvent.click(screen.getByRole("button", { name: "训练发布" }));
+
+  expect(await screen.findByRole("heading", { name: "训练数据发布" })).toBeVisible();
+  expect(window.location.pathname).toBe("/data/releases");
+  expect(screen.getByRole("button", { name: "训练发布" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("button", { name: "数据资产" })).not.toHaveAttribute("aria-current");
 });
 
 test("data management keeps ingestion and annotation facts separate and refresh preserves the view", async () => {

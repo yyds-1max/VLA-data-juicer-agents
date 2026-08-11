@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, type MouseEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { useStore } from "zustand";
 
 import {
@@ -254,7 +254,7 @@ function AnnotationStatusCell({
   projection: AnnotationLifecycleProjection | null | undefined;
 }) {
   if (!projection) {
-    return <span className="text-sm text-slate-400">—</span>;
+    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
   }
   const status = projection.status;
   const total = projection?.counts.total ?? 0;
@@ -275,7 +275,7 @@ function AnnotationStatusCell({
 
 function ReviewStatusCell({ projection }: { projection: ReviewLifecycleProjection | null | undefined }) {
   if (!projection) {
-    return <span className="text-sm text-slate-400">—</span>;
+    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
   }
   return (
     <div className="flex flex-col items-start gap-1">
@@ -291,7 +291,7 @@ function ReviewStatusCell({ projection }: { projection: ReviewLifecycleProjectio
 
 function ReleaseStatusCell({ projection }: { projection: DatasetReleaseProjection | null | undefined }) {
   if (!projection || projection.status === "not_ready") {
-    return <span className="text-sm text-slate-400">—</span>;
+    return <span className="block w-full text-center text-sm text-slate-400">—</span>;
   }
   return (
     <StatusTag tone={projection.status === "released" ? "success" : "warning"}>
@@ -415,7 +415,7 @@ function ClipRows({
 
   return (
     <tr className="border-b border-slate-200 bg-slate-50/55">
-      <td colSpan={9} className="px-0 py-0">
+      <td colSpan={8} className="px-0 py-0">
         {clips.length === 0 ? (
           <div className="border-l-2 border-blue-200 px-16 py-6 text-sm text-slate-500">该日期暂无 clip 明细。</div>
         ) : (
@@ -537,7 +537,7 @@ function DatasetTable({
         onPointerLeave={datasetScrollbar.onPointerLeave}
         onPointerMove={datasetScrollbar.onPointerMove}
       >
-        <table className="w-full min-w-[1240px] text-left text-sm">
+        <table className="w-full min-w-[1120px] text-left text-sm">
           <thead className="text-xs text-slate-500">
             <tr className="h-11 border-b border-slate-200 bg-white">
               <th className="pl-4 pr-3 font-medium sm:pl-5">日期</th>
@@ -548,13 +548,12 @@ function DatasetTable({
               <th className="pr-3 font-medium">修正 / 复核</th>
               <th className="pr-3 font-medium">训练发布</th>
               <th className="pr-3 font-medium">详情</th>
-              <th className="pr-5 text-right font-medium">操作</th>
             </tr>
           </thead>
           <tbody>
             {dates.length === 0 ? (
               <tr>
-                <td colSpan={9} className="h-[19rem] px-4 text-center text-sm text-slate-500">
+                <td colSpan={8} className="h-[19rem] px-4 text-center text-sm text-slate-500">
                   <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-400">
                     <Layers3 aria-hidden="true" className="size-5" />
                   </span>
@@ -609,7 +608,6 @@ function DatasetTable({
                         ]}
                       />
                     </td>
-                    <td className="pr-5 text-right" />
                   </tr>
                   {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
                 </Fragment>
@@ -781,22 +779,6 @@ function NavigationListToolbar({
       </Select>
 
       <Select
-        value={reviewStatus}
-        onValueChange={(value) => onReviewStatusChange(value as ReviewStatusFilter)}
-      >
-        <SelectTrigger aria-label="复核状态筛选" className="h-10 w-full bg-white shadow-none lg:w-44">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent align="start" position="popper">
-          {reviewStatusOptions.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
-              {option.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-
-      <Select
         value={annotationStatus}
         onValueChange={(value) => onAnnotationStatusChange(value as AnnotationStatusFilter)}
       >
@@ -805,6 +787,22 @@ function NavigationListToolbar({
         </SelectTrigger>
         <SelectContent align="start" position="popper">
           {annotationStatusOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <Select
+        value={reviewStatus}
+        onValueChange={(value) => onReviewStatusChange(value as ReviewStatusFilter)}
+      >
+        <SelectTrigger aria-label="复核状态筛选" className="h-10 w-full bg-white shadow-none lg:w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="start" position="popper">
+          {reviewStatusOptions.map((option) => (
             <SelectItem key={option.value} value={option.value}>
               {option.label}
             </SelectItem>
@@ -1335,7 +1333,6 @@ function SyncImageDrawer({
 
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
   void onPlaceholderAction;
-  const navigate = useNavigate();
   const location = useLocation();
   const releaseSurface = location.pathname === "/data/releases";
   const [activeSurface, setActiveSurface] = useState<DataSurface>("navigation");
@@ -1515,17 +1512,6 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   return (
     <section className="mx-auto max-w-360 space-y-4 px-3 pb-28 pt-2 md:px-4 lg:px-5">
-      <ConsoleSlidingTabs
-        aria-label="数据管理页面"
-        value={releaseSurface ? "releases" : "assets"}
-        items={[
-          { value: "assets", label: "数据资产" },
-          { value: "releases", label: "训练发布" },
-        ]}
-        listClassName="sm:min-w-60"
-        onValueChange={(value) => navigate(value === "releases" ? "/data/releases" : "/data")}
-      />
-
       {releaseSurface ? (
         <DatasetReleaseView dates={dates} loading={loading} error={error} onRefresh={reload} />
       ) : (
