@@ -746,6 +746,7 @@ def create_app(
 
                     @app.get("/agent", include_in_schema=False)
                     @app.get("/data", include_in_schema=False)
+                    @app.get("/data/releases", include_in_schema=False)
                     @app.get("/annotation", include_in_schema=False)
                     @app.get("/annotation/jobs", include_in_schema=False)
                     @app.get("/annotation/jobs/{job_ref}", include_in_schema=False)
@@ -758,14 +759,19 @@ def create_app(
                         "/annotation/reviews/{review_ref}",
                         include_in_schema=False,
                     )
+                    @app.get(
+                        "/annotation/verified/{asset_ref}",
+                        include_in_schema=False,
+                    )
                     @app.get("/model", include_in_schema=False)
                     @app.get("/simulation", include_in_schema=False)
                     async def frontend_route(
                         job_ref: str | None = None,
                         segment_ref: str | None = None,
                         review_ref: str | None = None,
+                        asset_ref: str | None = None,
                     ) -> FileResponse:
-                        del job_ref, segment_ref, review_ref
+                        del job_ref, segment_ref, review_ref, asset_ref
                         return FileResponse(index_path)
 
         return app

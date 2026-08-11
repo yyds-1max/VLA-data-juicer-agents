@@ -296,7 +296,7 @@ Playwright 绿色门禁。
 - 状态自动刷新功能提交为 `b00f1cd`；服务器服务已恢复运行，事件 cursor API、
   摘要 API、SPA 构建和 bundle gate 均通过。
 
-## 10. 四轴生命周期修订结果（2026-08-10）
+## 10. 四轴生命周期修订结果（2026-08-10～2026-08-11）
 
 本地已完成：
 
@@ -311,6 +311,16 @@ Playwright 绿色门禁。
 本地最终门禁为 Python `1791 passed, 1 warning`；前端 `393 passed, 8 skipped`；
 production build 与 `512000` 字节 bundle gate 通过；`git diff --check` 通过。
 
-服务器第 9 节记录的是 schema v9 首次交付结果。schema v10 必须在 Web 与 Worker
-停机、SQLite 主文件/WAL/SHM 备份后迁移，并重新检查 integrity、foreign keys、
-真实四轴投影和日期发布；在此之前不得把本次修订标记为服务器冻结。
+服务器已在 Web 停机后完成 schema v9→v10 迁移。迁移前创建全新私有 SQLite
+备份，备份 manifest SHA-256 为
+`9a202e590bf40f1c9f4aca058a80adaf8e3b333879f260b6f4ea5c61a4a98183`；迁移后：
+
+- migration ledger 为 `1..10`，safety marker 为 `schema_version=10/status=verified`；
+- `PRAGMA integrity_check` 为 `ok`，`foreign_key_check` 无异常；
+- 真实摘要为 53 个日期、643 个 clips、332 个已标注 clips、331 个已验证 clips；
+- 53 个日期中 16 个为“待发布”、37 个尚未满足发布条件、0 个已发布；验收没有
+  代替用户写入正式发布记录；
+- Runtime capability 可用，四轴摘要与发布候选 API、`/data`、`/data/releases`
+  SPA 深链均通过服务器轻量验收。
+
+四轴生命周期修订至此完成服务器冻结。

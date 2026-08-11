@@ -594,7 +594,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - M3 本地最终门禁为 Python `1785 passed, 1 warning`、前端 `392 passed,
   8 skipped`，production build 和 bundle gate 通过；M3 至此完成冻结。
 
-### M3 四轴生命周期修订（2026-08-10，本地完成、待服务器验收）
+### M3 四轴生命周期修订（2026-08-10～2026-08-11，已冻结）
 
 - 数据处理、自动标注、人工复核和日期训练发布拆为四条互不覆盖的状态轴；
 - Annotation schema v10 增加不可变 DatasetRelease，发布只形成模型训练的日期
@@ -604,5 +604,10 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - 日期和 clip 的次要原始/同步指标进入卡片式详情，`tmp_dir` 和 `sync_data` 在 clip
   列表继续直接展示；
 - 本地门禁为 Python `1791 passed, 1 warning`、前端 `393 passed, 8 skipped`，
-  production build 和 bundle gate 通过；服务器 schema v10 迁移与真实数据验收
-  尚未执行。
+  production build 和 bundle gate 通过；新增 SPA 深链回归为 `43 passed`；
+- 服务器已在 Web 停机后从 schema v9 迁移到 v10，迁移账本 `1..10` 连续、
+  safety marker 为 `10/verified`、integrity 为 `ok`、foreign-key 异常为 0；
+- 服务器真实只读投影为 53 个日期、643 个 clips、332 个已标注 clips、331 个
+  已验证 clips；16 个日期满足“待发布”，尚未代替用户执行任何正式发布；
+- 四轴摘要、日期发布候选、Runtime capability、`/data` 和 `/data/releases` SPA
+  深链均通过服务器轻量验收，本次修订至此冻结。

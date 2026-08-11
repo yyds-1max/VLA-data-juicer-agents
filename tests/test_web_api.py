@@ -455,7 +455,7 @@ def test_frontend_index_served_when_dist_provided(tmp_path: Path):
     assert api_response.status_code == 200
 
 
-def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
+def test_frontend_deep_links_serve_spa_index(tmp_path: Path):
     dist = tmp_path / "dist"
     dist.mkdir()
     index = "<!doctype html><main>Annotation workspace</main>"
@@ -469,6 +469,8 @@ def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
     client = TestClient(app)
 
     for path in (
+        "/data",
+        "/data/releases",
         "/annotation",
         "/annotation/jobs",
         "/annotation/jobs/job_0123456789abcdef0123456789abcdef",
@@ -478,6 +480,7 @@ def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
         ),
         "/annotation/reviews",
         "/annotation/reviews/review_0123456789abcdef0123456789abcdef",
+        "/annotation/verified/asset_0123456789abcdef0123456789abcdef",
     ):
         response = client.get(path)
         assert response.status_code == 200
