@@ -7,8 +7,10 @@ import {
   getNavigationDatasetReleases,
   getNavigationDatasetSummary,
   getTrainingCapabilities,
+  getTrainingNodeResources,
   getTrainingServerResources,
   listTrainingModels,
+  listTrainingNodes,
   listTrainingRuns,
   listTrainingServers,
   getSession,
@@ -29,13 +31,17 @@ import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
 vi.mock("../api/client", () => ({
+  createTrainingNode: vi.fn(),
+  createTrainingNodeEnrollmentToken: vi.fn(),
   createSession: vi.fn(),
   createNavigationDatasetRelease: vi.fn(),
   getNavigationDatasetReleases: vi.fn(),
   getNavigationDatasetSummary: vi.fn(),
   getTrainingCapabilities: vi.fn(),
+  getTrainingNodeResources: vi.fn(),
   getTrainingServerResources: vi.fn(),
   listTrainingModels: vi.fn(),
+  listTrainingNodes: vi.fn(),
   listTrainingRuns: vi.fn(),
   listTrainingServers: vi.fn(),
   getSyncImages: vi.fn(),
@@ -53,8 +59,10 @@ const apiMocks = vi.mocked({
   getNavigationDatasetReleases,
   getNavigationDatasetSummary,
   getTrainingCapabilities,
+  getTrainingNodeResources,
   getTrainingServerResources,
   listTrainingModels,
+  listTrainingNodes,
   listTrainingRuns,
   listTrainingServers,
   getSyncImages,
@@ -251,6 +259,8 @@ beforeEach(() => {
   };
   apiMocks.getTrainingCapabilities.mockResolvedValue(trainingCapabilities);
   apiMocks.listTrainingModels.mockResolvedValue([]);
+  apiMocks.listTrainingNodes.mockResolvedValue([]);
+  apiMocks.getTrainingNodeResources.mockResolvedValue({ node_ref: "unused", captured_at: null, stale: true, resources: null });
   apiMocks.listTrainingRuns.mockResolvedValue([]);
   apiMocks.listTrainingServers.mockResolvedValue([trainingServer]);
   apiMocks.getTrainingServerResources.mockResolvedValue(trainingResources);

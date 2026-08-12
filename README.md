@@ -96,8 +96,10 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 
 ## DataPilot web UI
 
-The model-training page currently provides a local, simulation-only workflow.
-It never connects to a training host or executes the displayed RunSpec. See
+The model-training page currently executes only simulated training runs. Its
+node page can separately deploy the read-only Training Worker through one
+explicit SSH authorization when a reachable HTTPS center origin is configured;
+the Worker still cannot execute a displayed RunSpec. See
 [`docs/training-simulation.md`](docs/training-simulation.md) for the explicit
 development-admin switch and local acceptance flow.
 
@@ -147,12 +149,15 @@ by that user with mode `0600`. The file is strict JSON, not a shell fragment:
   "VLA_NAVIGATION_ODOM_V1_SOURCE": "/srv/datapilot/runtime/navigation_odom_v1/source",
   "VLA_NAVIGATION_ODOM_V1_MANIFEST": "/srv/datapilot/app/runtime/navigation_odom_v1/manifest.json",
   "VLA_NAVIGATION_WRITER_LOCK_PATH": "/srv/datapilot/locks/navigation-writer.lock",
-  "VLA_VLADATASETS_ROOT": "/srv/vla-datasets"
+  "VLA_VLADATASETS_ROOT": "/srv/vla-datasets",
+  "VLA_TRAINING_CENTER_BASE_URL": "https://datapilot.example.internal"
 }
 ```
 
-Only the documented Web paths, the fixed frontend Node directory, and the
-non-secret Annotation Runtime variables are accepted. Unknown keys, duplicate
+Only the documented Web paths, the fixed frontend Node directory, the
+non-secret Annotation Runtime variables, and the public Training Worker center
+origin are accepted. `VLA_TRAINING_CENTER_BASE_URL` must be an HTTPS address
+reachable from every registered training node. Unknown keys, duplicate
 JSON keys, symlinks, hardlinks, unsafe permissions, and oversized files make
 startup fail closed. The script never `source`s or `eval`s this file and does
 not accept an alternate configuration path. Explicit variables already

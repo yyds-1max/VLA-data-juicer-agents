@@ -7,7 +7,7 @@ import math
 import re
 from typing import Annotated, Any, Callable, Literal, Protocol
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import (
     BaseModel,
@@ -16,6 +16,7 @@ from pydantic import (
     StrictBool,
     StrictFloat,
     StrictInt,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -47,6 +48,42 @@ class TrainingServiceProtocol(Protocol):
     def list_servers(self) -> list[dict[str, Any]]: ...
 
     def get_server_resources(self, server_ref: str) -> dict[str, Any]: ...
+
+    def list_nodes(self) -> list[dict[str, Any]]: ...
+
+    def get_node(self, node_ref: str) -> dict[str, Any]: ...
+
+    def create_node(
+        self, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def update_node(
+        self, node_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def delete_node(
+        self, node_ref: str, expected_revision: int, principal: TrainingPrincipal
+    ) -> None: ...
+
+    def create_enrollment_token(
+        self, node_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def discover_node_host_key(
+        self, node_ref: str, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def deploy_node_worker(
+        self, node_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def enroll_node(self, payload: Any) -> dict[str, Any]: ...
+
+    def heartbeat_node(
+        self, node_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]: ...
+
+    def get_node_resources(self, node_ref: str) -> dict[str, Any]: ...
 
     def list_models(
         self, *, include_private: bool = False
@@ -104,6 +141,320 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CreateTrainingNodeRequest(StrictRequest):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    address: str = Field(
+        min_length=1,
+        max_length=254,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,253}$",
+    )
+    ssh_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 22
+    ssh_username: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_node_name(cls, value: str) -> str:
+        if any(
+            character in value for character in ("\x00", "\r")
+        ):
+            raise ValueError("node text contains control characters")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("node name cannot be blank")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def validate_node_description(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            character in value for character in ("\x00", "\r")
+        ):
+            raise ValueError("node text contains control characters")
+        return value.strip() if value is not None else None
+
+
+class UpdateTrainingNodeRequest(StrictRequest):
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    address: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=254,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,253}$",
+    )
+    ssh_port: Annotated[int, Field(strict=True, ge=1, le=65535)] | None = None
+    ssh_username: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
+    )
+    desired_state: Literal["offline", "repair_required", "disabled"] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_node_name(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            character in value for character in ("\x00", "\r")
+        ):
+            raise ValueError("node text contains control characters")
+        normalized = value.strip() if value is not None else None
+        if normalized == "":
+            raise ValueError("node name cannot be blank")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def validate_node_description(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            character in value for character in ("\x00", "\r")
+        ):
+            raise ValueError("node text contains control characters")
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def require_change(self) -> UpdateTrainingNodeRequest:
+        if all(
+            getattr(self, field) is None
+            for field in (
+                "name",
+                "description",
+                "address",
+                "ssh_port",
+                "ssh_username",
+                "desired_state",
+            )
+        ):
+            raise ValueError("at least one node field must be changed")
+        return self
+
+
+class CreateEnrollmentTokenRequest(StrictRequest):
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    expires_in_seconds: Annotated[
+        int, Field(strict=True, ge=60, le=3600)
+    ] = 600
+
+
+class ConfirmedHostKey(StrictRequest):
+    algorithm: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9@._+-]+$",
+    )
+    public_key: str = Field(
+        min_length=20,
+        max_length=16384,
+        pattern=r"^[A-Za-z0-9+/=]+$",
+    )
+    sha256_fingerprint: str = Field(
+        pattern=r"^SHA256:[A-Za-z0-9+/]{43}$"
+    )
+
+
+class DeployTrainingNodeWorkerRequest(StrictRequest):
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    confirmed_host_key: ConfirmedHostKey
+    host_key_confirmed: Literal[True]
+    ssh_password: SecretStr
+    sudo_password_mode: Literal["same_as_ssh", "separate", "not_required"] = (
+        "same_as_ssh"
+    )
+    sudo_password: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> DeployTrainingNodeWorkerRequest:
+        ssh_password = self.ssh_password.get_secret_value()
+        if (
+            not ssh_password
+            or len(ssh_password) > 1024
+            or any(character in ssh_password for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("SSH credential has an unsupported format")
+        if self.sudo_password_mode == "separate":
+            if self.sudo_password is None:
+                raise ValueError("a separate sudo password is required")
+            sudo_password = self.sudo_password.get_secret_value()
+            if (
+                not sudo_password
+                or len(sudo_password) > 1024
+                or any(character in sudo_password for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("sudo credential has an unsupported format")
+        elif self.sudo_password is not None:
+            raise ValueError("sudo_password is only valid in separate mode")
+        return self
+
+
+class NodeCapabilities(StrictRequest):
+    hostname: str = Field(min_length=1, max_length=255)
+    operating_system: str = Field(min_length=1, max_length=255)
+    architecture: str = Field(min_length=1, max_length=64)
+    python_version: str | None = Field(default=None, max_length=64)
+    nvidia_driver_version: str | None = Field(default=None, max_length=64)
+    cuda_version: str | None = Field(default=None, max_length=64)
+    conda_environments: list[str] = Field(default_factory=list, max_length=100)
+    worker_features: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator(
+        "hostname",
+        "operating_system",
+        "architecture",
+        "python_version",
+        "nvidia_driver_version",
+        "cuda_version",
+    )
+    @classmethod
+    def safe_capability_text(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            character in value for character in ("\x00", "\n", "\r")
+        ):
+            raise ValueError("capability text must be a single line")
+        return value
+
+    @field_validator("conda_environments", "worker_features")
+    @classmethod
+    def safe_capability_list(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(
+            not value
+            or len(value) > 255
+            or any(character in value for character in ("\x00", "\n", "\r"))
+            for value in values
+        ):
+            raise ValueError("capability list contains invalid or duplicate values")
+        return values
+
+
+class CpuResources(StrictRequest):
+    logical_cores: Annotated[int, Field(strict=True, ge=1, le=4096)]
+    load_1m: Annotated[float, Field(strict=True, ge=0, le=1_000_000)] | None = None
+
+
+class MemoryResources(StrictRequest):
+    total_bytes: Annotated[int, Field(strict=True, ge=1)]
+    available_bytes: Annotated[int, Field(strict=True, ge=0)]
+
+    @model_validator(mode="after")
+    def available_cannot_exceed_total(self) -> MemoryResources:
+        if self.available_bytes > self.total_bytes:
+            raise ValueError("available memory cannot exceed total memory")
+        return self
+
+
+class DiskResources(StrictRequest):
+    mount: str = Field(min_length=1, max_length=1024)
+    total_bytes: Annotated[int, Field(strict=True, ge=1)]
+    available_bytes: Annotated[int, Field(strict=True, ge=0)]
+
+    @field_validator("mount")
+    @classmethod
+    def safe_mount(cls, value: str) -> str:
+        if any(character in value for character in ("\x00", "\n", "\r")):
+            raise ValueError("mount must be a single line")
+        return value
+
+    @model_validator(mode="after")
+    def available_cannot_exceed_total(self) -> DiskResources:
+        if self.available_bytes > self.total_bytes:
+            raise ValueError("available disk cannot exceed total disk")
+        return self
+
+
+class GpuResources(StrictRequest):
+    uuid: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    index: Annotated[int, Field(strict=True, ge=0, le=1024)]
+    name: str = Field(min_length=1, max_length=255)
+    memory_total_bytes: Annotated[int, Field(strict=True, ge=1)]
+    memory_used_bytes: Annotated[int, Field(strict=True, ge=0)]
+    utilization_percent: Annotated[
+        float, Field(strict=True, ge=0, le=100)
+    ]
+    temperature_celsius: Annotated[
+        float, Field(strict=True, ge=-100, le=250)
+    ] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def safe_name(cls, value: str) -> str:
+        if any(character in value for character in ("\x00", "\n", "\r")):
+            raise ValueError("GPU name must be a single line")
+        return value
+
+    @model_validator(mode="after")
+    def used_cannot_exceed_total(self) -> GpuResources:
+        if self.memory_used_bytes > self.memory_total_bytes:
+            raise ValueError("used GPU memory cannot exceed total GPU memory")
+        return self
+
+
+class NodeResources(StrictRequest):
+    cpu: CpuResources
+    memory: MemoryResources
+    disks: list[DiskResources] = Field(default_factory=list, max_length=128)
+    gpus: list[GpuResources] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def unique_gpu_identity(self) -> NodeResources:
+        uuids = [gpu.uuid for gpu in self.gpus]
+        indexes = [gpu.index for gpu in self.gpus]
+        if len(uuids) != len(set(uuids)) or len(indexes) != len(set(indexes)):
+            raise ValueError("GPU UUIDs and indexes must be unique")
+        return self
+
+
+class EnrollTrainingNodeRequest(StrictRequest):
+    enrollment_token: str = Field(
+        min_length=40,
+        max_length=256,
+        pattern=r"^enroll_[A-Za-z0-9_-]+$",
+    )
+    worker_instance_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    worker_version: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
+    )
+    protocol_version: Literal[1]
+    capabilities: NodeCapabilities
+
+
+class TrainingNodeHeartbeatRequest(StrictRequest):
+    worker_instance_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    worker_version: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$",
+    )
+    protocol_version: Literal[1]
+    health: Literal["healthy", "degraded", "repair_required"]
+    health_message: str | None = Field(default=None, max_length=1000)
+    capabilities: NodeCapabilities | None = None
+    resources: NodeResources
+
+    @field_validator("health_message")
+    @classmethod
+    def safe_health_message(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            character in value for character in ("\x00", "\r")
+        ):
+            raise ValueError("health message contains control characters")
+        return value
+
+
 class ParameterChoice(StrictRequest):
     value: str = Field(min_length=1, max_length=200)
     label: str = Field(min_length=1, max_length=200)
@@ -128,6 +479,7 @@ class ParameterDefinition(StrictRequest):
     key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
     label: str = Field(min_length=1, max_length=200)
     type: Literal["integer", "number", "boolean", "enum", "string"]
+    semantic_role: Literal["hyperparameter", "dataset"] = "hyperparameter"
     default: JsonScalar
     description: str | None = Field(default=None, max_length=120)
     minimum: StrictInt | StrictFloat | None = None
@@ -155,6 +507,8 @@ class ParameterDefinition(StrictRequest):
     @model_validator(mode="after")
     def validate_definition(self) -> ParameterDefinition:
         default = self.default
+        if self.semantic_role == "dataset" and self.type not in {"string", "enum"}:
+            raise ValueError("dataset parameters must be strings or enums")
         valid_default = {
             "integer": type(default) is int,
             "number": type(default) in {int, float},
@@ -228,6 +582,29 @@ class ParameterDefinition(StrictRequest):
         return self
 
 
+class RuntimeEnvironment(StrictRequest):
+    kind: Literal["system", "conda"] = "system"
+    conda_environment: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_environment(self) -> RuntimeEnvironment:
+        if self.kind == "conda" and self.conda_environment is None:
+            raise ValueError("conda runtime requires conda_environment")
+        if self.kind == "system" and self.conda_environment is not None:
+            raise ValueError("system runtime cannot declare conda_environment")
+        return self
+
+
+class MonitoringContract(StrictRequest):
+    source: Literal["stdout"] = "stdout"
+    format: Literal["plain", "transformers", "jsonl"] = "plain"
+
+
 class LaunchTemplate(StrictRequest):
     domain: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")
     server_ref: str = Field(min_length=1, max_length=200)
@@ -240,6 +617,10 @@ class LaunchTemplate(StrictRequest):
         default="--output_dir",
         pattern=r"^--[A-Za-z0-9][A-Za-z0-9_-]{0,99}$",
     )
+    runtime_environment: RuntimeEnvironment = Field(
+        default_factory=RuntimeEnvironment
+    )
+    monitoring: MonitoringContract = Field(default_factory=MonitoringContract)
 
     @field_validator("server_ref")
     @classmethod
@@ -301,6 +682,11 @@ class CreateModelRequest(StrictRequest):
 
     @model_validator(mode="after")
     def reserve_platform_output_flag(self) -> CreateModelRequest:
+        if sum(
+            definition.semantic_role == "dataset"
+            for definition in self.parameter_definitions
+        ) > 1:
+            raise ValueError("a model revision can declare at most one dataset parameter")
         groups: dict[str, tuple[str, int]] = {}
         labels: dict[str, str] = {}
         for definition in self.parameter_definitions:
@@ -485,6 +871,127 @@ def create_training_router(
             {"server_ref": server_ref, "gpu_count": len(resources.get("gpus", []))},
         )
         return _resources_projection(resources, server)
+
+    @router.get("/nodes")
+    def list_nodes() -> dict[str, Any]:
+        principal = get_principal()
+        return {
+            "nodes": [
+                _node_projection(node, principal)
+                for node in _translate(service.list_nodes)
+            ]
+        }
+
+    @router.post("/nodes", status_code=201)
+    def create_node(request: CreateTrainingNodeRequest) -> dict[str, Any]:
+        return {
+            "node": _translate(service.create_node, request, get_principal())
+        }
+
+    @router.post("/nodes/enroll")
+    def enroll_node(
+        request: EnrollTrainingNodeRequest, response: Response
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _translate(service.enroll_node, request)
+
+    @router.get("/nodes/{node_ref}")
+    def get_node(node_ref: str) -> dict[str, Any]:
+        principal = get_principal()
+        return {
+            "node": _node_projection(
+                _translate(service.get_node, node_ref), principal
+            )
+        }
+
+    @router.put("/nodes/{node_ref}")
+    def update_node(
+        node_ref: str, request: UpdateTrainingNodeRequest
+    ) -> dict[str, Any]:
+        return {
+            "node": _translate(
+                service.update_node, node_ref, request, get_principal()
+            )
+        }
+
+    @router.delete("/nodes/{node_ref}", status_code=204)
+    def delete_node(
+        node_ref: str,
+        expected_revision: int = Query(ge=1),
+    ) -> Response:
+        _translate(
+            service.delete_node,
+            node_ref,
+            expected_revision,
+            get_principal(),
+        )
+        return Response(status_code=204)
+
+    @router.post("/nodes/{node_ref}/enrollment-tokens", status_code=201)
+    def create_enrollment_token(
+        node_ref: str,
+        request: CreateEnrollmentTokenRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _translate(
+            service.create_enrollment_token,
+            node_ref,
+            request,
+            get_principal(),
+        )
+
+    @router.post("/nodes/{node_ref}/host-key")
+    def discover_node_host_key(node_ref: str) -> dict[str, Any]:
+        return {
+            "host_key": _translate(
+                service.discover_node_host_key,
+                node_ref,
+                get_principal(),
+            )
+        }
+
+    @router.post("/nodes/{node_ref}/deploy-worker")
+    def deploy_node_worker(
+        node_ref: str,
+        request: DeployTrainingNodeWorkerRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _translate(
+            service.deploy_node_worker,
+            node_ref,
+            request,
+            get_principal(),
+        )
+
+    @router.post("/nodes/{node_ref}/heartbeat")
+    def heartbeat_node(
+        node_ref: str,
+        request: TrainingNodeHeartbeatRequest,
+        authorization: Annotated[
+            str | None,
+            Header(alias="Authorization", max_length=512),
+        ] = None,
+    ) -> dict[str, Any]:
+        worker_token = _worker_bearer_token(authorization)
+        node = _translate(
+            service.heartbeat_node,
+            node_ref,
+            worker_token,
+            request,
+        )
+        return {
+            "node_ref": node["node_ref"],
+            "status": node["status"],
+            "state_revision": node["state_revision"],
+            "server_time": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "next_heartbeat_seconds": 15,
+        }
+
+    @router.get("/nodes/{node_ref}/resources")
+    def node_resources(node_ref: str) -> dict[str, Any]:
+        return _translate(service.get_node_resources, node_ref)
 
     @router.get("/models")
     def list_models() -> dict[str, Any]:
@@ -725,6 +1232,20 @@ def _translate(callable_: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         raise
 
 
+def _worker_bearer_token(authorization: str | None) -> str:
+    if authorization is not None and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        if re.fullmatch(r"worker_[A-Za-z0-9_-]{40,250}", token):
+            return token
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "worker_authentication_failed",
+            "message": "The Training Worker credential is invalid.",
+        },
+    )
+
+
 def _page_projection(page: Any, key: str) -> dict[str, Any]:
     if isinstance(page, list):
         return {key: page, "next_after": None}
@@ -751,7 +1272,31 @@ def _capabilities_projection(value: dict[str, Any]) -> dict[str, Any]:
                 "Real training is not enabled.",
             ),
         ),
+        "node_deployment_enabled": bool(
+            value.get("node_deployment_enabled", False)
+        ),
+        "node_deployment_disabled_reason": value.get(
+            "node_deployment_disabled_reason"
+        ),
     }
+
+
+def _node_projection(
+    node: dict[str, Any], principal: TrainingPrincipal
+) -> dict[str, Any]:
+    projection = dict(node)
+    if not principal.can("training:manage_nodes"):
+        for private_field in (
+            "address",
+            "ssh_port",
+            "ssh_username",
+            "host_key_algorithm",
+            "host_public_key",
+            "host_key_fingerprint",
+            "worker_instance_id",
+        ):
+            projection.pop(private_field, None)
+    return projection
 
 
 def _server_projection(server: dict[str, Any]) -> dict[str, Any]:
@@ -818,6 +1363,7 @@ def _normalize_parameter_definition(definition: dict[str, Any]) -> dict[str, Any
             "label", definition.get("name", definition.get("key", "parameter"))
         ),
         "type": parameter_type,
+        "semantic_role": definition.get("semantic_role", "hyperparameter"),
         "default": definition.get("default"),
         "description": definition.get("description") or None,
         "minimum": definition.get("minimum"),
@@ -893,6 +1439,12 @@ def _run_spec_projection(spec: dict[str, Any]) -> dict[str, Any]:
         "node_rank": int(spec.get("node_rank", 0)),
         "nproc_per_node": int(spec.get("nproc_per_node", 0)),
         "environment": spec.get("environment", {}),
+        "runtime_environment": spec.get(
+            "runtime_environment", {"kind": "system"}
+        ),
+        "monitoring": spec.get(
+            "monitoring", {"source": "stdout", "format": "plain"}
+        ),
         "parameters": spec.get("parameters", {}),
         "argv": spec.get("argv", []),
         "output_preview": spec.get("output_preview"),

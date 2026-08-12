@@ -163,6 +163,105 @@ def _typed_model_payload() -> dict[str, object]:
     return payload
 
 
+def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
+    service: TrainingService,
+) -> None:
+    client = _client(service, admin=True)
+    payload = _model_payload(name="NaVILA dataset input")
+    definitions = payload["parameter_definitions"]
+    assert isinstance(definitions, list)
+    definitions.append(
+        {
+            "key": "data_mixture",
+            "label": "Dataset mixture",
+            "type": "string",
+            "semantic_role": "dataset",
+            "default": "rxr",
+            "cli_flag": "--data_mixture",
+        }
+    )
+
+    response = client.post("/api/training/models", json=payload)
+
+    assert response.status_code == 201
+    registered = response.json()["model"]["revision"]["parameter_definitions"]
+    dataset = next(item for item in registered if item["key"] == "data_mixture")
+    assert dataset["semantic_role"] == "dataset"
+
+    definitions.append(
+        {
+            "key": "validation_data",
+            "label": "Validation dataset",
+            "type": "string",
+            "semantic_role": "dataset",
+            "default": "validation",
+            "cli_flag": "--validation_data",
+        }
+    )
+    rejected = client.post("/api/training/models", json=payload)
+    assert rejected.status_code == 422
+
+
+def test_runtime_and_monitoring_contracts_roundtrip_and_reach_run_spec(
+    service: TrainingService,
+) -> None:
+    client = _client(service, admin=True)
+    payload = _model_payload(name="NaVILA conda runtime")
+    launch_template = payload["launch_template"]
+    assert isinstance(launch_template, dict)
+    launch_template["runtime_environment"] = {
+        "kind": "conda",
+        "conda_environment": "navila-train",
+    }
+    launch_template["monitoring"] = {
+        "source": "stdout",
+        "format": "transformers",
+    }
+
+    created = client.post("/api/training/models", json=payload)
+
+    assert created.status_code == 201, created.text
+    model = created.json()["model"]
+    registered_template = model["revision"]["launch_template"]
+    assert registered_template["runtime_environment"] == {
+        "kind": "conda",
+        "conda_environment": "navila-train",
+    }
+    assert registered_template["monitoring"] == {
+        "source": "stdout",
+        "format": "transformers",
+    }
+
+    preview = client.post(
+        "/api/training/runs/preview",
+        json=_run_payload(str(model["model_ref"])),
+    )
+    assert preview.status_code == 200, preview.text
+    spec = preview.json()["run_spec"]
+    assert spec["runtime_environment"] == registered_template["runtime_environment"]
+    assert spec["monitoring"] == registered_template["monitoring"]
+
+
+def test_conda_runtime_requires_a_safe_environment_name(
+    service: TrainingService,
+) -> None:
+    client = _client(service, admin=True)
+    payload = _model_payload()
+    launch_template = payload["launch_template"]
+    assert isinstance(launch_template, dict)
+    launch_template["runtime_environment"] = {"kind": "conda"}
+
+    missing = client.post("/api/training/models", json=payload)
+    assert missing.status_code == 422
+
+    launch_template["runtime_environment"] = {
+        "kind": "conda",
+        "conda_environment": "navila; touch /tmp/unsafe",
+    }
+    unsafe = client.post("/api/training/models", json=payload)
+    assert unsafe.status_code == 422
+
+
 @pytest.fixture
 def service(tmp_path: Path) -> TrainingService:
     store = TrainingStore(tmp_path / "training.sqlite")
@@ -185,7 +284,11 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         rows = db.execute(
             "SELECT version, name FROM training_schema_migrations ORDER BY version"
         ).fetchall()
-    assert rows == [(LATEST_TRAINING_SCHEMA_VERSION, "training_platform_m1")]
+    assert rows == [
+        (1, "training_platform_m1"),
+        (2, "training_nodes_m2"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "training_node_deployment_m3"),
+    ]
 
 
 def _create_model(client: TestClient) -> dict[str, object]:

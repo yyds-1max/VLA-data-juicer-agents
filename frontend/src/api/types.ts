@@ -325,7 +325,7 @@ export interface NavigationSyncImageListing {
 
 // Training platform API (contract v1).  These projections intentionally never
 // expose model working directories or raw command lines to unprivileged views.
-export type TrainingPermission = "training:view" | "training:manage_models" | "training:create_runs" | "training:stop_runs";
+export type TrainingPermission = "training:view" | "training:manage_models" | "training:manage_nodes" | "training:create_runs" | "training:stop_runs";
 export type TrainingModelStatus = "draft" | "verified" | "disabled";
 export type TrainingRunStatus = "queued" | "preparing" | "running" | "stop_requested" | "succeeded" | "failed" | "cancelled" | "lost";
 export type TrainingParameterType = "integer" | "number" | "boolean" | "enum" | "string";
@@ -337,12 +337,16 @@ export interface TrainingCapabilities {
   simulation_enabled: boolean;
   real_execution_enabled: boolean;
   real_execution_disabled_reason: string;
+  node_deployment_enabled?: boolean;
+  node_deployment_disabled_reason?: string | null;
 }
 
 export interface TrainingParameterDefinition {
   key: string;
   label: string;
   type: TrainingParameterType;
+  /** Dataset inputs remain structured CLI parameters, but are surfaced separately when creating a run. */
+  semantic_role?: "hyperparameter" | "dataset";
   default: string | number | boolean;
   description?: string | null;
   minimum?: number | null;
@@ -385,6 +389,8 @@ export interface TrainingLaunchTemplate {
   output_root: string;
   /** The training entrypoint output flag. The platform supplies the directory value. */
   output_flag?: string;
+  runtime_environment?: { kind: "system" | "conda"; conda_environment?: string | null };
+  monitoring?: { source: "stdout"; format: "plain" | "transformers" | "jsonl" };
 }
 
 export interface TrainingModel {
@@ -423,6 +429,76 @@ export interface TrainingServerResources {
   gpus: TrainingGpuResource[];
 }
 
+export type TrainingNodeStatus = "pending_enrollment" | "online" | "degraded" | "offline" | "repair_required" | "disabled";
+
+export interface TrainingNodeGpuResource {
+  uuid: string;
+  index: number;
+  name: string;
+  memory_total_bytes: number;
+  memory_used_bytes: number;
+  utilization_percent: number;
+  temperature_celsius?: number | null;
+}
+
+export interface TrainingNodeResources {
+  cpu: { logical_cores: number; load_1m?: number | null };
+  memory: { total_bytes: number; available_bytes: number };
+  disks: Array<{ mount: string; total_bytes: number; available_bytes: number }>;
+  gpus: TrainingNodeGpuResource[];
+}
+
+export interface TrainingNode {
+  node_ref: string;
+  name: string;
+  description?: string | null;
+  address?: string;
+  ssh_port?: number;
+  ssh_username?: string;
+  host_key_algorithm?: string | null;
+  host_public_key?: string | null;
+  host_key_fingerprint?: string | null;
+  deployment_status?: "not_started" | "deploying" | "succeeded" | "failed";
+  deployment_message?: string | null;
+  deployment_started_at?: string | null;
+  deployment_finished_at?: string | null;
+  installed_worker_version?: string | null;
+  status: TrainingNodeStatus;
+  state_revision: number;
+  enrolled_at?: string | null;
+  last_heartbeat_at?: string | null;
+  last_seen_at?: string | null;
+  worker_version?: string | null;
+  protocol_version?: number | null;
+  health_message?: string | null;
+  created_at: string;
+  updated_at: string;
+  capabilities?: Record<string, unknown> | null;
+  resources?: TrainingNodeResources | null;
+}
+
+export interface TrainingNodeHostKey {
+  algorithm: string;
+  public_key: string;
+  sha256_fingerprint: string;
+}
+
+export interface TrainingNodeDeploymentResult {
+  node: TrainingNode;
+  deployment: {
+    status: "succeeded";
+    worker_version: string;
+    message: string;
+  };
+}
+
+export interface TrainingNodeResourceSnapshot {
+  node_ref: string;
+  captured_at?: string | null;
+  stale: boolean;
+  resources?: TrainingNodeResources | null;
+}
+
 export interface TrainingRunSpec {
   contract_version: 1;
   execution_mode: "simulation";
@@ -434,6 +510,8 @@ export interface TrainingRunSpec {
   node_rank: 0;
   nproc_per_node: number;
   environment: Record<string, string>;
+  runtime_environment?: TrainingLaunchTemplate["runtime_environment"];
+  monitoring?: TrainingLaunchTemplate["monitoring"];
   parameters: Record<string, string | number | boolean>;
   argv: string[];
   output_preview?: string | null;

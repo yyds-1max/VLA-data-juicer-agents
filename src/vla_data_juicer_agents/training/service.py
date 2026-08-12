@@ -1,21 +1,47 @@
 from __future__ import annotations
 
 import shlex
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from .auth import TRAINING_CREATE_RUNS, TRAINING_MANAGE_MODELS, TRAINING_STOP_RUNS
-from .errors import TrainingForbiddenError, TrainingValidationError
+from .auth import (
+    TRAINING_CREATE_RUNS,
+    TRAINING_MANAGE_MODELS,
+    TRAINING_MANAGE_NODES,
+    TRAINING_STOP_RUNS,
+)
+from .errors import (
+    TrainingError,
+    TrainingForbiddenError,
+    TrainingUnavailableError,
+    TrainingValidationError,
+)
 from .models import ParameterDefinition, normalize_parameter_value
 from .resources import FakeResourceProvider
 from .store import TrainingStore
 
 
+class TrainingNodeDeploymentManager(Protocol):
+    def discover_host_key(self, node: dict[str, Any]) -> dict[str, str]: ...
+
+    def deploy_worker(
+        self,
+        *,
+        node: dict[str, Any],
+        confirmed_host_key: dict[str, str],
+        ssh_password: str,
+        sudo_password_mode: str,
+        sudo_password: str | None,
+        enrollment_token: str,
+    ) -> dict[str, str]: ...
+
+
 class TrainingService:
-    def __init__(self, store: TrainingStore, provider: FakeResourceProvider, *, simulation_enabled: bool = True) -> None:
+    def __init__(self, store: TrainingStore, provider: FakeResourceProvider, *, simulation_enabled: bool = True, node_deployment_manager: TrainingNodeDeploymentManager | None = None) -> None:
         self.store, self.provider = store, provider
         self.simulation_enabled = simulation_enabled
+        self.node_deployment_manager = node_deployment_manager
 
     @staticmethod
     def _data(payload: Any) -> dict[str, Any]:
@@ -28,10 +54,148 @@ class TrainingService:
             raise TrainingForbiddenError("training_write_forbidden", "This deployment does not allow that training operation.")
 
     def capabilities(self, principal: Any) -> dict[str, Any]:
-        return {**principal.public_projection(), "simulation_enabled": self.simulation_enabled, "real_execution_enabled": False, "real_execution_disabled_reason": "Real training is intentionally disabled until server paths and credentials are verified."}
+        deployment_enabled = self.node_deployment_manager is not None
+        return {**principal.public_projection(), "simulation_enabled": self.simulation_enabled, "real_execution_enabled": False, "real_execution_disabled_reason": "Real training is intentionally disabled until server paths and credentials are verified.", "node_deployment_enabled": deployment_enabled, "node_deployment_disabled_reason": None if deployment_enabled else "Training Worker deployment requires a configured HTTPS center URL."}
 
     def list_servers(self) -> list[dict[str, Any]]: return self.provider.list_servers()
     def get_server_resources(self, server_ref: str) -> dict[str, Any]: return self.provider.resources(server_ref)
+
+    def list_nodes(self) -> list[dict[str, Any]]:
+        return self.store.list_nodes()
+
+    def get_node(self, node_ref: str) -> dict[str, Any]:
+        return self.store.get_node(node_ref)
+
+    def create_node(self, payload: Any, principal: Any) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        return self.store.create_node(self._data(payload), principal.subject)
+
+    def update_node(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        data = self._data(payload)
+        expected_revision = int(data.pop("expected_revision"))
+        return self.store.update_node(
+            node_ref, expected_revision, data, principal.subject
+        )
+
+    def delete_node(
+        self, node_ref: str, expected_revision: int, principal: Any
+    ) -> None:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        self.store.delete_node(node_ref, expected_revision, principal.subject)
+
+    def create_enrollment_token(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        data = self._data(payload)
+        return self.store.create_enrollment_token(
+            node_ref,
+            int(data["expected_revision"]),
+            int(data["expires_in_seconds"]),
+            principal.subject,
+        )
+
+    def discover_node_host_key(
+        self, node_ref: str, principal: Any
+    ) -> dict[str, str]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        if self.node_deployment_manager is None:
+            raise TrainingUnavailableError(
+                "training_node_deployment_unavailable",
+                "Training Worker deployment is not configured on this server.",
+            )
+        return self.node_deployment_manager.discover_host_key(
+            self.store.get_node(node_ref)
+        )
+
+    def deploy_node_worker(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        if self.node_deployment_manager is None:
+            raise TrainingUnavailableError(
+                "training_node_deployment_unavailable",
+                "Training Worker deployment is not configured on this server.",
+            )
+        confirmed = payload.confirmed_host_key.model_dump(mode="json")
+        ssh_password = payload.ssh_password.get_secret_value()
+        sudo_password = (
+            payload.sudo_password.get_secret_value()
+            if payload.sudo_password is not None
+            else None
+        )
+        deploying = self.store.begin_node_deployment(
+            node_ref,
+            int(payload.expected_revision),
+            host_key_algorithm=confirmed["algorithm"],
+            host_public_key=confirmed["public_key"],
+            host_key_fingerprint=confirmed["sha256_fingerprint"],
+            actor=principal.subject,
+        )
+        try:
+            token_result = self.store.create_enrollment_token(
+                node_ref,
+                int(deploying["state_revision"]),
+                600,
+                principal.subject,
+            )
+            deployment = self.node_deployment_manager.deploy_worker(
+                node=token_result["node"],
+                confirmed_host_key=confirmed,
+                ssh_password=ssh_password,
+                sudo_password_mode=payload.sudo_password_mode,
+                sudo_password=sudo_password,
+                enrollment_token=token_result["enrollment_token"],
+            )
+        except Exception as exc:
+            self.store.invalidate_node_enrollment_tokens(node_ref)
+            message = (
+                str(exc)
+                if isinstance(exc, TrainingError)
+                else "Training Worker deployment failed."
+            )
+            self.store.finish_node_deployment(
+                node_ref,
+                succeeded=False,
+                message=message,
+                worker_version=None,
+                actor=principal.subject,
+            )
+            raise
+        self.store.invalidate_node_enrollment_tokens(node_ref)
+        worker_version = deployment.get("worker_version", "0.1.0")
+        node = self.store.finish_node_deployment(
+            node_ref,
+            succeeded=True,
+            message=deployment.get("message", "Training Worker deployed."),
+            worker_version=worker_version,
+            actor=principal.subject,
+        )
+        return {
+            "node": node,
+            "deployment": {
+                "status": "succeeded",
+                "worker_version": worker_version,
+                "message": deployment.get("message", "Training Worker deployed."),
+            },
+        }
+
+    def enroll_node(self, payload: Any) -> dict[str, Any]:
+        return self.store.enroll_node(self._data(payload))
+
+    def heartbeat_node(
+        self, node_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]:
+        return self.store.record_node_heartbeat(
+            node_ref, worker_token, self._data(payload)
+        )
+
+    def get_node_resources(self, node_ref: str) -> dict[str, Any]:
+        return self.store.get_node_resources(node_ref)
+
     def list_models(self, *, include_private: bool = False) -> list[dict[str, Any]]:
         models = self.store.list_models()
         if include_private:
@@ -58,7 +222,7 @@ class TrainingService:
             for item in model["parameter_definitions"]:
                 visible_when = item.get("visible_when")
                 choices = [choice if isinstance(choice, dict) else {"value": choice, "label": choice} for choice in (item.get("choices") or [])]
-                definitions.append({"key": item["name"], "label": item.get("label", item["name"]), "type": "number" if item["kind"] == "float" else item["kind"], "default": item["default"], "description": item.get("description"), "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": choices, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_key": visible_when["parameter_name"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag"), "argument_style": item.get("argument_style") or ("flag_when_true" if item["kind"] == "boolean" else "value")})
+                definitions.append({"key": item["name"], "label": item.get("label", item["name"]), "type": "number" if item["kind"] == "float" else item["kind"], "semantic_role": item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description"), "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": choices, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_key": visible_when["parameter_name"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag"), "argument_style": item.get("argument_style") or ("flag_when_true" if item["kind"] == "boolean" else "value")})
             revision = {"revision": model["revision"], "created_at": model["updated_at"], "parameter_definitions": definitions, "fixed_argv": model.get("launch_template", {}).get("fixed_argv", [])}
             template = model.get("launch_template")
             if isinstance(template, dict) and {"domain", "server_ref", "working_directory", "executable", "entrypoint", "output_root"} <= set(template):
@@ -73,7 +237,7 @@ class TrainingService:
         for item in data["parameter_definitions"]:
             kind = "float" if item["type"] == "number" else item["type"]
             visible_when = item.get("visible_when")
-            definitions.append({"name": item["key"], "label": item["label"], "kind": kind, "default": item["default"], "description": item.get("description") or "", "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": item.get("choices") or None, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_name": visible_when["parameter_key"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag") or f"--{item['key']}", "argument_style": item.get("argument_style") or ("flag_when_true" if kind == "boolean" else "value")})
+            definitions.append({"name": item["key"], "label": item["label"], "kind": kind, "semantic_role": item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description") or "", "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": item.get("choices") or None, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_name": visible_when["parameter_key"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag") or f"--{item['key']}", "argument_style": item.get("argument_style") or ("flag_when_true" if kind == "boolean" else "value")})
         adapted = {**data, "parameter_definitions": definitions}
         return adapted
 
@@ -153,8 +317,8 @@ class TrainingService:
             output_flag = template.get("output_flag", "--output_dir")
             argv.extend([output_flag, output])
             safe_argv.extend([output_flag, output])
-            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "model_name": model["name"], "model_revision": model["revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "nnodes": 1, "nproc_per_node": len(indexes), "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
-            safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "nnodes": 1, "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "nproc_per_node": len(indexes), "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "parameters": normalized, "argv": safe_argv, "output_preview": output}
+            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "model_name": model["name"], "model_revision": model["revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "nnodes": 1, "nproc_per_node": len(indexes), "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
+            safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "nnodes": 1, "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "nproc_per_node": len(indexes), "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "argv": safe_argv, "output_preview": output}
             safe["parameters"] = {key: "********" if key in sensitive else value for key,value in normalized.items()}
             private["public_spec"] = safe
             return {"private_spec": private, "run_spec": safe, "command_preview": private["safe_command_preview"]}

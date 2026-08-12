@@ -1,0 +1,29 @@
+[Unit]
+Description=DataPilot Training Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=datapilot-worker
+Group=datapilot-worker
+EnvironmentFile=/etc/datapilot-training-worker/worker.env
+ExecStart=/usr/bin/python3 /opt/datapilot-training-worker/current/datapilot-training-worker.pyz --state-dir /var/lib/datapilot-training-worker --center-base-url ${DATAPILOT_CENTER_BASE_URL} --node-ref ${DATAPILOT_NODE_REF}
+WorkingDirectory=/var/lib/datapilot-training-worker
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/datapilot-training-worker
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

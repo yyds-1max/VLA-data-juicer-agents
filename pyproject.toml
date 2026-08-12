@@ -35,6 +35,7 @@ vla-nav-runtime-manifest = "vla_data_juicer_agents.navigation.runtime_manifest:m
 vla-nav-golden = "vla_data_juicer_agents.navigation.golden.cli:main"
 vla-annotation-operator = "vla_data_juicer_agents.annotation.operator_cli:main"
 vla-navigation-operator = "vla_data_juicer_agents.navigation.operator_cli:main"
+datapilot-training-worker = "vla_data_juicer_agents.training_worker.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

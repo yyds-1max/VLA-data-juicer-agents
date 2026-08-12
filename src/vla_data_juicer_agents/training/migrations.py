@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 1
+LATEST_TRAINING_SCHEMA_VERSION = 3
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -23,6 +23,22 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(1,?,?)",
             ("training_platform_m1", applied_at),
+        )
+        connection.commit()
+        versions.append(1)
+    if 2 not in versions:
+        connection.executescript(_MIGRATION_002)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(2,?,?)",
+            ("training_nodes_m2", applied_at),
+        )
+        connection.commit()
+        versions.append(2)
+    if 3 not in versions:
+        connection.executescript(_MIGRATION_003)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(3,?,?)",
+            ("training_node_deployment_m3", applied_at),
         )
         connection.commit()
 
@@ -145,5 +161,72 @@ CREATE TABLE training_idempotency (
   created_at TEXT NOT NULL,
   PRIMARY KEY(scope,idempotency_key)
 );
+COMMIT;
+"""
+
+
+_MIGRATION_002 = """
+BEGIN IMMEDIATE;
+CREATE TABLE training_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_ref TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL,
+  ssh_port INTEGER NOT NULL CHECK(ssh_port BETWEEN 1 AND 65535),
+  ssh_username TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'pending_enrollment','online','degraded','offline','repair_required','disabled'
+  )) DEFAULT 'pending_enrollment',
+  state_revision INTEGER NOT NULL DEFAULT 1,
+  enrolled_at TEXT,
+  last_heartbeat_at TEXT,
+  worker_instance_id TEXT,
+  worker_version TEXT,
+  protocol_version INTEGER,
+  worker_token_sha256 TEXT,
+  health_message TEXT,
+  capabilities_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_training_nodes_status ON training_nodes(status, id);
+CREATE TABLE training_node_enrollment_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER NOT NULL,
+  token_sha256 TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_training_node_enrollment_tokens_node
+  ON training_node_enrollment_tokens(node_id, id);
+CREATE TABLE training_node_resource_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  captured_at TEXT NOT NULL,
+  resources_json TEXT NOT NULL,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_training_node_resource_snapshots_node
+  ON training_node_resource_snapshots(node_id, id DESC);
+COMMIT;
+"""
+
+
+_MIGRATION_003 = """
+BEGIN IMMEDIATE;
+ALTER TABLE training_nodes ADD COLUMN host_key_algorithm TEXT;
+ALTER TABLE training_nodes ADD COLUMN host_public_key TEXT;
+ALTER TABLE training_nodes ADD COLUMN host_key_fingerprint TEXT;
+ALTER TABLE training_nodes ADD COLUMN deployment_status TEXT NOT NULL DEFAULT 'not_started'
+  CHECK(deployment_status IN ('not_started','deploying','succeeded','failed'));
+ALTER TABLE training_nodes ADD COLUMN deployment_message TEXT;
+ALTER TABLE training_nodes ADD COLUMN deployment_started_at TEXT;
+ALTER TABLE training_nodes ADD COLUMN deployment_finished_at TEXT;
+ALTER TABLE training_nodes ADD COLUMN installed_worker_version TEXT;
 COMMIT;
 """

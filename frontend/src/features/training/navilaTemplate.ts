@@ -15,7 +15,7 @@ export const navilaTrajectoryParameters: TrainingParameterDefinition[] = [
   value("model_name_or_path", "预训练参数加载地址", "string", "/workspace/checkpoints/navila", { editable: true, description: "注册前请替换为部署环境允许的路径。" }),
   value("version", "模型版本", "enum", "llama_3", { choices: [{ value: "llama_3", label: "llama_3" }], description: "选择训练代码使用的对话模板版本。" }),
   value("seed", "随机种子", "integer", 10, { editable: true, minimum: 0, description: "控制随机初始化和数据顺序，便于复现。" }),
-  value("data_mixture", "数据混合配置", "string", "rxr", { editable: true, description: "指定训练数据集或数据混合方案。" }),
+  value("data_mixture", "数据混合配置", "string", "rxr", { editable: true, semantic_role: "dataset", description: "指定训练数据集或数据混合方案。" }),
   value("vision_tower", "视觉编码器", "string", "google/siglip-so400m-patch14-384", { description: "指定提取图像特征的视觉骨干模型。" }),
   value("mm_vision_select_feature", "视觉特征选择", "enum", "cls_patch", { choices: [{ value: "cls_patch", label: "cls_patch" }], description: "选择送入多模态模块的视觉特征类型。" }),
   value("mm_projector", "多模态投影器", "enum", "mlp_downsample", { choices: [{ value: "mlp_downsample", label: "mlp_downsample" }], description: "定义视觉特征到语言空间的映射结构。" }),
@@ -59,4 +59,6 @@ export const navilaTrajectoryLaunchTemplate = {
   fixed_argv: [] as string[],
   output_root: "/workspace/outputs",
   output_flag: "--output_dir",
+  runtime_environment: { kind: "system" as const, conda_environment: null as string | null },
+  monitoring: { source: "stdout" as const, format: "transformers" as const },
 };

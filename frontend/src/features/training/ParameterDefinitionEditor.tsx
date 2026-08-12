@@ -52,6 +52,7 @@ function NumericField({ ariaLabel, value, integer, optional = false, disabled, p
 
 export function validateParameterDefinitions(definitions: TrainingParameterDefinition[]) {
   if (!definitions.length) throw new Error("请至少添加一个训练参数。");
+  if (definitions.filter((parameter) => parameter.semantic_role === "dataset").length > 1) throw new Error("每个模型版本最多只能指定一个数据集参数。");
   const keys = new Set<string>(); const flags = new Set<string>();
   definitions.forEach((parameter, index) => {
     const position = index + 1;
@@ -59,6 +60,7 @@ export function validateParameterDefinitions(definitions: TrainingParameterDefin
     if (keys.has(parameter.key)) throw new Error(`参数字段名 ${parameter.key} 重复。`);
     keys.add(parameter.key);
     if (!parameter.label.trim()) throw new Error(`参数 ${parameter.key} 缺少显示名称。`);
+    if (parameter.semantic_role === "dataset" && !["string", "enum"].includes(parameter.type)) throw new Error(`数据集参数 ${parameter.key} 只能使用字符串或枚举类型。`);
     if (parameter.label.trim().length > 200) throw new Error(`参数 ${parameter.key} 的显示名称不能超过 200 个字符。`);
     if ((parameter.description?.length ?? 0) > 120) throw new Error(`参数 ${parameter.key} 的解释不能超过 120 个字符。`);
     const flag = parameter.cli_flag || `--${parameter.key}`;
@@ -219,7 +221,7 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
     key,
     cli_flag: !parameter.cli_flag || parameter.cli_flag === `--${parameter.key}` ? `--${key}` : parameter.cli_flag,
   });
-  const changeType = (type: TrainingParameterType) => onChange({ ...parameter, type, minimum: undefined, maximum: undefined, string_min_length: undefined, string_max_length: undefined, ...defaultForType(type) });
+  const changeType = (type: TrainingParameterType) => onChange({ ...parameter, type, semantic_role: ["string", "enum"].includes(type) ? parameter.semantic_role : "hyperparameter", minimum: undefined, maximum: undefined, string_min_length: undefined, string_max_length: undefined, ...defaultForType(type) });
   const dependencySummary = parameterDependencySummary(definitions, parameter);
   const selectedGroup = trainingParameterGroupFor(parameter);
   const numericDefault = typeof parameter.default === "number" && Number.isFinite(parameter.default) ? parameter.default : null;
@@ -251,6 +253,7 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
       <label className="text-xs text-console-muted">页面显示名称<input aria-label={`${parameter.key || "未命名参数"} 显示名称`} className={inputClass} value={parameter.label} maxLength={200} disabled={disabled} placeholder="视频帧数" onChange={(event) => update("label", event.target.value)} /></label>
       <label className="text-xs text-console-muted">CLI flag<input aria-label={`${parameter.key || "未命名参数"} CLI flag`} className={inputClass} value={parameter.cli_flag ?? `--${parameter.key}`} maxLength={102} disabled={disabled} placeholder="--num_video_frames" onChange={(event) => update("cli_flag", event.target.value)} /></label>
       <label className="text-xs text-console-muted">类型<select aria-label={`${parameter.key || "未命名参数"} 类型`} className={inputClass} value={parameter.type} disabled={disabled} onChange={(event) => changeType(event.target.value as TrainingParameterType)}>{parameterTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select></label>
+      <label className="text-xs text-console-muted">参数用途<select aria-label={`${parameter.key || "未命名参数"} 参数用途`} className={inputClass} value={parameter.semantic_role ?? "hyperparameter"} disabled={disabled || !["string", "enum"].includes(parameter.type)} onChange={(event) => update("semantic_role", event.target.value as "hyperparameter" | "dataset")}><option value="hyperparameter">训练超参数</option><option value="dataset">数据集输入</option></select></label>
       {parameter.type === "boolean" ? <label className="text-xs text-console-muted">默认值<select aria-label={`${parameter.key} 默认值`} className={inputClass} value={String(parameter.default)} disabled={disabled} onChange={(event) => update("default", event.target.value === "true")}><option value="true">True</option><option value="false">False</option></select></label>
       : parameter.type === "enum" ? null
       : parameter.type === "string" ? <label className="text-xs text-console-muted">默认值<input aria-label={`${parameter.key} 默认值`} aria-invalid={Boolean(stringDefaultError)} className={`${inputClass} ${stringDefaultError ? "border-rose-500" : ""}`} type="text" value={String(parameter.default)} maxLength={Number.isInteger(stringMaximum) && stringMaximum >= 0 && stringMaximum <= 512 ? stringMaximum : 512} disabled={disabled} onChange={(event) => update("default", event.target.value)} />{stringDefaultError ? <span role="alert" className="mt-1 block text-[11px] text-rose-700">{stringDefaultError}</span> : null}</label>

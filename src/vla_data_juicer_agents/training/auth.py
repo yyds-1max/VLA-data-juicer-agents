@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from typing import Final
+from urllib.parse import urlsplit
 
 
 TRAINING_VIEW: Final = "training:view"
+TRAINING_MANAGE_NODES: Final = "training:manage_nodes"
 TRAINING_MANAGE_MODELS: Final = "training:manage_models"
 TRAINING_CREATE_RUNS: Final = "training:create_runs"
 TRAINING_STOP_RUNS: Final = "training:stop_runs"
@@ -13,6 +15,7 @@ TRAINING_STOP_RUNS: Final = "training:stop_runs"
 _ADMIN_PERMISSIONS: Final[frozenset[str]] = frozenset(
     {
         TRAINING_VIEW,
+        TRAINING_MANAGE_NODES,
         TRAINING_MANAGE_MODELS,
         TRAINING_CREATE_RUNS,
         TRAINING_STOP_RUNS,
@@ -45,18 +48,43 @@ class TrainingSettings:
 
     simulation_enabled: bool = True
     development_admin: bool = False
+    center_base_url: str | None = None
 
     def __post_init__(self) -> None:
         if self.development_admin and not self.simulation_enabled:
             raise ValueError(
                 "VLA_TRAINING_DEV_ADMIN requires training simulation to be enabled"
             )
+        if self.center_base_url is not None:
+            try:
+                parsed = urlsplit(self.center_base_url)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    "VLA_TRAINING_CENTER_BASE_URL must be a valid HTTPS origin"
+                ) from exc
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+                or (port is not None and not 1 <= port <= 65535)
+            ):
+                raise ValueError(
+                    "VLA_TRAINING_CENTER_BASE_URL must be a valid HTTPS origin"
+                )
 
     @classmethod
     def from_env(cls) -> TrainingSettings:
         return cls(
             simulation_enabled=_env_bool("VLA_TRAINING_SIMULATION_ENABLED", True),
             development_admin=_env_bool("VLA_TRAINING_DEV_ADMIN", False),
+            center_base_url=(
+                os.environ.get("VLA_TRAINING_CENTER_BASE_URL", "").strip() or None
+            ),
         )
 
     def principal(self) -> TrainingPrincipal:

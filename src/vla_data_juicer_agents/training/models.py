@@ -25,6 +25,25 @@ class RunStatus(StrEnum):
     LOST = "lost"
 
 
+class TrainingNodeStatus(StrEnum):
+    """Server-owned lifecycle and health state for a training node."""
+
+    PENDING_ENROLLMENT = "pending_enrollment"
+    ONLINE = "online"
+    DEGRADED = "degraded"
+    OFFLINE = "offline"
+    REPAIR_REQUIRED = "repair_required"
+    DISABLED = "disabled"
+
+
+class WorkerHealth(StrEnum):
+    """Health reports accepted from an authenticated Training Worker."""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    REPAIR_REQUIRED = "repair_required"
+
+
 TERMINAL_RUN_STATUSES = frozenset(
     {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST}
 )
@@ -61,6 +80,7 @@ class ParameterDefinition(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
     label: str = Field(default="", max_length=200)
     kind: Literal["integer", "float", "boolean", "enum", "string"]
+    semantic_role: Literal["hyperparameter", "dataset"] = "hyperparameter"
     cli_flag: str = Field(pattern=r"^--[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
     # ``None`` is retained while reading legacy revisions.  Those revisions
     # encoded booleans as presence-only flags; non-booleans always used a
@@ -95,6 +115,8 @@ class ParameterDefinition(BaseModel):
 
     @model_validator(mode="after")
     def validate_definition(self) -> "ParameterDefinition":
+        if self.semantic_role == "dataset" and self.kind not in {"string", "enum"}:
+            raise ValueError("dataset parameters must be strings or enums")
         if self.argument_style is None:
             self.argument_style = (
                 "flag_when_true" if self.kind == "boolean" else "value"
@@ -177,6 +199,11 @@ class ModelRevisionInput(BaseModel):
         flags = [item.cli_flag for item in self.parameter_definitions]
         if len(names) != len(set(names)) or len(flags) != len(set(flags)):
             raise ValueError("parameter names and CLI flags must be unique")
+        if sum(
+            item.semantic_role == "dataset"
+            for item in self.parameter_definitions
+        ) > 1:
+            raise ValueError("a model revision can declare at most one dataset parameter")
         fields = set(re.findall(r"{([^{}]+)}", self.output_template))
         if fields - {"run_ref", "model_ref"}:
             raise ValueError("output template contains an unsupported field")

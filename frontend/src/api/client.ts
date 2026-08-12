@@ -19,6 +19,10 @@ import type {
   TrainingServer,
   TrainingServerResources,
   TrainingMetricSample,
+  TrainingNode,
+  TrainingNodeDeploymentResult,
+  TrainingNodeHostKey,
+  TrainingNodeResourceSnapshot,
   TrainingParameterDefinition,
   TrainingLaunchTemplate,
 } from "./types";
@@ -219,6 +223,46 @@ export async function listTrainingServers(): Promise<TrainingServer[]> {
 
 export async function getTrainingServerResources(serverRef: string): Promise<TrainingServerResources> {
   return requestJson<TrainingServerResources>(`${trainingPath}/servers/${encodeURIComponent(serverRef)}/resources`);
+}
+
+export async function listTrainingNodes(): Promise<TrainingNode[]> {
+  const data = await requestJson<{ nodes: TrainingNode[] }>(`${trainingPath}/nodes`);
+  return data.nodes;
+}
+
+export async function createTrainingNode(payload: { name: string; description?: string; address: string; ssh_port: number; ssh_username: string }): Promise<TrainingNode> {
+  const data = await requestJson<{ node: TrainingNode }>(`${trainingPath}/nodes`, { method: "POST", body: JSON.stringify(payload) });
+  return data.node;
+}
+
+export async function createTrainingNodeEnrollmentToken(nodeRef: string, expectedRevision: number): Promise<{ enrollment_token: string; expires_at: string; node: TrainingNode }> {
+  return requestJson<{ enrollment_token: string; expires_at: string; node: TrainingNode }>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/enrollment-tokens`, {
+    method: "POST",
+    body: JSON.stringify({ expected_revision: expectedRevision, expires_in_seconds: 600 }),
+  });
+}
+
+export async function discoverTrainingNodeHostKey(nodeRef: string): Promise<TrainingNodeHostKey> {
+  const data = await requestJson<{ host_key: TrainingNodeHostKey }>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/host-key`, { method: "POST" });
+  return data.host_key;
+}
+
+export async function deployTrainingNodeWorker(nodeRef: string, payload: {
+  expected_revision: number;
+  confirmed_host_key: TrainingNodeHostKey;
+  host_key_confirmed: true;
+  ssh_password: string;
+  sudo_password_mode: "same_as_ssh" | "separate" | "not_required";
+  sudo_password?: string;
+}): Promise<TrainingNodeDeploymentResult> {
+  return requestJson<TrainingNodeDeploymentResult>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/deploy-worker`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getTrainingNodeResources(nodeRef: string): Promise<TrainingNodeResourceSnapshot> {
+  return requestJson<TrainingNodeResourceSnapshot>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/resources`);
 }
 
 export async function listTrainingModels(): Promise<TrainingModel[]> {

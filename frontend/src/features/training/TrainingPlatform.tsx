@@ -24,8 +24,10 @@ import {
   getTrainingRun,
   getTrainingRunLogs,
   getTrainingRunMetrics,
+  getTrainingNodeResources,
   getTrainingServerResources,
   listTrainingModels,
+  listTrainingNodes,
   listTrainingRuns,
   listTrainingServers,
   openTrainingEvents,
@@ -33,7 +35,7 @@ import {
   stopTrainingRun,
   updateTrainingModel,
 } from "../../api/client";
-import type { TrainingCapabilities, TrainingGpuResource, TrainingMetricSample, TrainingModel, TrainingParameterDefinition, TrainingRun, TrainingRunLog, TrainingRunPreview, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingGpuResource, TrainingMetricSample, TrainingModel, TrainingNode, TrainingNodeResourceSnapshot, TrainingParameterDefinition, TrainingRun, TrainingRunLog, TrainingRunPreview, TrainingServer, TrainingServerResources } from "../../api/types";
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
 import { ProgressBar } from "../../components/console/ProgressBar";
@@ -47,11 +49,12 @@ import { parameterDependencySummary } from "./ParameterDependencyDialog";
 import { navilaTrajectoryLaunchTemplate, navilaTrajectoryParameters } from "./navilaTemplate";
 import { trainingParameterGroupFor, usedTrainingParameterGroups } from "./parameterGroups";
 import { enabledTrainingParameters } from "./parameterAvailability";
+import { TrainingNodesPanel } from "./TrainingNodesPanel";
 
-type TrainingTab = "runs" | "new" | "models" | "resources";
+type TrainingTab = "runs" | "new" | "models" | "nodes" | "resources";
 const tabs = [
   { id: "runs", label: "训练任务" }, { id: "new", label: "新建训练" },
-  { id: "models", label: "模型注册" }, { id: "resources", label: "服务器资源" },
+  { id: "models", label: "模型注册" }, { id: "nodes", label: "训练节点" }, { id: "resources", label: "服务器资源" },
 ] satisfies Array<TabItem<TrainingTab>>;
 
 const defaultParameters: TrainingParameterDefinition[] = navilaTrajectoryParameters;
@@ -214,11 +217,14 @@ function ParameterAccordion({ title, hint, definitions, values, onChange, enable
 }
 
 function GroupedParameterFields({ definitions, values, onChange, enabledParameterKeys, disabled = false }: { definitions: TrainingParameterDefinition[]; values: Record<string, string | number | boolean>; onChange: (key: string, value: string | number | boolean) => void; enabledParameterKeys: Set<string>; disabled?: boolean }) {
-  const groups = usedTrainingParameterGroups(definitions);
+  const datasetDefinitions = definitions.filter((parameter) => parameter.semantic_role === "dataset");
+  const hyperparameterDefinitions = definitions.filter((parameter) => parameter.semantic_role !== "dataset");
+  const groups = usedTrainingParameterGroups(hyperparameterDefinitions);
   const commonGroup = groups.find((group) => group.key === "common");
-  const common = commonGroup ? definitions.filter((parameter) => trainingParameterGroupFor(parameter).key === commonGroup.key) : [];
-  const foldedGroups = groups.filter((group) => group.key !== "common").map((group) => ({ ...group, definitions: definitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key) }));
+  const common = commonGroup ? hyperparameterDefinitions.filter((parameter) => trainingParameterGroupFor(parameter).key === commonGroup.key) : [];
+  const foldedGroups = groups.filter((group) => group.key !== "common").map((group) => ({ ...group, definitions: hyperparameterDefinitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key) }));
   return <div className="space-y-4">
+    {datasetDefinitions.length ? <section aria-label="训练数据集" className="rounded-md border border-sky-200 bg-sky-50/60 p-3"><div className="mb-3"><h3 className="text-sm font-medium text-console-text">训练数据集</h3><p className="text-xs text-console-muted">该输入由模型注册时标记，当前填写数据集标识；后续将接入已发布数据版本选择器。</p></div><ParameterFields definitions={datasetDefinitions} values={values} onChange={onChange} enabledParameterKeys={enabledParameterKeys} disabled={disabled} /></section> : null}
     {common.length ? <section aria-label="常用参数"><div className="mb-3"><h3 className="text-sm font-medium text-console-text">常用参数 <span className="font-normal text-console-muted">({common.length})</span></h3><p className="text-xs text-console-muted">高频训练参数保持常驻；依赖条件未满足时会灰显且不可设置。</p></div><ParameterFields definitions={common} values={values} onChange={onChange} enabledParameterKeys={enabledParameterKeys} disabled={disabled} /></section> : null}
     <div className="space-y-2">
       {foldedGroups.map((group) => <ParameterAccordion key={group.key} title={group.label} hint={group.hint} definitions={group.definitions} values={values} onChange={onChange} enabledParameterKeys={enabledParameterKeys} disabled={disabled} />)}
@@ -414,20 +420,26 @@ function ModelsPanel({ models, canManage, onSaved }: { models: TrainingModel[]; 
   const [domain, setDomain] = useState("vla"); const [serverRef, setServerRef] = useState("fake-local");
   const [workingDirectory, setWorkingDirectory] = useState(emptyLaunchTemplate.working_directory); const [executable, setExecutable] = useState(emptyLaunchTemplate.executable);
   const [entrypoint, setEntrypoint] = useState(emptyLaunchTemplate.entrypoint); const [fixedArgv, setFixedArgv] = useState(""); const [outputRoot, setOutputRoot] = useState(emptyLaunchTemplate.output_root); const [outputFlag, setOutputFlag] = useState(emptyLaunchTemplate.output_flag);
+  const [runtimeKind, setRuntimeKind] = useState<"system" | "conda">(emptyLaunchTemplate.runtime_environment.kind);
+  const [condaEnvironment, setCondaEnvironment] = useState("");
+  const [monitoringFormat, setMonitoringFormat] = useState<"plain" | "transformers" | "jsonl">(emptyLaunchTemplate.monitoring.format);
   const [parameterDefinitions, setParameterDefinitions] = useState<TrainingParameterDefinition[]>([]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const textInput = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text";
   const resetCreateMode = () => {
     setEditingModelRef(null); setName(""); setDescription("");
     setDomain(emptyLaunchTemplate.domain); setServerRef(emptyLaunchTemplate.server_ref); setWorkingDirectory(emptyLaunchTemplate.working_directory); setExecutable(emptyLaunchTemplate.executable);
-    setEntrypoint(emptyLaunchTemplate.entrypoint); setFixedArgv(""); setOutputRoot(emptyLaunchTemplate.output_root); setOutputFlag(emptyLaunchTemplate.output_flag); setParameterDefinitions([]); setError(null);
+    setEntrypoint(emptyLaunchTemplate.entrypoint); setFixedArgv(""); setOutputRoot(emptyLaunchTemplate.output_root); setOutputFlag(emptyLaunchTemplate.output_flag);
+    setRuntimeKind(emptyLaunchTemplate.runtime_environment.kind); setCondaEnvironment(""); setMonitoringFormat(emptyLaunchTemplate.monitoring.format); setParameterDefinitions([]); setError(null);
   };
   const edit = (model: TrainingModel) => {
     const template = model.revision?.launch_template;
     if (!template || !model.revision) { setError("该模型缺少可编辑的 launch template，请重新加载管理员投影。"); return; }
     setEditingModelRef(model.model_ref); setName(model.name); setDescription(model.description ?? "");
     setDomain(template.domain); setServerRef(template.server_ref); setWorkingDirectory(template.working_directory); setExecutable(template.executable);
-    setEntrypoint(template.entrypoint); setFixedArgv(template.fixed_argv.join("\n")); setOutputRoot(template.output_root); setOutputFlag(template.output_flag ?? "--output_dir"); setParameterDefinitions(model.revision.parameter_definitions.map((parameter) => ({ ...structuredClone(parameter), editable: true }))); setError(null);
+    setEntrypoint(template.entrypoint); setFixedArgv(template.fixed_argv.join("\n")); setOutputRoot(template.output_root); setOutputFlag(template.output_flag ?? "--output_dir");
+    setRuntimeKind(template.runtime_environment?.kind ?? "system"); setCondaEnvironment(template.runtime_environment?.conda_environment ?? ""); setMonitoringFormat(template.monitoring?.format ?? "plain");
+    setParameterDefinitions(model.revision.parameter_definitions.map((parameter) => ({ ...structuredClone(parameter), editable: true }))); setError(null);
   };
   const save = async () => {
     let normalizedDefinitions: TrainingParameterDefinition[];
@@ -440,12 +452,16 @@ function ModelsPanel({ models, canManage, onSaved }: { models: TrainingModel[]; 
     const parameterFlags = new Set(normalizedDefinitions.map((parameter) => parameter.cli_flag || `--${parameter.key}`));
     const duplicateFixedFlag = fixedTokenFlags.find((token) => parameterFlags.has(token));
     if (duplicateFixedFlag) { setError(`额外固定 argv 与训练参数重复声明了 ${duplicateFixedFlag}。`); return; }
+    const normalizedCondaEnvironment = condaEnvironment.trim();
+    if (runtimeKind === "conda" && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(normalizedCondaEnvironment)) { setError("Conda 环境名只能包含字母、数字、点、下划线和短横线，且不能为空。"); return; }
     setBusy(true); setError(null);
     try {
       const launchTemplate = {
         domain, server_ref: serverRef, working_directory: workingDirectory, executable, entrypoint,
         // One argv token per line makes this a structured argv list, never a shell command.
         fixed_argv: fixedTokens, output_root: outputRoot, output_flag: outputFlag,
+        runtime_environment: runtimeKind === "conda" ? { kind: "conda" as const, conda_environment: normalizedCondaEnvironment } : { kind: "system" as const },
+        monitoring: { source: "stdout" as const, format: monitoringFormat },
       };
       const editingModel = models.find((model) => model.model_ref === editingModelRef);
       const saved = editingModel
@@ -459,7 +475,9 @@ function ModelsPanel({ models, canManage, onSaved }: { models: TrainingModel[]; 
     setName("NaVILA 轨迹训练"); setDescription("NaVILA 轨迹训练模板；所有路径均为待配置占位值，仅用于模拟预览。");
     setDomain(navilaTrajectoryLaunchTemplate.domain); setServerRef(navilaTrajectoryLaunchTemplate.server_ref); setWorkingDirectory(navilaTrajectoryLaunchTemplate.working_directory);
     setExecutable(navilaTrajectoryLaunchTemplate.executable); setEntrypoint(navilaTrajectoryLaunchTemplate.entrypoint); setFixedArgv("");
-    setOutputRoot(navilaTrajectoryLaunchTemplate.output_root); setOutputFlag(navilaTrajectoryLaunchTemplate.output_flag); setParameterDefinitions(structuredClone(navilaTrajectoryParameters)); setError(null);
+    setOutputRoot(navilaTrajectoryLaunchTemplate.output_root); setOutputFlag(navilaTrajectoryLaunchTemplate.output_flag);
+    setRuntimeKind(navilaTrajectoryLaunchTemplate.runtime_environment.kind); setCondaEnvironment(navilaTrajectoryLaunchTemplate.runtime_environment.conda_environment ?? ""); setMonitoringFormat(navilaTrajectoryLaunchTemplate.monitoring.format);
+    setParameterDefinitions(structuredClone(navilaTrajectoryParameters)); setError(null);
   };
   const defaultParameterValues = Object.fromEntries(parameterDefinitions.map((parameter) => [parameter.key, parameter.default]));
   const defaultEnabledParameters = enabledTrainingParameters(parameterDefinitions, defaultParameterValues);
@@ -479,7 +497,7 @@ function ModelsPanel({ models, canManage, onSaved }: { models: TrainingModel[]; 
   return <div className="space-y-5"><header className="border-b border-console-line pb-5"><h2 className="text-xl font-semibold text-console-text">模型注册</h2><p className="mt-1 text-sm text-console-muted">维护可复用的训练入口、参数规范与不可变版本，供创建训练任务时选择。</p></header><div className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,.65fr)]"><ConsoleCard className="shadow-none"><div className="mb-4 flex items-start justify-between gap-3"><div className="flex items-center gap-2"><Plus className="h-5 w-5 text-console-cyan" /><div><h2 className="font-semibold text-console-text">{editingModelRef ? "编辑草稿模型" : "登记草稿模型"}</h2><p className="text-sm text-console-muted">{editingModelRef ? "保存时创建不可变的新 revision，不覆盖历史版本。" : "仅创建 draft；launch template 只用于生成模拟预览，绝不从浏览器执行。"}</p></div></div>{editingModelRef ? <ConsoleButton variant="ghost" onClick={resetCreateMode}>创建新模型</ConsoleButton> : null}</div>
     <div className="mb-4 rounded-md border border-sky-200 bg-sky-50 p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-medium text-sky-900">不知道从哪里开始？</p><p className="text-xs text-sky-800">载入同事命令对应的完整参数结构，再按部署环境修改占位路径。</p></div><ConsoleButton variant="ghost" disabled={!canManage} onClick={loadNavilaPreset}>一键载入 NaVILA 轨迹训练模板</ConsoleButton></div></div>
     <label className="block text-sm text-console-muted">名称<input className={textInput} value={name} disabled={!canManage} onChange={(event) => setName(event.target.value)} /></label><label className="mt-3 block text-sm text-console-muted">说明<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 text-console-text" value={description} disabled={!canManage} onChange={(event) => setDescription(event.target.value)} /></label>
-    <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-sm text-console-muted">领域 · Domain<input className={textInput} value={domain} disabled={!canManage} onChange={(e) => setDomain(e.target.value)} /></label><label className="text-sm text-console-muted">服务器标识 · Server ref<input className={textInput} value={serverRef} disabled={!canManage} onChange={(e) => setServerRef(e.target.value)} /></label><label className="text-sm text-console-muted">工作目录 · Working directory<input className={textInput} value={workingDirectory} disabled={!canManage} onChange={(e) => setWorkingDirectory(e.target.value)} /></label><label className="text-sm text-console-muted">启动程序 · Executable<input className={textInput} value={executable} disabled={!canManage} onChange={(e) => setExecutable(e.target.value)} /></label><label className="text-sm text-console-muted">训练入口 · Entrypoint<input className={textInput} value={entrypoint} disabled={!canManage} onChange={(e) => setEntrypoint(e.target.value)} /></label><label className="text-sm text-console-muted">输出根目录 · Output root<input className={textInput} value={outputRoot} disabled={!canManage} onChange={(e) => setOutputRoot(e.target.value)} /></label><label className="text-sm text-console-muted">输出参数标志 · Output flag<input className={textInput} value={outputFlag} disabled={!canManage} onChange={(e) => setOutputFlag(e.target.value)} /></label></div>
+    <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-sm text-console-muted">领域 · Domain<input className={textInput} value={domain} disabled={!canManage} onChange={(e) => setDomain(e.target.value)} /></label><label className="text-sm text-console-muted">服务器标识 · Server ref<input className={textInput} value={serverRef} disabled={!canManage} onChange={(e) => setServerRef(e.target.value)} /></label><label className="text-sm text-console-muted">工作目录 · Working directory<input className={textInput} value={workingDirectory} disabled={!canManage} onChange={(e) => setWorkingDirectory(e.target.value)} /></label><label className="text-sm text-console-muted">启动程序 · Executable<input className={textInput} value={executable} disabled={!canManage} onChange={(e) => setExecutable(e.target.value)} /></label><label className="text-sm text-console-muted">训练入口 · Entrypoint<input className={textInput} value={entrypoint} disabled={!canManage} onChange={(e) => setEntrypoint(e.target.value)} /></label><label className="text-sm text-console-muted">输出根目录 · Output root<input className={textInput} value={outputRoot} disabled={!canManage} onChange={(e) => setOutputRoot(e.target.value)} /></label><label className="text-sm text-console-muted">输出参数标志 · Output flag<input className={textInput} value={outputFlag} disabled={!canManage} onChange={(e) => setOutputFlag(e.target.value)} /></label><label className="text-sm text-console-muted">运行环境 · Runtime environment<select className={textInput} value={runtimeKind} disabled={!canManage} onChange={(e) => setRuntimeKind(e.target.value as "system" | "conda")}><option value="system">Worker 系统环境</option><option value="conda">Conda 环境</option></select></label>{runtimeKind === "conda" ? <label className="text-sm text-console-muted">Conda 环境名<input className={textInput} value={condaEnvironment} disabled={!canManage} maxLength={128} placeholder="例如 navila" onChange={(e) => setCondaEnvironment(e.target.value)} /></label> : null}<label className="text-sm text-console-muted">指标日志格式 · Metrics format<select className={textInput} value={monitoringFormat} disabled={!canManage} onChange={(e) => setMonitoringFormat(e.target.value as "plain" | "transformers" | "jsonl")}><option value="plain">普通文本（仅日志）</option><option value="transformers">Transformers Trainer 日志</option><option value="jsonl">JSON Lines 指标</option></select></label></div>
     <label className="mt-3 block text-sm text-console-muted">额外固定 argv（每行一个 token）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 font-mono text-xs text-console-text" value={fixedArgv} disabled={!canManage} onChange={(e) => setFixedArgv(e.target.value)} /></label><div className="mt-5"><ParameterDefinitionEditor definitions={parameterDefinitions} disabled={!canManage} onChange={setParameterDefinitions} /></div><p className="mt-3 text-xs text-console-muted">GPU、nnodes、nproc_per_node、master 地址/端口、node rank 和输出目录由平台管理，不注册为普通参数。</p><div className="mt-4 rounded-md border border-console-line bg-slate-950 p-3"><p className="mb-2 text-xs font-semibold text-slate-300">实时结构化命令摘要（默认值）</p><p className="font-mono text-xs leading-6 text-slate-100 break-all">{commandTokens.map((token) => /\s/.test(token) ? JSON.stringify(token) : token).join(" ")}</p></div>{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<ConsoleButton className="mt-4" variant="primary" disabled={!canManage || busy || !name.trim() || !serverRef.trim() || !entrypoint.trim()} onClick={() => void save()}><Plus className="h-4 w-4" />{editingModelRef ? "创建新 revision" : "创建草稿"}</ConsoleButton></ConsoleCard><ConsoleCard className="h-fit shadow-none"><div className="mb-4 flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h2 className="font-semibold text-console-text">已登记模型</h2></div><div className="space-y-2">{models.map((model) => <div key={model.model_ref} className="rounded-md border border-console-line bg-console-panel2 p-3"><div className="flex items-center justify-between gap-2"><p className="font-medium text-console-text">{model.name}</p><StatusTag tone={modelStatusMeta[model.status].tone}>{modelStatusMeta[model.status].label}</StatusTag></div><p className="mt-1 text-sm text-console-muted">revision {model.latest_revision} · {model.description ?? "无说明"}</p><p className="mt-2 line-clamp-2 text-xs text-console-muted">参数：{model.revision?.parameter_definitions.map((p) => p.key).join("、") || "加载详情后显示"}</p>{canManage && model.status === "draft" ? <ConsoleButton className="mt-3" variant="ghost" onClick={() => edit(model)}>编辑并创建新 revision</ConsoleButton> : null}</div>)}{!models.length ? <p className="py-8 text-center text-sm text-console-muted">尚未登记模型。</p> : null}</div></ConsoleCard></div></div>;
 }
 
@@ -566,10 +584,10 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
 export function TrainingPlatform() {
   const location = useLocation(); const navigate = useNavigate();
   const deepRunRef = useMemo(() => /^\/model\/runs\/([^/]+)\/?$/.exec(location.pathname)?.[1], [location.pathname]);
-  const [tab, setTab] = useState<TrainingTab>("runs"); const [capabilities, setCapabilities] = useState<TrainingCapabilities | null>(null); const [models, setModels] = useState<TrainingModel[]>([]); const [servers, setServers] = useState<TrainingServer[]>([]); const [resourcesByServer, setResourcesByServer] = useState<Record<string, TrainingServerResources>>({}); const [resourceErrors, setResourceErrors] = useState<Record<string, string>>({}); const [runs, setRuns] = useState<TrainingRun[]>([]); const [selectedRun, setSelectedRun] = useState<TrainingRun | null>(null); const [error, setError] = useState<string | null>(null); const [eventStreamDisconnected, setEventStreamDisconnected] = useState(false);
+  const [tab, setTab] = useState<TrainingTab>("runs"); const [capabilities, setCapabilities] = useState<TrainingCapabilities | null>(null); const [models, setModels] = useState<TrainingModel[]>([]); const [nodes, setNodes] = useState<TrainingNode[]>([]); const [nodeResources, setNodeResources] = useState<Record<string, TrainingNodeResourceSnapshot>>({}); const [servers, setServers] = useState<TrainingServer[]>([]); const [resourcesByServer, setResourcesByServer] = useState<Record<string, TrainingServerResources>>({}); const [resourceErrors, setResourceErrors] = useState<Record<string, string>>({}); const [runs, setRuns] = useState<TrainingRun[]>([]); const [selectedRun, setSelectedRun] = useState<TrainingRun | null>(null); const [error, setError] = useState<string | null>(null); const [eventStreamDisconnected, setEventStreamDisconnected] = useState(false);
   const load = useCallback(async () => {
     try {
-      const [nextCapabilities, nextModels, nextServers, nextRuns] = await Promise.all([getTrainingCapabilities(), listTrainingModels(), listTrainingServers(), listTrainingRuns()]);
+      const [nextCapabilities, nextModels, nextNodes, nextServers, nextRuns] = await Promise.all([getTrainingCapabilities(), listTrainingModels(), listTrainingNodes(), listTrainingServers(), listTrainingRuns()]);
       // 各服务器资源独立请求，单台服务器不可达时仍保留其他服务器的监控数据。
       const resourceResults = await Promise.allSettled(nextServers.map(async (server) => ({ serverRef: server.server_ref, resources: await getTrainingServerResources(server.server_ref) })));
       const nextResources: Record<string, TrainingServerResources> = {};
@@ -579,7 +597,13 @@ export function TrainingPlatform() {
         if (result.status === "fulfilled") nextResources[serverRef] = result.value.resources;
         else nextResourceErrors[serverRef] = errorText(result.reason);
       });
-      setCapabilities(nextCapabilities); setModels(nextModels); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns);
+      const nodeResourceResults = await Promise.allSettled(nextNodes.map(async (node) => ({ nodeRef: node.node_ref, resources: await getTrainingNodeResources(node.node_ref) })));
+      const nextNodeResources: Record<string, TrainingNodeResourceSnapshot> = {};
+      nodeResourceResults.forEach((result) => { if (result.status === "fulfilled") nextNodeResources[result.value.nodeRef] = result.value.resources; });
+      setCapabilities(nextCapabilities); setModels(nextModels); setNodes((current) => nextNodes.map((node) => {
+        const local = current.find((item) => item.node_ref === node.node_ref);
+        return local && local.state_revision > node.state_revision ? local : node;
+      })); setNodeResources(nextNodeResources); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns);
       setSelectedRun((current) => current ? nextRuns.find((item) => item.run_ref === current.run_ref) ?? current : null);
       setError(null);
     } catch (caught) { setError(errorText(caught)); }
@@ -633,6 +657,9 @@ export function TrainingPlatform() {
       </div>
       <div id="training-platform-panel-models" role="tabpanel" aria-labelledby="training-platform-tab-models" hidden={tab !== "models"}>
         <ModelsPanel models={models} canManage={can(capabilities, "training:manage_models")} onSaved={(model) => setModels((current) => [model, ...current.filter((item) => item.model_ref !== model.model_ref)])} />
+      </div>
+      <div id="training-platform-panel-nodes" role="tabpanel" aria-labelledby="training-platform-tab-nodes" hidden={tab !== "nodes"}>
+        <TrainingNodesPanel nodes={nodes} resourcesByNode={nodeResources} canManage={can(capabilities, "training:manage_nodes")} deploymentEnabled={capabilities?.node_deployment_enabled ?? false} deploymentDisabledReason={capabilities?.node_deployment_disabled_reason} onChanged={(node) => setNodes((current) => [node, ...current.filter((item) => item.node_ref !== node.node_ref)])} />
       </div>
       <div id="training-platform-panel-resources" role="tabpanel" aria-labelledby="training-platform-tab-resources" hidden={tab !== "resources"}>
         <ResourcesPanel servers={servers} resourcesByServer={resourcesByServer} resourceErrors={resourceErrors} onRefresh={() => void load()} />

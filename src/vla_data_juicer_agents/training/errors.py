@@ -39,3 +39,8 @@ class TrainingNotFoundError(TrainingError):
 class TrainingConflictError(TrainingError):
     def __init__(self, code: str, message: str, *, current: Any | None = None) -> None:
         super().__init__(code, message, status_code=409, current=current)
+
+
+class TrainingUnavailableError(TrainingError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(code, message, status_code=503)

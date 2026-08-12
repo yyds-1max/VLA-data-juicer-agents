@@ -95,6 +95,21 @@ def test_create_session_returns_title(tmp_path: Path):
     assert body["session"]["contract_version"] == 1
 
 
+def test_https_center_configuration_enables_worker_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "VLA_TRAINING_CENTER_BASE_URL", "https://center.example.internal"
+    )
+    client = make_client(tmp_path)
+
+    capabilities = client.get("/api/training/capabilities")
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["node_deployment_enabled"] is True
+    assert capabilities.json()["node_deployment_disabled_reason"] is None
+
+
 def test_submit_turn_returns_turn_id(tmp_path: Path):
     client = make_client(tmp_path)
     session_id = _create_session(client)

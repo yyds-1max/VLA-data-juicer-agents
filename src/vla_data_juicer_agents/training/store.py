@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -10,9 +11,13 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from .errors import TrainingConflictError, TrainingNotFoundError
+from .errors import (
+    TrainingConflictError,
+    TrainingForbiddenError,
+    TrainingNotFoundError,
+)
 from .migrations import apply_training_migrations
-from .models import RunStatus, TERMINAL_RUN_STATUSES
+from .models import RunStatus, TERMINAL_RUN_STATUSES, TrainingNodeStatus
 
 
 def now_iso() -> str:
@@ -66,6 +71,560 @@ class TrainingStore:
             except BaseException:
                 connection.rollback()
                 raise
+
+    @staticmethod
+    def _token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _effective_node_status(
+        row: sqlite3.Row, *, offline_after_seconds: float
+    ) -> str:
+        status = str(row["status"])
+        if status not in {
+            TrainingNodeStatus.ONLINE.value,
+            TrainingNodeStatus.DEGRADED.value,
+        }:
+            return status
+        heartbeat_at = row["last_heartbeat_at"]
+        if heartbeat_at is None:
+            return TrainingNodeStatus.OFFLINE.value
+        try:
+            age = datetime.now(UTC) - datetime.fromisoformat(str(heartbeat_at))
+        except ValueError:
+            return TrainingNodeStatus.OFFLINE.value
+        if age.total_seconds() > offline_after_seconds:
+            return TrainingNodeStatus.OFFLINE.value
+        return status
+
+    @classmethod
+    def _safe_node(
+        cls, row: sqlite3.Row, *, offline_after_seconds: float = 45.0
+    ) -> dict[str, Any]:
+        capabilities = (
+            json.loads(row["capabilities_json"])
+            if row["capabilities_json"] is not None
+            else None
+        )
+        return {
+            "node_ref": row["node_ref"],
+            "name": row["name"],
+            "description": row["description"],
+            "address": row["address"],
+            "ssh_port": row["ssh_port"],
+            "ssh_username": row["ssh_username"],
+            "host_key_algorithm": row["host_key_algorithm"],
+            "host_public_key": row["host_public_key"],
+            "host_key_fingerprint": row["host_key_fingerprint"],
+            "deployment_status": row["deployment_status"],
+            "deployment_message": row["deployment_message"],
+            "deployment_started_at": row["deployment_started_at"],
+            "deployment_finished_at": row["deployment_finished_at"],
+            "installed_worker_version": row["installed_worker_version"],
+            "status": cls._effective_node_status(
+                row, offline_after_seconds=offline_after_seconds
+            ),
+            "state_revision": row["state_revision"],
+            "enrolled_at": row["enrolled_at"],
+            "last_heartbeat_at": row["last_heartbeat_at"],
+            "last_seen_at": row["last_heartbeat_at"],
+            "worker_instance_id": row["worker_instance_id"],
+            "worker_version": row["worker_version"],
+            "protocol_version": row["protocol_version"],
+            "health_message": row["health_message"],
+            "capabilities": capabilities,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_node(self, data: dict[str, Any], actor: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        node_ref = new_ref("node")
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO training_nodes(
+                node_ref,name,description,address,ssh_port,ssh_username,status,
+                state_revision,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,'pending_enrollment',1,?,?)""",
+                (
+                    node_ref,
+                    data["name"],
+                    data.get("description") or "",
+                    data["address"],
+                    data.get("ssh_port", 22),
+                    data["ssh_username"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._audit(db, actor, "node.created", node_ref, {}, timestamp)
+        return self.get_node(node_ref)
+
+    def list_nodes(self, *, offline_after_seconds: float = 45.0) -> list[dict[str, Any]]:
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM training_nodes ORDER BY id DESC").fetchall()
+        return [
+            self._safe_node(row, offline_after_seconds=offline_after_seconds)
+            for row in rows
+        ]
+
+    def get_node(
+        self, node_ref: str, *, offline_after_seconds: float = 45.0
+    ) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError(
+                "training_node_not_found", "Training node was not found."
+            )
+        return self._safe_node(row, offline_after_seconds=offline_after_seconds)
+
+    def update_node(
+        self,
+        node_ref: str,
+        expected_revision: int,
+        data: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if int(row["state_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "training_node_revision_conflict",
+                    "The training node changed.",
+                    current=self._safe_node(row),
+                )
+            merged = {
+                "name": row["name"],
+                "description": row["description"],
+                "address": row["address"],
+                "ssh_port": row["ssh_port"],
+                "ssh_username": row["ssh_username"],
+                "status": row["status"],
+            }
+            merged.update(
+                {key: value for key, value in data.items() if value is not None}
+            )
+            desired_state = merged.pop("desired_state", None)
+            if desired_state is not None:
+                merged["status"] = desired_state
+            worker_token_sha256 = row["worker_token_sha256"]
+            if merged["status"] == TrainingNodeStatus.DISABLED.value:
+                worker_token_sha256 = None
+                db.execute(
+                    """UPDATE training_node_enrollment_tokens
+                    SET consumed_at=? WHERE node_id=? AND consumed_at IS NULL""",
+                    (timestamp, row["id"]),
+                )
+            db.execute(
+                """UPDATE training_nodes SET
+                name=?,description=?,address=?,ssh_port=?,ssh_username=?,status=?,
+                worker_token_sha256=?,state_revision=state_revision+1,updated_at=?
+                WHERE id=?""",
+                (
+                    merged["name"],
+                    merged["description"],
+                    merged["address"],
+                    merged["ssh_port"],
+                    merged["ssh_username"],
+                    merged["status"],
+                    worker_token_sha256,
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            self._audit(
+                db,
+                actor,
+                "node.updated",
+                node_ref,
+                {"status": merged["status"]},
+                timestamp,
+            )
+        return self.get_node(node_ref)
+
+    def delete_node(
+        self, node_ref: str, expected_revision: int, actor: str
+    ) -> None:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if int(row["state_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "training_node_revision_conflict",
+                    "The training node changed.",
+                    current=self._safe_node(row),
+                )
+            snapshot_exists = db.execute(
+                """SELECT 1 FROM training_node_resource_snapshots
+                WHERE node_id=? LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            if row["enrolled_at"] is not None or snapshot_exists is not None:
+                raise TrainingConflictError(
+                    "training_node_has_history",
+                    "An enrolled node cannot be deleted; disable it instead.",
+                    current=self._safe_node(row),
+                )
+            self._audit(db, actor, "node.deleted", node_ref, {}, timestamp)
+            db.execute("DELETE FROM training_nodes WHERE id=?", (row["id"],))
+
+    def create_enrollment_token(
+        self,
+        node_ref: str,
+        expected_revision: int,
+        expires_in_seconds: int,
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        expires_at = (
+            datetime.now(UTC) + timedelta(seconds=expires_in_seconds)
+        ).isoformat(timespec="milliseconds")
+        token = f"enroll_{secrets.token_urlsafe(32)}"
+        token_ref = new_ref("enrollment")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if int(row["state_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "training_node_revision_conflict",
+                    "The training node changed.",
+                    current=self._safe_node(row),
+                )
+            if row["status"] == TrainingNodeStatus.DISABLED.value:
+                raise TrainingConflictError(
+                    "training_node_disabled",
+                    "A disabled training node cannot be enrolled.",
+                    current=self._safe_node(row),
+                )
+            db.execute(
+                """UPDATE training_node_enrollment_tokens SET consumed_at=?
+                WHERE node_id=? AND consumed_at IS NULL""",
+                (timestamp, row["id"]),
+            )
+            db.execute(
+                """INSERT INTO training_node_enrollment_tokens(
+                token_ref,node_id,token_sha256,expires_at,created_by,created_at)
+                VALUES(?,?,?,?,?,?)""",
+                (
+                    token_ref,
+                    row["id"],
+                    self._token_digest(token),
+                    expires_at,
+                    actor,
+                    timestamp,
+                ),
+            )
+            db.execute(
+                """UPDATE training_nodes SET state_revision=state_revision+1,
+                updated_at=? WHERE id=?""",
+                (timestamp, row["id"]),
+            )
+            self._audit(
+                db,
+                actor,
+                "node.enrollment_token_created",
+                node_ref,
+                {"expires_at": expires_at},
+                timestamp,
+            )
+        return {
+            "enrollment_token": token,
+            "expires_at": expires_at,
+            "node": self.get_node(node_ref),
+        }
+
+    def begin_node_deployment(
+        self,
+        node_ref: str,
+        expected_revision: int,
+        *,
+        host_key_algorithm: str,
+        host_public_key: str,
+        host_key_fingerprint: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if int(row["state_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "training_node_revision_conflict",
+                    "The training node changed.",
+                    current=self._safe_node(row),
+                )
+            if row["status"] == TrainingNodeStatus.DISABLED.value:
+                raise TrainingConflictError(
+                    "training_node_disabled",
+                    "A disabled training node cannot deploy a Worker.",
+                    current=self._safe_node(row),
+                )
+            if row["deployment_status"] == "deploying":
+                raise TrainingConflictError(
+                    "training_node_deployment_in_progress",
+                    "A Worker deployment is already in progress.",
+                    current=self._safe_node(row),
+                )
+            db.execute(
+                """UPDATE training_nodes SET
+                host_key_algorithm=?,host_public_key=?,host_key_fingerprint=?,
+                deployment_status='deploying',deployment_message=NULL,
+                deployment_started_at=?,deployment_finished_at=NULL,
+                state_revision=state_revision+1,updated_at=? WHERE id=?""",
+                (
+                    host_key_algorithm,
+                    host_public_key,
+                    host_key_fingerprint,
+                    timestamp,
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            self._audit(
+                db,
+                actor,
+                "node.deployment_started",
+                node_ref,
+                {"host_key_fingerprint": host_key_fingerprint},
+                timestamp,
+            )
+        return self.get_node(node_ref)
+
+    def finish_node_deployment(
+        self,
+        node_ref: str,
+        *,
+        succeeded: bool,
+        message: str,
+        worker_version: str | None,
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        safe_message = message[:1000]
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            db.execute(
+                """UPDATE training_nodes SET deployment_status=?,deployment_message=?,
+                deployment_finished_at=?,installed_worker_version=COALESCE(?,installed_worker_version),
+                state_revision=state_revision+1,updated_at=? WHERE id=?""",
+                (
+                    "succeeded" if succeeded else "failed",
+                    safe_message,
+                    timestamp,
+                    worker_version,
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            self._audit(
+                db,
+                actor,
+                "node.deployment_succeeded" if succeeded else "node.deployment_failed",
+                node_ref,
+                {"message": safe_message, "worker_version": worker_version},
+                timestamp,
+            )
+        return self.get_node(node_ref)
+
+    def invalidate_node_enrollment_tokens(self, node_ref: str) -> None:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT id FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                return
+            db.execute(
+                """UPDATE training_node_enrollment_tokens SET consumed_at=?
+                WHERE node_id=? AND consumed_at IS NULL""",
+                (timestamp, row["id"]),
+            )
+
+    def enroll_node(self, data: dict[str, Any]) -> dict[str, Any]:
+        timestamp = now_iso()
+        worker_token = f"worker_{secrets.token_urlsafe(32)}"
+        digest = self._token_digest(data["enrollment_token"])
+        with self.transaction() as db:
+            token_row = db.execute(
+                """SELECT t.*,n.node_ref,n.status AS node_status
+                FROM training_node_enrollment_tokens t
+                JOIN training_nodes n ON n.id=t.node_id
+                WHERE t.token_sha256=?""",
+                (digest,),
+            ).fetchone()
+            if (
+                token_row is None
+                or token_row["consumed_at"] is not None
+                or str(token_row["expires_at"]) <= timestamp
+            ):
+                raise TrainingForbiddenError(
+                    "invalid_enrollment_token",
+                    "The enrollment token is invalid, expired, or already used.",
+                )
+            if token_row["node_status"] == TrainingNodeStatus.DISABLED.value:
+                raise TrainingForbiddenError(
+                    "training_node_disabled", "The training node is disabled."
+                )
+            db.execute(
+                """UPDATE training_node_enrollment_tokens
+                SET consumed_at=? WHERE id=? AND consumed_at IS NULL""",
+                (timestamp, token_row["id"]),
+            )
+            db.execute(
+                """UPDATE training_nodes SET
+                status='online',state_revision=state_revision+1,
+                enrolled_at=COALESCE(enrolled_at,?),last_heartbeat_at=?,
+                worker_instance_id=?,worker_version=?,protocol_version=?,
+                worker_token_sha256=?,health_message=NULL,capabilities_json=?,
+                updated_at=? WHERE id=?""",
+                (
+                    timestamp,
+                    timestamp,
+                    data["worker_instance_id"],
+                    data["worker_version"],
+                    data["protocol_version"],
+                    self._token_digest(worker_token),
+                    canonical_json(data["capabilities"]),
+                    timestamp,
+                    token_row["node_id"],
+                ),
+            )
+            self._audit(
+                db,
+                f"worker:{data['worker_instance_id']}",
+                "node.enrolled",
+                token_row["node_ref"],
+                {
+                    "worker_version": data["worker_version"],
+                    "protocol_version": data["protocol_version"],
+                },
+                timestamp,
+            )
+        return {
+            "node": self.get_node(token_row["node_ref"]),
+            "worker_token": worker_token,
+        }
+
+    def record_node_heartbeat(
+        self, node_ref: str, worker_token: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        digest = self._token_digest(worker_token)
+        status = {
+            "healthy": TrainingNodeStatus.ONLINE.value,
+            "degraded": TrainingNodeStatus.DEGRADED.value,
+            "repair_required": TrainingNodeStatus.REPAIR_REQUIRED.value,
+        }[data["health"]]
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if (
+                row is None
+                or row["worker_token_sha256"] is None
+                or not secrets.compare_digest(str(row["worker_token_sha256"]), digest)
+                or row["worker_instance_id"] != data["worker_instance_id"]
+            ):
+                raise TrainingForbiddenError(
+                    "worker_authentication_failed",
+                    "The Training Worker credential is invalid.",
+                )
+            if row["status"] == TrainingNodeStatus.DISABLED.value:
+                raise TrainingForbiddenError(
+                    "training_node_disabled", "The training node is disabled."
+                )
+            capabilities_json = row["capabilities_json"]
+            if data.get("capabilities") is not None:
+                capabilities_json = canonical_json(data["capabilities"])
+            db.execute(
+                """UPDATE training_nodes SET
+                status=?,state_revision=state_revision+1,last_heartbeat_at=?,
+                worker_version=?,protocol_version=?,health_message=?,
+                capabilities_json=?,updated_at=? WHERE id=?""",
+                (
+                    status,
+                    timestamp,
+                    data["worker_version"],
+                    data["protocol_version"],
+                    data.get("health_message"),
+                    capabilities_json,
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            db.execute(
+                """INSERT INTO training_node_resource_snapshots(
+                node_id,captured_at,resources_json) VALUES(?,?,?)""",
+                (row["id"], timestamp, canonical_json(data["resources"])),
+            )
+            db.execute(
+                """DELETE FROM training_node_resource_snapshots
+                WHERE node_id=? AND id NOT IN (
+                  SELECT id FROM training_node_resource_snapshots
+                  WHERE node_id=? ORDER BY id DESC LIMIT 1000
+                )""",
+                (row["id"], row["id"]),
+            )
+        return self.get_node(node_ref)
+
+    def get_node_resources(self, node_ref: str) -> dict[str, Any]:
+        node = self.get_node(node_ref)
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT s.captured_at,s.resources_json
+                FROM training_node_resource_snapshots s
+                JOIN training_nodes n ON n.id=s.node_id
+                WHERE n.node_ref=? ORDER BY s.id DESC LIMIT 1""",
+                (node_ref,),
+            ).fetchone()
+        if row is None:
+            return {
+                "node_ref": node_ref,
+                "captured_at": None,
+                "stale": True,
+                "resources": None,
+            }
+        captured_at = datetime.fromisoformat(str(row["captured_at"]))
+        age_seconds = (datetime.now(UTC) - captured_at).total_seconds()
+        return {
+            "node_ref": node_ref,
+            "captured_at": row["captured_at"],
+            "stale": node["status"] not in {"online", "degraded"}
+            or age_seconds > 90,
+            "resources": json.loads(row["resources_json"]),
+        }
 
     def create_model(self, data: dict[str, Any], actor: str) -> dict[str, Any]:
         timestamp = now_iso()

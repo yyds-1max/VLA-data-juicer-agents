@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import hashlib
+import json
+
+from vla_data_juicer_agents.training.ssh_bootstrap import RemoteExecution
+from vla_data_juicer_agents.training.worker_deployment import (
+    PASSWORD_SUDO_PROBE_ARGV,
+    ROOT_IDENTITY_PROBE_ARGV,
+    SudoPasswordMode,
+    TrainingWorkerSystemDeployer,
+    WorkerDeploymentRequest,
+    WorkerRelease,
+)
+from vla_data_juicer_agents.training.worker_deployment_ssh import (
+    OpenSshWorkerDeploymentBackend,
+)
+
+
+ARTIFACT = b"test-only worker zip application"
+SSH_PASSWORD = "ssh-test-password"
+ENROLLMENT_TOKEN = "enroll_" + "x" * 48
+
+
+class _FakeFixedSshSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], bytes, str]] = []
+
+    def run_probe(self, *args, **kwargs):  # pragma: no cover - protocol only
+        raise AssertionError("deployment adapter must not use preflight probes")
+
+    def run_fixed_argv(
+        self,
+        remote_argv: tuple[str, ...],
+        *,
+        stdin_payload: bytes,
+        timeout_seconds: int,
+        operation_name: str,
+    ) -> RemoteExecution:
+        self.calls.append((remote_argv, stdin_payload, operation_name))
+        if remote_argv == ROOT_IDENTITY_PROBE_ARGV:
+            return RemoteExecution(0, b"1000\n")
+        if remote_argv == PASSWORD_SUDO_PROBE_ARGV:
+            return RemoteExecution(0)
+        if operation_name == "deploy:is_enrolled":
+            return RemoteExecution(0, b'{"changed":false,"value":false}\n')
+        if operation_name == "deploy:is_active":
+            return RemoteExecution(0, b'{"changed":false,"value":true}\n')
+        return RemoteExecution(0, b'{"changed":true,"value":null}\n')
+
+
+def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets() -> None:
+    session = _FakeFixedSshSession()
+    backend = OpenSshWorkerDeploymentBackend(
+        session,  # type: ignore[arg-type]
+        _ssh_password=SSH_PASSWORD,
+    )
+    release = WorkerRelease(
+        "0.3.0",
+        hashlib.sha256(ARTIFACT).hexdigest(),
+        ARTIFACT,
+    )
+
+    result = TrainingWorkerSystemDeployer().deploy(
+        backend,
+        WorkerDeploymentRequest(
+            release=release,
+            center_base_url="https://datapilot.example.internal",
+            node_ref="node_adapter01",
+            enrollment_token=ENROLLMENT_TOKEN,
+            sudo_password_mode=SudoPasswordMode.SAME_AS_SSH,
+        ),
+    )
+
+    assert result.service_active is True
+    assert result.privilege.value == "sudo"
+    assert SSH_PASSWORD not in repr(backend)
+    assert ENROLLMENT_TOKEN not in repr(backend)
+    assert session.calls[0] == (ROOT_IDENTITY_PROBE_ARGV, b"", "privilege_probe")
+    assert session.calls[1] == (
+        PASSWORD_SUDO_PROBE_ARGV,
+        (SSH_PASSWORD + "\n").encode(),
+        "privilege_probe",
+    )
+    deployment_calls = session.calls[2:]
+    assert deployment_calls
+    for argv, _stdin, operation_name in deployment_calls:
+        assert argv[:6] == ("/usr/bin/sudo", "-S", "-k", "-p", "", "--")
+        assert argv[6:9] == ("/usr/bin/python3", "-c", argv[8])
+        assert operation_name.startswith("deploy:")
+        serialized_argv = repr(argv)
+        assert SSH_PASSWORD not in serialized_argv
+        assert ENROLLMENT_TOKEN not in serialized_argv
+        assert ARTIFACT.decode() not in serialized_argv
+        arguments = json.loads(argv[-1])
+        assert isinstance(arguments, dict)
+    release_call = next(call for call in deployment_calls if call[2] == "deploy:install_release")
+    assert release_call[1] == (SSH_PASSWORD + "\n").encode() + ARTIFACT
+    enroll_call = next(call for call in deployment_calls if call[2] == "deploy:enroll")
+    assert enroll_call[1] == (SSH_PASSWORD + "\n" + ENROLLMENT_TOKEN).encode()
+    backend.clear_ephemeral_credentials()
+    assert SSH_PASSWORD not in repr(backend)
+
+
+def test_openssh_backend_rejects_non_catalogue_privilege_command() -> None:
+    backend = OpenSshWorkerDeploymentBackend(_FakeFixedSshSession())  # type: ignore[arg-type]
+
+    try:
+        backend.run_fixed_privilege_probe(
+            ("/bin/sh", "-c", "id"),
+            stdin_secret=None,
+            timeout_seconds=10,
+        )
+    except ValueError as exc:
+        assert "non-catalogue" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("non-catalogue command was accepted")

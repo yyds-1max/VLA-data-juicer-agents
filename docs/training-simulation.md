@@ -1,7 +1,8 @@
 # 模型训练模拟链路
 
-模型训练模块的首个里程碑只在本地运行模拟链路。它不会建立 SSH 连接、读取
-NaVILA 目录、启动 shell 或创建真实训练进程。
+模型训练任务的首个里程碑只运行模拟链路，不读取 NaVILA 目录，也不创建真实训练
+进程。训练节点页可以在显式配置中心 HTTPS 地址后，通过一次 SSH 授权自动部署只读
+Worker；该 Worker 仍不能执行训练命令。
 
 ## 本地启用管理操作
 
@@ -41,8 +42,17 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 “模型注册”不是粘贴并执行一段 Shell。管理员在页面中登记 launcher、工作目录、
 训练入口、输出根目录，以及一组类型化的训练脚本参数。参数无需预先填写数量，可
 逐项添加或删除，并为每项设置字段名、CLI flag、类型、默认值、范围、枚举选项、
-是否敏感、argv 表达方式和展示分组。每个参数还可填写不超过 120 个字符的可选
+是否敏感、argv 表达方式、参数用途和展示分组。字符串或枚举参数可标记为唯一的
+“数据集输入”，新建训练会把它从普通超参数中单独展示；当前仍填写模型脚本接受的
+数据集标识，后续再接入数据管理模块的已发布版本选择器。每个参数还可填写不超过 120 个字符的可选
 解释，用于训练配置页的悬停帮助。
+
+模型 revision 还会保存运行环境与指标日志契约。运行环境当前只允许声明 Worker
+系统环境或一个受限格式的 Conda 环境名；这是结构化元数据，不会拼接或执行
+`conda activate`。日志来源当前固定为 stdout，可声明普通文本、Transformers Trainer
+日志或 JSON Lines 指标。真实 Worker Runner 后续只能按这些已审核字段选择固定实现，
+不能把它们转换为任意 Shell。NaVILA 预置声明系统环境和 Transformers 日志格式，
+管理员可根据实际部署创建新 revision 调整。
 
 枚举参数使用结构化选项表，而不是解析自由文本：每项只登记一个选项值，该值同时
 写入 argv 并显示在新建训练页；选项可添加、排序、删除及指定默认项，且必须唯一。
@@ -89,6 +99,63 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 ## 真实训练边界
 
-在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用连接凭据确认
-前，不增加真实 Runner。SSH/NVML、磁盘检查、路径 allowlist、进程身份验证和
-NaVILA metrics callback 均属于后续里程碑。
+本里程碑已经建立训练节点、只读 Worker 和 SSH preflight 的基础契约，但真实 Runner
+仍保持关闭。在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用
+连接凭据确认前，不允许 Worker 接收任务或启动训练。路径 allowlist、训练进程创建与
+停止、artifact 校验以及 NaVILA metrics callback 均属于后续里程碑。
+
+## 训练节点与 Worker v1
+
+管理员可在“训练节点”页登记名称、主机地址、SSH 端口和用户名；这些连接元数据会
+保存，但 SSH 与 sudo 密码仅存在于一次部署请求的内存中，不写入数据库、日志、argv、
+环境变量或远端文件。节点状态为 `pending_enrollment / online / degraded / offline /
+repair_required / disabled`，在线状态由中心根据最近心跳计算，不能由 Worker 自报。
+默认只读身份只能查看安全投影，地址和 SSH 信息仅 `training:manage_nodes` 可见。
+
+部署时中心内部签发 600 秒有效的一次性 enrollment token；新 token 会使此前未使用的
+token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换取的 bearer token
+同样只在中心保存摘要；节点停用时立即吊销。
+
+`datapilot-training-worker` 是独立进程。v1 只采集 CPU、内存、磁盘和 GPU 状态并上报
+心跳，不轮询可执行任务，也不能启动、停止、占用或检查同事的训练命令。GPU fallback
+只使用固定 `nvidia-smi` argv、五秒超时和 `shell=False`。节点本地保存私有 identity、
+权限为 `0600` 的 Worker token，以及用于重启后保守对账的 SQLite ledger；PID 必须与
+进程启动标记和 argv digest 同时匹配，无法确认时标为 unknown，绝不发送信号。
+
+Worker HTTP 客户端只允许固定中心 origin 上的 enroll 和 heartbeat 两类 POST，拒绝
+重定向并限制超时和响应大小。部署模板位于 `deployment/systemd/`，使用独立的
+`datapilot-worker` 系统账号、系统级 systemd、`NoNewPrivileges` 和只读文件系统保护。
+
+## Training Worker 一次性 SSH 部署
+
+中心服务必须配置一个训练节点可访问的 HTTPS origin：
+
+```bash
+export VLA_TRAINING_CENTER_BASE_URL=https://datapilot.example.internal
+```
+
+用户登记节点后点击“部署 Worker”，页面先读取未受信任的 SSH host key 并显示
+`SHA256:...` 指纹。用户必须通过可信渠道核对并明确确认；实际连接随后固定该 public
+key，强制 `StrictHostKeyChecking=yes`，不会把首次扫描结果直接当作可信身份。
+
+用户只需提供本次 SSH 登录密码，并选择 sudo 使用同一密码、独立密码或无需密码。
+密码通过本机短生命周期的受控 askpass 通道交给 OpenSSH，不使用 `sshpass`；部署结束
+即销毁。系统只执行内部固定的幂等安装操作，不接收 Shell 文本或自定义命令：
+
+1. 检查部署账号是 root 或可用 sudo；
+2. 创建无登录权限的 `datapilot-worker` 系统账号；
+3. 创建 `/opt/datapilot-training-worker`、`/var/lib/datapilot-training-worker` 和
+   `/etc/datapilot-training-worker`；
+4. 校验并安装版本化 Worker 制品，写入不含秘密的固定配置和 systemd unit；
+5. 用短时 enrollment token 完成注册，再启用并启动系统服务。
+
+如果部署账号不是 root 且不能使用 sudo，系统在任何特权写操作前终止，接口返回稳定
+错误码 `training_node_deployment_account_insufficient`，页面明确显示“部署账号权限不足”。
+系统不会退回到用 SSH 登录账号长期运行 Worker，也不会让算法用户手工执行补救命令。
+
+系统级 service 不依赖登录会话或 systemd linger。正常升级可由仍在线的 Worker 后续
+接管；Worker 完全损坏时，用户可在页面再次提供一次 SSH 授权执行同一套幂等修复。
+修复只管理 Worker 自身，不扫描、重启、停止或修改已有训练进程。
+
+即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。当前部署和 Worker
+都不会读取或修改模型工程、权重、checkpoint 或训练输出；真实 Runner 仍保持禁用。

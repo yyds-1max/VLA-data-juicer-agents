@@ -53,10 +53,16 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
 )
 from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
+from vla_data_juicer_agents.training.node_deployment import (
+    AutomatedNodeDeploymentManager,
+)
 from vla_data_juicer_agents.training.resources import FakeResourceProvider
 from vla_data_juicer_agents.training.service import TrainingService
 from vla_data_juicer_agents.training.store import TrainingStore
 from vla_data_juicer_agents.training.worker import TrainingWorker
+from vla_data_juicer_agents.training.worker_deployment_ssh import (
+    OpenSshWorkerDeploymentBackend,
+)
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
@@ -77,6 +83,18 @@ from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 logger = logging.getLogger(__name__)
+
+
+def _password_worker_deployment_context(
+    *, endpoint: Any, host_key: Any, ssh_password: str
+):
+    """Open one pinned, short-lived SSH password deployment session."""
+
+    return OpenSshWorkerDeploymentBackend.password_session(
+        endpoint=endpoint,
+        host_key=host_key,
+        password=ssh_password,
+    )
 
 
 def create_app(
@@ -154,10 +172,19 @@ def create_app(
         training_settings = TrainingSettings.from_env()
         training_store = TrainingStore(training_database_path)
         training_provider = FakeResourceProvider(training_store)
+        node_deployment_manager = (
+            AutomatedNodeDeploymentManager(
+                center_base_url=training_settings.center_base_url,
+                backend_factory=_password_worker_deployment_context,
+            )
+            if training_settings.center_base_url is not None
+            else None
+        )
         training_service = TrainingService(
             training_store,
             training_provider,
             simulation_enabled=training_settings.simulation_enabled,
+            node_deployment_manager=node_deployment_manager,
         )
         training_worker = TrainingWorker(
             training_store,

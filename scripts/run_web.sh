@@ -80,6 +80,8 @@ Environment:
                         Delay between simulated training metrics. Default: 0.25.
   VLA_TRAINING_DB_PATH
                         Optional absolute training SQLite path. Default: WORKING_DIR/training.sqlite.
+  VLA_TRAINING_CENTER_BASE_URL
+                        Public HTTPS origin reachable by Training Workers. Required for Worker deployment.
   WEB_CMD               Override vla-data-agent-web command path.
   RUN_WEB_CONTROL_PYTHON
                         Python 3 used for safe PID/control operations.

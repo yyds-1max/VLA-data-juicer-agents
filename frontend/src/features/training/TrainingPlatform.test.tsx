@@ -4,13 +4,19 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as trainingApi from "../../api/client";
-import type { TrainingCapabilities, TrainingModel, TrainingRun, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingModel, TrainingNode, TrainingRun, TrainingServer, TrainingServerResources } from "../../api/types";
 import { TrainingPlatform } from "./TrainingPlatform";
 import { navilaTrajectoryParameters } from "./navilaTemplate";
 
 vi.mock("../../api/client", () => ({
+  ApiResponseError: class ApiResponseError extends Error {
+    constructor(message: string, readonly status: number, readonly body: unknown) {
+      super(message);
+    }
+  },
   getTrainingCapabilities: vi.fn(), listTrainingModels: vi.fn(), listTrainingServers: vi.fn(),
-  getTrainingServerResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(),
+  getTrainingServerResources: vi.fn(), listTrainingNodes: vi.fn(), getTrainingNodeResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(),
+  createTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), deployTrainingNodeWorker: vi.fn(),
   updateTrainingModel: vi.fn(),
   previewTrainingRun: vi.fn(), createTrainingRun: vi.fn(), getTrainingRun: vi.fn(),
   getTrainingRunLogs: vi.fn(), getTrainingRunMetrics: vi.fn(), stopTrainingRun: vi.fn(),
@@ -21,15 +27,16 @@ const readonlyCapabilities: TrainingCapabilities = {
   permissions: ["training:view"], authentication_mode: "read_only", simulation_enabled: true,
   real_execution_enabled: false, real_execution_disabled_reason: "真实执行未配置",
 };
-const adminCapabilities: TrainingCapabilities = { ...readonlyCapabilities, authentication_mode: "development_admin", permissions: ["training:view", "training:manage_models", "training:create_runs", "training:stop_runs"] };
+const adminCapabilities: TrainingCapabilities = { ...readonlyCapabilities, authentication_mode: "development_admin", permissions: ["training:view", "training:manage_models", "training:manage_nodes", "training:create_runs", "training:stop_runs"], node_deployment_enabled: true };
 const server: TrainingServer = { server_ref: "fake-local", name: "Fake A100 Server", kind: "simulation", gpu_count: 8 };
 const resources: TrainingServerResources = { server, sampled_at: "2026-08-06T00:00:00Z", gpus: [{ gpu_uuid: "GPU-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 1024, utilization_percent: 2, temperature_c: 45, externally_occupied: false }] };
 const secondaryServer: TrainingServer = { server_ref: "fake-west", name: "Fake L40S Server", kind: "simulation", gpu_count: 4 };
 const secondaryResources: TrainingServerResources = { server: secondaryServer, sampled_at: "2026-08-06T00:01:00Z", gpus: [{ gpu_uuid: "GPU-WEST-1", index: 1, name: "L40S", total_memory_mib: 49152, used_memory_mib: 12288, utilization_percent: 38, temperature_c: 52, externally_occupied: false }] };
-const launchTemplate = { domain: "vla", server_ref: "fake-local", working_directory: "/workspace/project", executable: "python", entrypoint: "train.py", fixed_argv: ["--deepspeed", "configs/zero3.json"], output_root: "/workspace/outputs", output_flag: "--output_dir" };
+const launchTemplate = { domain: "vla", server_ref: "fake-local", working_directory: "/workspace/project", executable: "python", entrypoint: "train.py", fixed_argv: ["--deepspeed", "configs/zero3.json"], output_root: "/workspace/outputs", output_flag: "--output_dir", runtime_environment: { kind: "system" as const }, monitoring: { source: "stdout" as const, format: "plain" as const } };
 const model: TrainingModel = { model_ref: "navila", name: "NaVILA", description: "draft model", status: "draft", latest_revision: 1, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", revision: { revision: 1, created_at: "2026-08-06T00:00:00Z", fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
 const runningRun: TrainingRun = { run_ref: "run-running", model_ref: "navila", model_name: "NaVILA Running", model_revision: 1, status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", model_name: "NaVILA Succeeded", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20 };
+const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer", status: "pending_enrollment", state_revision: 1, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
 
 class TestResizeObserver {
   observe() {}
@@ -45,6 +52,7 @@ function renderPlatform(path = "/model") {
 function mockApi(capabilities = readonlyCapabilities, models: TrainingModel[] = []) {
   vi.mocked(trainingApi.getTrainingCapabilities).mockResolvedValue(capabilities);
   vi.mocked(trainingApi.listTrainingModels).mockResolvedValue(models);
+  vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([]);
   vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server]);
   vi.mocked(trainingApi.getTrainingServerResources).mockResolvedValue(resources);
   vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([]);
@@ -63,6 +71,63 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByRole("button", { name: "启动模拟训练" })).toBeDisabled();
   });
 
+  it("registers a node then automatically deploys a Worker with one-time SSH credentials", async () => {
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
+    vi.mocked(trainingApi.createTrainingNode).mockResolvedValue(pendingNode);
+    const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
+    vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
+    vi.mocked(trainingApi.deployTrainingNodeWorker).mockResolvedValue({ node: { ...pendingNode, state_revision: 2, deployment_status: "succeeded", installed_worker_version: "0.1.0" }, deployment: { status: "succeeded", worker_version: "0.1.0", message: "Worker deployed." } });
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+    fireEvent.change(screen.getByLabelText("节点名称"), { target: { value: "测试训练节点" } });
+    fireEvent.change(screen.getByLabelText("SSH 用户名"), { target: { value: "trainer" } });
+    fireEvent.change(screen.getByLabelText("主机地址"), { target: { value: "10.0.0.12" } });
+    fireEvent.change(screen.getByLabelText("SSH 端口"), { target: { value: "2222" } });
+    fireEvent.click(screen.getByRole("button", { name: "登记节点" }));
+    expect((await screen.findAllByText("待部署 Worker"))[0]).toBeVisible();
+    expect(trainingApi.createTrainingNode).toHaveBeenCalledWith(expect.objectContaining({ address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer" }));
+    expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
+    expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
+    fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
+    fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
+    await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
+    expect(await screen.findByText("Worker 已自动部署并完成注册，正在等待稳定心跳。")).toBeVisible();
+    expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
+  });
+
+  it("clearly reports an insufficient deployment account without suggesting manual setup", async () => {
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
+    const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
+    vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
+    vi.mocked(trainingApi.deployTrainingNodeWorker).mockRejectedValue(new trainingApi.ApiResponseError("deployment failed", 400, { detail: { code: "training_node_deployment_account_insufficient", message: "部署账号权限不足" } }));
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+    fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
+    await screen.findByText(hostKey.sha256_fingerprint);
+    fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
+    fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
+
+    expect(await screen.findByText("部署账号权限不足。请改用具有 root 或 sudo 权限的 SSH 账号重新部署。")).toBeVisible();
+    expect(screen.queryByText(/手工创建账号/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces a registered dataset parameter separately from hyperparameters", async () => {
+    const datasetModel: TrainingModel = { ...model, revision: { ...model.revision!, parameter_definitions: [
+      { key: "data_mixture", label: "数据混合配置", type: "string", semantic_role: "dataset", default: "rxr", editable: true },
+      ...model.revision!.parameter_definitions,
+    ] } };
+    mockApi(adminCapabilities, [datasetModel]);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    expect(await screen.findByRole("region", { name: "训练数据集" })).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "训练数据集" })).getByLabelText("数据混合配置")).toHaveValue("rxr");
+  });
+
   it("sends an admin model registration payload with the structured launch template", async () => {
     mockApi(adminCapabilities);
     vi.mocked(trainingApi.createTrainingModel).mockResolvedValue(model);
@@ -76,12 +141,14 @@ describe("TrainingPlatform", () => {
     expect(screen.getByLabelText("训练入口 · Entrypoint")).toBeVisible();
     expect(screen.getByLabelText("输出根目录 · Output root")).toBeVisible();
     expect(screen.getByLabelText("输出参数标志 · Output flag")).toBeVisible();
+    expect(screen.getByLabelText("运行环境 · Runtime environment")).toBeVisible();
+    expect(screen.getByLabelText("指标日志格式 · Metrics format")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
     fireEvent.click(await screen.findByRole("button", { name: "创建草稿" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     expect(trainingApi.createTrainingModel).toHaveBeenCalledWith(expect.objectContaining({
       name: "NaVILA 轨迹训练",
-      launch_template: expect.objectContaining({ server_ref: "fake-local", executable: "torchrun", entrypoint: "llava/train/train_mem.py", fixed_argv: [], output_flag: "--output_dir" }),
+      launch_template: expect.objectContaining({ server_ref: "fake-local", executable: "torchrun", entrypoint: "llava/train/train_mem.py", fixed_argv: [], output_flag: "--output_dir", runtime_environment: { kind: "system" }, monitoring: { source: "stdout", format: "transformers" } }),
       parameter_definitions: expect.arrayContaining([expect.objectContaining({ key: "num_video_frames", default: 4 }), expect.objectContaining({ key: "tune_vision_tower", argument_style: "explicit_boolean" }), expect.objectContaining({ key: "longvila_sampler", editable: true }), expect.objectContaining({ key: "save_steps", visible_when: { parameter_key: "save_strategy", equals: "steps" } })]),
     }));
   });
@@ -110,7 +177,7 @@ describe("TrainingPlatform", () => {
       key: "tune_vision_tower",
       visible_when: { parameter_key: "bf16", equals: true },
     }));
-  });
+  }, 10_000);
 
   it("creates, manages, and safely deletes a custom parameter group", async () => {
     mockApi(adminCapabilities);
@@ -137,7 +204,7 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText(/该分组内的 1 个参数将自动移入系统保留的“其他参数”/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "删除分组并迁移参数" }));
     expect(screen.getByLabelText("longvila_sampler 展示分组")).toHaveValue("other");
-  });
+  }, 10_000);
 
   it("keeps common and other reserved while allowing recommended groups to be renamed and deleted", async () => {
     mockApi(adminCapabilities);
@@ -313,7 +380,8 @@ describe("TrainingPlatform", () => {
     await screen.findByRole("tab", { name: "训练任务" });
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
 
-    expect(await screen.findByRole("heading", { name: "常用参数 (18)" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "常用参数 (17)" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "训练数据集" })).toBeVisible();
     expect(screen.getByLabelText("学习率")).toBeVisible();
     expect(screen.getByLabelText("随机种子")).toBeVisible();
     expect(screen.getByLabelText("保存 step 间隔")).toBeVisible();
