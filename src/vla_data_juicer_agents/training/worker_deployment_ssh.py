@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
+import base64
 import json
 import re
 from typing import Protocol, cast
@@ -270,6 +271,13 @@ sys.stdout.buffer.write(executed.stdout)
 sys.stderr.buffer.write(executed.stderr[-65536:])
 raise SystemExit(executed.returncode)
 '''
+
+
+_REMOTE_SOURCE_LOADER = "import base64;exec(base64.b64decode(__import__('sys').argv.pop(1)))"
+
+
+def _encoded_remote_source(source: str) -> str:
+    return base64.b64encode(source.encode("utf-8")).decode("ascii")
 
 
 @dataclass(slots=True)
@@ -581,7 +589,8 @@ class OpenSshWorkerDeploymentBackend:
         installer_argv = (
             "/usr/bin/python3",
             "-c",
-            _REMOTE_INSTALLER,
+            _REMOTE_SOURCE_LOADER,
+            _encoded_remote_source(_REMOTE_INSTALLER),
             operation.value,
             arguments_json,
         )
@@ -594,7 +603,8 @@ class OpenSshWorkerDeploymentBackend:
                 remote_argv = (
                     "/usr/bin/python3",
                     "-c",
-                    _REMOTE_SUDO_BRIDGE,
+                    _REMOTE_SOURCE_LOADER,
+                    _encoded_remote_source(_REMOTE_SUDO_BRIDGE),
                     *installer_argv,
                 )
                 stdin = (

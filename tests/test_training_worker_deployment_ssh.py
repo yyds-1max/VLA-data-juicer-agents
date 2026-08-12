@@ -93,8 +93,9 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     assert deployment_calls
     for argv, _stdin, operation_name in deployment_calls:
         assert argv[:2] == ("/usr/bin/python3", "-c")
-        assert argv[3:5] == ("/usr/bin/python3", "-c")
-        assert len(argv) == 8
+        assert argv[4:6] == ("/usr/bin/python3", "-c")
+        assert len(argv) == 10
+        assert all("\n" not in value and "\r" not in value for value in argv)
         assert operation_name.startswith("deploy:")
         serialized_argv = repr(argv)
         assert SSH_PASSWORD not in serialized_argv
