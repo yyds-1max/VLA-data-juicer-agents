@@ -3,6 +3,7 @@ import type {
   InteractionResponsePayload,
   InteractionResponseResult,
   NavigationDatasetSummary,
+  NavigationDatasetRelease,
   NavigationDateSummary,
   NavigationSyncImageListing,
   SessionDetail,
@@ -149,6 +150,32 @@ export async function getNavigationDatasetSummary(): Promise<NavigationDatasetSu
 
 export async function getNavigationDatasetDate(date: string): Promise<NavigationDateSummary> {
   return requestJson<NavigationDateSummary>(navigationDatasetPath(date));
+}
+
+export async function getNavigationDatasetReleases(): Promise<NavigationDatasetRelease[]> {
+  const data = await requestJson<{ releases: NavigationDatasetRelease[] }>(
+    "/api/navigation/datasets/releases",
+  );
+  return data.releases;
+}
+
+export async function createNavigationDatasetRelease(
+  date: string,
+  expectedScopeManifestSha256: string,
+  note: string | null,
+  idempotencyKey: string,
+): Promise<NavigationDatasetRelease> {
+  return requestJson<NavigationDatasetRelease>(
+    `/api/navigation/datasets/releases/${encodeURIComponent(date)}`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({
+        expected_scope_manifest_sha256: expectedScopeManifestSha256,
+        note,
+      }),
+    },
+  );
 }
 
 export async function getSyncImages(

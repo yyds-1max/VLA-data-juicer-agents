@@ -230,6 +230,17 @@ export type TrajectoryReview = {
   updated_at: string;
 };
 
+export type HistoricalVerifiedAsset = {
+  asset_ref: string;
+  dataset_date: string;
+  source_clip: string;
+  segment_ordinal: number;
+  segment_total: number;
+  content_sha256: string;
+  provenance: "historical_import";
+  imported_at: string;
+};
+
 export type TrajectoryPoint = {
   x: number;
   y: number;

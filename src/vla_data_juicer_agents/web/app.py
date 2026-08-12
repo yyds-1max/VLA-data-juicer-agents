@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import threading
@@ -10,10 +11,18 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.annotation.api import create_annotation_router
@@ -26,6 +35,10 @@ from vla_data_juicer_agents.annotation.maintenance import (
 from vla_data_juicer_agents.annotation.navigation_gateway import (
     AnnotationNavigationGateway,
 )
+from vla_data_juicer_agents.annotation.models import (
+    AnnotationConflictError,
+    AnnotationValidationError,
+)
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.annotation.worker import AnnotationWorker
 from vla_data_juicer_agents.annotation.workflow_coordinator import (
@@ -33,6 +46,7 @@ from vla_data_juicer_agents.annotation.workflow_coordinator import (
 )
 from vla_data_juicer_agents.navigation.dataset_catalog import (
     list_sync_images,
+    merge_annotation_lifecycle,
     resolve_sync_image_path,
     scan_navigation_dataset,
     scan_navigation_date,
@@ -41,6 +55,7 @@ from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
     CreateSessionRequest,
+    CreateDatasetReleaseRequest,
     CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
@@ -324,14 +339,162 @@ def create_app(
         @app.get("/api/navigation/datasets/summary")
         async def navigation_dataset_summary() -> dict[str, Any]:
             try:
-                return scan_navigation_dataset().model_dump(mode="json")
+                summary = scan_navigation_dataset()
+                return merge_annotation_lifecycle(
+                    summary,
+                    annotation_store.asset_lifecycle_snapshot(),
+                ).model_dump(mode="json")
+            except (ValueError, FileNotFoundError) as exc:
+                _raise_navigation_http_error(exc)
+
+        @app.get("/api/navigation/datasets/events/cursor")
+        async def navigation_dataset_event_cursor() -> dict[str, int]:
+            return {"cursor": store.navigation_dataset_event_cursor()}
+
+        @app.get("/api/navigation/datasets/events")
+        async def navigation_dataset_events(
+            request: Request,
+            after_seq: int = Query(default=0, ge=0),
+            last_event_id: str | None = Header(
+                default=None,
+                alias="Last-Event-ID",
+                max_length=32,
+            ),
+        ) -> StreamingResponse:
+            cursor = after_seq
+            if last_event_id is not None:
+                try:
+                    resumed_cursor = int(last_event_id, 10)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Last-Event-ID must be a non-negative integer",
+                    ) from exc
+                if resumed_cursor < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Last-Event-ID must be a non-negative integer",
+                    )
+                cursor = max(cursor, resumed_cursor)
+
+            async def stream():
+                nonlocal cursor
+                loop = asyncio.get_running_loop()
+                heartbeat_at = loop.time() + 15.0
+                yield "retry: 1000\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    events = await asyncio.to_thread(
+                        store.list_navigation_dataset_events_after,
+                        after_seq=cursor,
+                    )
+                    for event in events:
+                        cursor = int(event["seq"])
+                        payload = json.dumps(
+                            event,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        yield (
+                            f"id: {cursor}\n"
+                            "event: navigation_dataset\n"
+                            f"data: {payload}\n\n"
+                        )
+                    now = loop.time()
+                    if now >= heartbeat_at:
+                        yield ": keepalive\n\n"
+                        heartbeat_at = now + 15.0
+                    if not events:
+                        await asyncio.sleep(0.25)
+
+            return StreamingResponse(
+                stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        @app.get("/api/navigation/datasets/releases")
+        async def navigation_dataset_releases() -> dict[str, Any]:
+            try:
+                summary = scan_navigation_dataset()
+                return {
+                    "releases": [
+                        annotation_store.dataset_release_candidate(
+                            dataset_date=date.date,
+                            managed_clips=[
+                                {
+                                    "source_clip": clip.clip,
+                                    "status": clip.status,
+                                    "duration_ns": clip.duration_ns,
+                                }
+                                for clip in date.clips
+                            ],
+                        )
+                        for date in summary.dates
+                    ]
+                }
+            except (ValueError, FileNotFoundError) as exc:
+                _raise_navigation_http_error(exc)
+
+        @app.post("/api/navigation/datasets/releases/{date}")
+        async def create_navigation_dataset_release(
+            date: str,
+            request: CreateDatasetReleaseRequest,
+            idempotency_key: str = Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=200,
+            ),
+        ) -> dict[str, Any]:
+            try:
+                date_summary = scan_navigation_date(date)
+                managed_clips = [
+                    {
+                        "source_clip": clip.clip,
+                        "status": clip.status,
+                        "duration_ns": clip.duration_ns,
+                    }
+                    for clip in date_summary.clips
+                ]
+                return annotation_store.create_dataset_release(
+                    dataset_date=date,
+                    managed_clips=managed_clips,
+                    expected_scope_manifest_sha256=(
+                        request.expected_scope_manifest_sha256
+                    ),
+                    note=request.note,
+                    idempotency_key=idempotency_key,
+                )
+            except AnnotationConflictError as exc:
+                detail: dict[str, Any] = {
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+                if exc.current is not None:
+                    detail["current"] = exc.current
+                raise HTTPException(status_code=409, detail=detail) from exc
+            except AnnotationValidationError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
             except (ValueError, FileNotFoundError) as exc:
                 _raise_navigation_http_error(exc)
 
         @app.get("/api/navigation/datasets/{date}")
         async def navigation_date_summary(date: str) -> dict[str, Any]:
             try:
-                return scan_navigation_date(date).model_dump(mode="json")
+                summary = scan_navigation_date(date)
+                return merge_annotation_lifecycle(
+                    summary,
+                    annotation_store.asset_lifecycle_snapshot(),
+                ).model_dump(mode="json")
             except (ValueError, FileNotFoundError) as exc:
                 _raise_navigation_http_error(exc)
 
@@ -583,6 +746,7 @@ def create_app(
 
                     @app.get("/agent", include_in_schema=False)
                     @app.get("/data", include_in_schema=False)
+                    @app.get("/data/releases", include_in_schema=False)
                     @app.get("/annotation", include_in_schema=False)
                     @app.get("/annotation/jobs", include_in_schema=False)
                     @app.get("/annotation/jobs/{job_ref}", include_in_schema=False)
@@ -595,14 +759,19 @@ def create_app(
                         "/annotation/reviews/{review_ref}",
                         include_in_schema=False,
                     )
+                    @app.get(
+                        "/annotation/verified/{asset_ref}",
+                        include_in_schema=False,
+                    )
                     @app.get("/model", include_in_schema=False)
                     @app.get("/simulation", include_in_schema=False)
                     async def frontend_route(
                         job_ref: str | None = None,
                         segment_ref: str | None = None,
                         review_ref: str | None = None,
+                        asset_ref: str | None = None,
                     ) -> FileResponse:
-                        del job_ref, segment_ref, review_ref
+                        del job_ref, segment_ref, review_ref, asset_ref
                         return FileResponse(index_path)
 
         return app

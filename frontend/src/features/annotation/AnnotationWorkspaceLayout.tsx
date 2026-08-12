@@ -23,7 +23,8 @@ export function AnnotationWorkspaceLayout() {
     location.pathname,
   );
   const fixWorkbench = /^\/annotation\/reviews\/[^/]+\/?$/.test(location.pathname);
-  const deepWorkbench = annotationWorkbench || fixWorkbench;
+  const verifiedAsset = /^\/annotation\/verified\/[^/]+\/?$/.test(location.pathname);
+  const deepWorkbench = annotationWorkbench || fixWorkbench || verifiedAsset;
 
   useEffect(() => {
     let activeRequest = true;

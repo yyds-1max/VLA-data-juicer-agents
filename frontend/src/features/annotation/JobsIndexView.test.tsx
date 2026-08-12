@@ -231,7 +231,7 @@ describe("JobsIndexView", () => {
     renderView({ onRefresh, onOpenDataPilot, onPrimaryAction });
 
     fireEvent.click(screen.getByRole("button", { name: "刷新标注任务" }));
-    fireEvent.click(screen.getByRole("button", { name: "交给 DataPilot 处理" }));
+    fireEvent.click(screen.getByRole("button", { name: "交给DataPilot" }));
     fireEvent.click(screen.getByRole("button", { name: "继续标注" }));
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
@@ -295,7 +295,7 @@ describe("JobsIndexView", () => {
     expect(screen.getByText("网络连接失败")).toBeInTheDocument();
     expect(screen.getByText("运行环境未启动")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "正在刷新标注任务" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "交给DataPilot" })).toBeEnabled();
     expect(screen.getByRole("status")).toHaveTextContent("正在刷新标注任务列表");
   });
 

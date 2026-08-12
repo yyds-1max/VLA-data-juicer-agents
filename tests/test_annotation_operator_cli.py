@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 from multiprocessing.connection import Connection
@@ -438,6 +439,71 @@ def test_cli_requires_explicit_absolute_existing_database_and_lock_paths(
         "ok": False,
     }
     assert str(tmp_path) not in captured.err
+
+
+def test_import_history_defaults_to_dry_run_then_applies_without_path_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state = _private_directory(tmp_path / "state-history")
+    database = state / "annotation.sqlite"
+    locks = _private_directory(tmp_path / "locks-history")
+    writer_lock = locks / "navigation-annotation-writer.lock"
+    store = AnnotationStore(database)
+    _configure_production_scope(monkeypatch, database, writer_lock)
+
+    finish_root = _private_directory(tmp_path / "finish-data")
+    artifact = finish_root / "20260623" / "segment_trajectory_fix_five.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"frame":{"master":{"x":1}}}', encoding="utf-8")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest = tmp_path / "historical-verified-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {
+                        "dataset_date": "20260623",
+                        "source_clip": "20260623_145550",
+                        "segment_ordinal": 1,
+                        "segment_total": 1,
+                        "relative_path": str(artifact.relative_to(finish_root)),
+                        "sha256": artifact_sha,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = [
+        *_scope_args(database, writer_lock),
+        "import-history",
+        "--finish-data-root",
+        str(finish_root),
+        "--manifest",
+        str(manifest),
+    ]
+
+    assert operator_cli.main(command) == 0
+    dry_run = capsys.readouterr()
+    assert dry_run.err == ""
+    dry_payload = _json_output(dry_run.out)
+    assert dry_payload["result"]["status"] == "historical_import_validated"
+    assert dry_payload["result"]["asset_count"] == 1
+    assert store.asset_lifecycle_snapshot()["scopes"] == []
+    assert str(tmp_path) not in dry_run.out
+
+    assert operator_cli.main([*command, "--apply"]) == 0
+    applied = capsys.readouterr()
+    assert applied.err == ""
+    applied_payload = _json_output(applied.out)
+    assert applied_payload["result"]["imported"] == 1
+    assert applied_payload["result"]["existing"] == 0
+    assert str(tmp_path) not in applied.out
+    scope = store.asset_lifecycle_snapshot()["scopes"][0]
+    assert scope["annotation"]["status"] == "annotated"
+    assert scope["review"]["status"] == "verified"
 
 
 def test_list_recovery_rejects_database_symlink_without_leaking_path(

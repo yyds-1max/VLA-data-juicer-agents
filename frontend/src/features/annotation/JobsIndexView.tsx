@@ -501,7 +501,7 @@ export function JobsIndexView({
             className="bg-[#274bc8] px-3 text-white shadow-sm hover:bg-[#203fae] active:translate-y-px"
           >
             <Bot aria-hidden="true" />
-            交给 DataPilot 处理
+            交给DataPilot
           </Button>
         </>
       }
