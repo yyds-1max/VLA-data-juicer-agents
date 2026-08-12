@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -102,7 +102,7 @@ def load_or_create_identity(state_dir: Path) -> WorkerIdentity:
     identity = WorkerIdentity(
         worker_id=f"worker-{uuid4().hex}",
         credential=secrets.token_urlsafe(32),
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
     )
     payload = json.dumps(_identity_payload(identity), sort_keys=True) + "\n"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL

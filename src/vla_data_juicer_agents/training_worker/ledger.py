@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -164,7 +164,7 @@ class WorkerLedger:
             raise ValueError("an active process observation requires a positive pid")
         if pid is not None and pid <= 0:
             raise ValueError("pid must be positive")
-        sampled_at = datetime.now(UTC).isoformat()
+        sampled_at = datetime.now(timezone.utc).isoformat()
         gpu_payload = json.dumps(sorted(set(gpu_uuids)))
         with self._connect() as connection:
             connection.execute(
@@ -235,7 +235,7 @@ class WorkerLedger:
             probe_result = process_probe.inspect(observation)
             previous_state = str(row["state"])
             current_state = previous_state if probe_result.status == "matched" else "unknown"
-            sampled_at = datetime.now(UTC).isoformat()
+            sampled_at = datetime.now(timezone.utc).isoformat()
             with self._connect() as connection:
                 connection.execute(
                     """

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import platform
@@ -45,7 +45,7 @@ class ResourceCollector:
         gpu_payload, gpu_source, gpu_error = self._collect_gpus()
         return {
             "schema_version": 1,
-            "sampled_at": datetime.now(UTC).isoformat(),
+            "sampled_at": datetime.now(timezone.utc).isoformat(),
             "host": {
                 "hostname": socket.gethostname(),
                 "os": platform.system(),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import threading
 import time
 from typing import Callable
@@ -52,7 +52,7 @@ class TrainingWorkerDaemon:
             "schema_version": 1,
             "worker_id": self.identity.worker_id,
             "sequence": self._sequence,
-            "sampled_at": datetime.now(UTC).isoformat(),
+            "sampled_at": datetime.now(timezone.utc).isoformat(),
             "health": {
                 "status": "degraded" if degraded else "healthy",
                 "uptime_seconds": round(self._clock() - self._started_at, 3),
