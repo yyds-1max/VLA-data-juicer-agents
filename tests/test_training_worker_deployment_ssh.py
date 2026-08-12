@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from vla_data_juicer_agents.training.worker_deployment import (
 )
 from vla_data_juicer_agents.training.worker_deployment_ssh import (
     OpenSshWorkerDeploymentBackend,
+    _REMOTE_INSTALLER,
     _REMOTE_SUDO_BRIDGE,
 )
 
@@ -191,3 +193,63 @@ raise SystemExit(completed.returncode)
     assert completed.returncode == 0
     assert completed.stdout == payload
     assert b"sudo-secret" not in completed.stdout + completed.stderr
+
+
+def test_remote_enrollment_suppresses_worker_stdout_from_protocol(
+    tmp_path: Path,
+) -> None:
+    fake_runuser = tmp_path / "runuser"
+    fake_runuser.write_text(
+        """#!/usr/bin/env python3
+import subprocess
+import sys
+
+separator = sys.argv.index("--")
+completed = subprocess.run(
+    sys.argv[separator + 1:],
+    input=sys.stdin.buffer.read(),
+    stdout=sys.stdout.buffer,
+    stderr=sys.stderr.buffer,
+    check=False,
+)
+raise SystemExit(completed.returncode)
+""",
+        encoding="utf-8",
+    )
+    fake_runuser.chmod(0o700)
+    noisy_worker = tmp_path / "worker.py"
+    noisy_worker.write_text(
+        "import sys\nsys.stdin.buffer.read()\nprint('{\"worker\":\"noise\"}')\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PATH"] = str(tmp_path) + os.pathsep + environment["PATH"]
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REMOTE_INSTALLER,
+            "enroll",
+            json.dumps(
+                {
+                    "artifact_path": str(noisy_worker),
+                    "state_directory": str(tmp_path / "state"),
+                    "center_base_url": "https://127.0.0.1:8777",
+                    "node_ref": "node_test1234",
+                    "center_ca_path": None,
+                    "run_as": "datapilot-worker",
+                }
+            ),
+        ],
+        input=b"enroll_" + b"x" * 48,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {"changed": True, "value": None}
+    assert b"worker" not in completed.stdout

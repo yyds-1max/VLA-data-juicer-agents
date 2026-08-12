@@ -215,6 +215,8 @@ elif operation == "enroll":
     subprocess.run(
         command,
         input=token + b"\n",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         check=True,
         env=environment,
     )
