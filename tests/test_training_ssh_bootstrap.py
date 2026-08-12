@@ -377,6 +377,7 @@ def test_password_session_accepts_fixed_sudo_argv_through_transport_validation(
     def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         captured["argv"] = argv
         captured["environment"] = kwargs["env"]
+        captured["start_new_session"] = kwargs["start_new_session"]
         return subprocess.CompletedProcess(argv, 0, stdout=b"0\n", stderr=b"")
 
     monkeypatch.setattr(ssh_bootstrap.subprocess, "run", run)
@@ -397,6 +398,7 @@ def test_password_session_accepts_fixed_sudo_argv_through_transport_validation(
     assert result.return_code == 0
     assert password not in repr(captured["argv"])
     assert password not in repr(captured["environment"])
+    assert captured["start_new_session"] is True
     assert "DataPilot sudo password:" in captured["argv"][-1]  # type: ignore[index]
 
 

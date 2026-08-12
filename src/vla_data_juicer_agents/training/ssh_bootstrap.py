@@ -720,6 +720,7 @@ class _OpenSshSession:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=environment,
+                    start_new_session=True,
                     timeout=timeout_seconds,
                     check=False,
                 )
