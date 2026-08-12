@@ -1,4 +1,4 @@
-import { Activity, Cpu, HardDrive, KeyRound, Plus, Server, ShieldCheck } from "lucide-react";
+import { Activity, Cpu, Eye, EyeOff, HardDrive, KeyRound, Plus, Server, ShieldCheck } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { ApiResponseError, createTrainingNode, deployTrainingNodeWorker, discoverTrainingNodeHostKey } from "../../api/client";
@@ -51,6 +51,43 @@ function formatTime(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function availablePercent(available: number, total: number) {
+  if (!Number.isFinite(available) || !Number.isFinite(total) || total <= 0) return 0;
+  return Math.min(100, Math.max(0, available / total * 100));
+}
+
+const inputClass = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none disabled:bg-slate-100";
+
+function PasswordField({
+  id,
+  label,
+  value,
+  visible,
+  disabled,
+  autoComplete,
+  onChange,
+  onToggle,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  visible: boolean;
+  disabled: boolean;
+  autoComplete: string;
+  onChange: (value: string) => void;
+  onToggle: () => void;
+}) {
+  return <div className="text-sm text-console-muted">
+    <label htmlFor={id}>{label}</label>
+    <div className="relative">
+      <input id={id} aria-label={label} className={`${inputClass} pr-10`} type={visible ? "text" : "password"} autoComplete={autoComplete} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+      <button type="button" className="absolute inset-y-1 right-1 mt-1 flex w-8 items-center justify-center rounded text-console-muted hover:bg-slate-100 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan disabled:cursor-not-allowed disabled:opacity-50" aria-label={`${visible ? "隐藏" : "显示"} ${label}`} aria-pressed={visible} disabled={disabled} onClick={onToggle}>
+        {visible ? <EyeOff className="h-4 w-4" aria-hidden="true" /> : <Eye className="h-4 w-4" aria-hidden="true" />}
+      </button>
+    </div>
+  </div>;
+}
+
 export function TrainingNodesPanel({
   nodes,
   resourcesByNode,
@@ -78,11 +115,14 @@ export function TrainingNodesPanel({
   const [hostKey, setHostKey] = useState<TrainingNodeHostKey | null>(null);
   const [hostKeyConfirmed, setHostKeyConfirmed] = useState(false);
   const [sshPassword, setSshPassword] = useState("");
+  const [sshPasswordVisible, setSshPasswordVisible] = useState(false);
   const [sudoPasswordMode, setSudoPasswordMode] = useState<"same_as_ssh" | "separate" | "not_required">("same_as_ssh");
   const [sudoPassword, setSudoPassword] = useState("");
+  const [sudoPasswordVisible, setSudoPasswordVisible] = useState(false);
   const selected = nodes.find((node) => node.node_ref === selectedRef) ?? nodes[0] ?? null;
   const snapshot = selected ? resourcesByNode[selected.node_ref] : undefined;
   const resources = snapshot?.resources ?? selected?.resources ?? null;
+  const memoryAvailablePercent = resources ? availablePercent(resources.memory.available_bytes, resources.memory.total_bytes) : 0;
   const port = Number(sshPort);
   const valid = Boolean(name.trim() && address.trim() && sshUsername.trim() && Number.isInteger(port) && port >= 1 && port <= 65535);
   const gpuSummary = useMemo(() => {
@@ -91,6 +131,14 @@ export function TrainingNodesPanel({
       count: gpus.length,
       memory: gpus.reduce((sum, gpu) => sum + gpu.memory_total_bytes, 0),
       utilization: gpus.length ? gpus.reduce((sum, gpu) => sum + gpu.utilization_percent, 0) / gpus.length : 0,
+    };
+  }, [resources]);
+  const diskSummary = useMemo(() => {
+    const disks = resources?.disks ?? [];
+    return {
+      count: disks.length,
+      available: disks.reduce((sum, disk) => sum + disk.available_bytes, 0),
+      total: disks.reduce((sum, disk) => sum + disk.total_bytes, 0),
     };
   }, [resources]);
 
@@ -106,7 +154,7 @@ export function TrainingNodesPanel({
 
   const openDeployment = async () => {
     if (!selected) return;
-    setBusy(true); setMessage(null); setDeployingRef(selected.node_ref); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSudoPasswordMode("same_as_ssh"); setSudoPassword("");
+    setBusy(true); setMessage(null); setDeployingRef(selected.node_ref); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSshPasswordVisible(false); setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setSudoPasswordVisible(false);
     try {
       setHostKey(await discoverTrainingNodeHostKey(selected.node_ref));
     } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
@@ -124,12 +172,11 @@ export function TrainingNodesPanel({
         sudo_password_mode: sudoPasswordMode,
         ...(sudoPasswordMode === "separate" ? { sudo_password: sudoPassword } : {}),
       });
-      onChanged(result.node); setDeployingRef(null); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSudoPassword("");
+      onChanged(result.node); setDeployingRef(null); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false);
       setMessage("Worker 已自动部署并完成注册，正在等待稳定心跳。");
-    } catch (error) { setMessage(errorText(error)); setSshPassword(""); setSudoPassword(""); } finally { setBusy(false); }
+    } catch (error) { setMessage(errorText(error)); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); } finally { setBusy(false); }
   };
 
-  const inputClass = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none disabled:bg-slate-100";
   return (
     <section className="space-y-5" aria-labelledby="training-nodes-title">
       <header className="border-b border-console-line pb-5">
@@ -185,16 +232,17 @@ export function TrainingNodesPanel({
               {selected.health_message ? <p className="mt-3 text-sm text-amber-700">{selected.health_message}</p> : null}
               <div className="mt-4 flex flex-wrap items-center gap-3"><ConsoleButton disabled={!canManage || !deploymentEnabled || busy || selected.status === "disabled" || selected.deployment_status === "deploying"} onClick={() => void openDeployment()}><KeyRound className="h-4 w-4" />{selected.enrolled_at ? "修复 Worker" : "部署 Worker"}</ConsoleButton><span className="text-xs text-console-muted">系统自动创建低权限运行账号、安装系统服务并完成注册，不需要手工操作服务器。</span></div>
               {!deploymentEnabled ? <p className="mt-2 text-xs text-amber-700">{deploymentDisabledReason || "系统尚未配置可供训练节点访问的中心 HTTPS 地址，暂不能部署 Worker。"}</p> : null}
-              {deployingRef === selected.node_ref && hostKey ? <div className="mt-4 space-y-3 rounded-md border border-sky-200 bg-sky-50 p-4"><div><p className="text-sm font-medium text-sky-950">确认服务器身份</p><p className="mt-1 text-xs text-sky-800">请核对管理员提供的主机指纹，确认后本次部署将固定使用该密钥。</p><code className="mt-2 block break-all rounded bg-white p-2 text-xs text-sky-950">{hostKey.sha256_fingerprint}</code></div><label className="flex items-start gap-2 text-sm text-sky-950"><input className="mt-0.5" type="checkbox" checked={hostKeyConfirmed} disabled={busy} onChange={(event) => setHostKeyConfirmed(event.target.checked)} /><span>我已确认该主机指纹正确</span></label><label className="block text-sm text-console-muted">SSH 密码<input aria-label="SSH 部署密码" className={inputClass} type="password" autoComplete="current-password" value={sshPassword} disabled={busy} onChange={(event) => setSshPassword(event.target.value)} /></label><label className="block text-sm text-console-muted">提权方式<select aria-label="Worker 部署提权方式" className={inputClass} value={sudoPasswordMode} disabled={busy} onChange={(event) => setSudoPasswordMode(event.target.value as typeof sudoPasswordMode)}><option value="same_as_ssh">SSH 密码同时用于 sudo</option><option value="not_required">root 或免密 sudo</option><option value="separate">使用不同的 sudo 密码</option></select></label>{sudoPasswordMode === "separate" ? <label className="block text-sm text-console-muted">sudo 密码<input aria-label="sudo 部署密码" className={inputClass} type="password" autoComplete="off" value={sudoPassword} disabled={busy} onChange={(event) => setSudoPassword(event.target.value)} /></label> : null}<p className="text-xs leading-5 text-sky-800">密码仅用于本次安装请求，不保存到节点记录。若部署账号没有 root 或 sudo 权限，系统会停止并明确提示“部署账号权限不足”。</p><div className="flex gap-2"><ConsoleButton variant="primary" disabled={busy || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void deploy()}>自动部署 Worker</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSudoPassword(""); }}>取消</ConsoleButton></div></div> : null}
+              {deployingRef === selected.node_ref && hostKey ? <div className="mt-4 space-y-3 rounded-md border border-sky-200 bg-sky-50 p-4"><div><p className="text-sm font-medium text-sky-950">确认服务器身份</p><p className="mt-1 text-xs text-sky-800">请核对管理员提供的主机指纹，确认后本次部署将固定使用该密钥。</p><code className="mt-2 block break-all rounded bg-white p-2 text-xs text-sky-950">{hostKey.sha256_fingerprint}</code></div><label className="flex items-start gap-2 text-sm text-sky-950"><input className="mt-0.5" type="checkbox" checked={hostKeyConfirmed} disabled={busy} onChange={(event) => setHostKeyConfirmed(event.target.checked)} /><span>我已确认该主机指纹正确</span></label><PasswordField id="training-node-ssh-password" label="SSH 部署密码" value={sshPassword} visible={sshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={setSshPassword} onToggle={() => setSshPasswordVisible((current) => !current)} /><label className="block text-sm text-console-muted">提权方式<select aria-label="Worker 部署提权方式" className={inputClass} value={sudoPasswordMode} disabled={busy} onChange={(event) => setSudoPasswordMode(event.target.value as typeof sudoPasswordMode)}><option value="same_as_ssh">SSH 密码同时用于 sudo</option><option value="not_required">root 或免密 sudo</option><option value="separate">使用不同的 sudo 密码</option></select></label>{sudoPasswordMode === "separate" ? <PasswordField id="training-node-sudo-password" label="sudo 部署密码" value={sudoPassword} visible={sudoPasswordVisible} disabled={busy} autoComplete="off" onChange={setSudoPassword} onToggle={() => setSudoPasswordVisible((current) => !current)} /> : null}<p className="text-xs leading-5 text-sky-800">密码仅用于本次安装请求，不保存到节点记录。若部署账号没有 root 或 sudo 权限，系统会停止并明确提示“部署账号权限不足”。</p><div className="flex gap-2"><ConsoleButton variant="primary" disabled={busy || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void deploy()}>自动部署 Worker</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); }}>取消</ConsoleButton></div></div> : null}
               {message ? <p role="status" className="mt-3 text-sm text-console-muted">{message}</p> : null}
             </ConsoleCard>
 
             <ConsoleCard className="shadow-none">
               <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><Activity className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">节点资源</h3></div><span className="text-xs text-console-muted">{snapshot?.stale ? "快照已过期" : `采样 ${formatTime(snapshot?.captured_at)}`}</span></div>
-              {resources ? <><div className="mt-4 grid gap-3 sm:grid-cols-3">
+              {resources ? <><div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <div className="rounded-md bg-console-panel2 p-3"><Cpu className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">CPU</p><p className="mt-1 font-semibold text-console-text">{resources.cpu.logical_cores} 核 · load {resources.cpu.load_1m?.toFixed(2) ?? "--"}</p></div>
-                <div className="rounded-md bg-console-panel2 p-3"><Activity className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">内存可用</p><p className="mt-1 font-semibold text-console-text">{formatBytes(resources.memory.available_bytes)} / {formatBytes(resources.memory.total_bytes)}</p></div>
-                <div className="rounded-md bg-console-panel2 p-3"><HardDrive className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">GPU</p><p className="mt-1 font-semibold text-console-text">{gpuSummary.count} 张 · {formatBytes(gpuSummary.memory)}</p></div>
+                <div className="rounded-md bg-console-panel2 p-3"><div className="flex items-start justify-between gap-3"><div><Activity className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">内存可用 / 总容量</p></div><p className="text-2xl font-semibold leading-none text-console-text" aria-label={`内存可用百分比 ${memoryAvailablePercent.toFixed(0)}%`}>{memoryAvailablePercent.toFixed(0)}<span className="text-sm">%</span></p></div><p className="mt-1 font-semibold text-console-text">{formatBytes(resources.memory.available_bytes)} / {formatBytes(resources.memory.total_bytes)}</p><ProgressBar className="mt-2" value={memoryAvailablePercent} tone="success" label="可用内存" /></div>
+                <div className="rounded-md bg-console-panel2 p-3"><HardDrive className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">磁盘可用 / 总容量</p>{diskSummary.count ? <><p className="mt-1 font-semibold text-console-text">{formatBytes(diskSummary.available)} / {formatBytes(diskSummary.total)}</p><p className="mt-1 truncate text-xs text-console-muted" title={resources.disks.map((disk) => `${disk.mount}: ${formatBytes(disk.available_bytes)} / ${formatBytes(disk.total_bytes)}`).join("；")}>{resources.disks.map((disk) => disk.mount).join("、")} · {availablePercent(diskSummary.available, diskSummary.total).toFixed(0)}% 可用</p></> : <p className="mt-1 font-semibold text-console-muted">未上报</p>}</div>
+                <div className="rounded-md bg-console-panel2 p-3"><Server className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">GPU</p><p className="mt-1 font-semibold text-console-text">{gpuSummary.count} 张 · {formatBytes(gpuSummary.memory)}</p></div>
               </div><div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">{resources.gpus.map((gpu) => <article key={gpu.uuid} className="rounded-md border border-console-line p-3"><div className="flex justify-between gap-2"><p className="font-medium text-console-text">GPU {gpu.index}</p><span className="text-xs text-console-muted">{gpu.temperature_celsius == null ? "--" : `${gpu.temperature_celsius}°C`}</span></div><p className="mt-1 truncate text-xs text-console-muted">{gpu.name}</p><ProgressBar className="mt-3" value={gpu.utilization_percent} tone="purple" label={`利用率 ${gpu.utilization_percent}%`} /><ProgressBar className="mt-3" value={gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : 0} tone="info" label={`显存 ${formatBytes(gpu.memory_used_bytes)} / ${formatBytes(gpu.memory_total_bytes)}`} /></article>)}</div></> : <div className="py-10 text-center text-sm text-console-muted">Worker 上报心跳后显示 CPU、内存、磁盘和 GPU 资源。</div>}
             </ConsoleCard>
           </> : null}

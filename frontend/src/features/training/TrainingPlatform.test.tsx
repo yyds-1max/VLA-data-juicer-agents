@@ -90,12 +90,48 @@ describe("TrainingPlatform", () => {
     expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
+    const sshPasswordInput = screen.getByLabelText("SSH 部署密码");
+    expect(sshPasswordInput).toHaveAttribute("type", "password");
+    fireEvent.click(screen.getByRole("button", { name: "显示 SSH 部署密码" }));
+    expect(sshPasswordInput).toHaveAttribute("type", "text");
+    fireEvent.click(document.body);
+    fireEvent.focus(sshPasswordInput);
+    expect(screen.getByRole("button", { name: "隐藏 SSH 部署密码" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "隐藏 SSH 部署密码" }));
+    expect(sshPasswordInput).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-password" } });
     fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
     await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
     expect(await screen.findByText("Worker 已自动部署并完成注册，正在等待稳定心跳。")).toBeVisible();
     expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
+  });
+
+  it("shows available memory percentage and reported disk capacity for a real node", async () => {
+    const gib = 1024 ** 3;
+    const onlineNode: TrainingNode = { ...pendingNode, status: "online", enrolled_at: "2026-08-12T00:00:00Z", last_heartbeat_at: "2026-08-12T00:01:00Z" };
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([onlineNode]);
+    vi.mocked(trainingApi.getTrainingNodeResources).mockResolvedValue({
+      node_ref: onlineNode.node_ref,
+      captured_at: "2026-08-12T00:01:00Z",
+      stale: false,
+      resources: {
+        cpu: { logical_cores: 112, load_1m: 10.88 },
+        memory: { available_bytes: 88 * gib, total_bytes: 100 * gib },
+        disks: [{ mount: "/", available_bytes: 400 * gib, total_bytes: 1000 * gib }],
+        gpus: [],
+      },
+    });
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    expect(await screen.findByText("内存可用 / 总容量")).toBeVisible();
+    expect(screen.getByLabelText("内存可用百分比 88%")).toBeVisible();
+    expect(screen.getByText("88 GiB / 100 GiB")).toBeVisible();
+    expect(screen.getByText("磁盘可用 / 总容量")).toBeVisible();
+    expect(screen.getByText("400 GiB / 1000 GiB")).toBeVisible();
+    expect(screen.getByText("/ · 40% 可用")).toBeVisible();
   });
 
   it("clearly reports an insufficient deployment account without suggesting manual setup", async () => {
