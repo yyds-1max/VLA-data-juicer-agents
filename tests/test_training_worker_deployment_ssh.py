@@ -140,12 +140,20 @@ def test_remote_sudo_bridge_keeps_password_separate_from_installer_payload(
     fake_sudo = tmp_path / "sudo"
     fake_sudo.write_text(
         """#!/usr/bin/env python3
+import os
 import subprocess
 import sys
 
 arguments = sys.argv[1:]
-if "-S" in arguments:
-    raise SystemExit(0 if sys.stdin.buffer.readline() == b"sudo-secret\\n" else 1)
+password = subprocess.run(
+    [os.environ["SUDO_ASKPASS"]],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=os.environ,
+    check=False,
+)
+if password.returncode != 0 or password.stdout != b"sudo-secret\\n":
+    raise SystemExit(1)
 separator = arguments.index("--")
 completed = subprocess.run(
     arguments[separator + 1:],

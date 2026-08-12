@@ -240,36 +240,58 @@ else:
 '''
 
 
-_REMOTE_SUDO_BRIDGE = r'''import subprocess
+_REMOTE_SUDO_BRIDGE = r'''import os
+import pathlib
+import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 
-password = sys.stdin.buffer.readline(1025)
+password = bytearray(sys.stdin.buffer.readline(1025))
 if not password or len(password) > 1024 or not password.endswith(b"\n"):
     raise RuntimeError("invalid sudo input")
 payload = sys.stdin.buffer.read()
-authenticated = subprocess.run(
-    [
-        "/usr/bin/sudo", "-S", "-k", "-p",
-        "DataPilot sudo password:", "--", "/usr/bin/true",
-    ],
-    input=password,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.PIPE,
-    check=False,
-)
-if authenticated.returncode != 0:
-    sys.stderr.buffer.write(authenticated.stderr[-4096:])
-    raise SystemExit(authenticated.returncode or 1)
-executed = subprocess.run(
-    ["/usr/bin/sudo", "-n", "--", *sys.argv[1:]],
-    input=payload,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    check=False,
-)
-sys.stdout.buffer.write(executed.stdout)
-sys.stderr.buffer.write(executed.stderr[-65536:])
-raise SystemExit(executed.returncode)
+temporary = pathlib.Path(tempfile.mkdtemp(prefix="datapilot-sudo-", dir="/tmp"))
+os.chmod(temporary, stat.S_IRWXU)
+pipe = temporary / "password.pipe"
+helper = temporary / "askpass"
+pipe_descriptor = None
+try:
+    os.mkfifo(pipe, stat.S_IRUSR | stat.S_IWUSR)
+    pipe_descriptor = os.open(pipe, os.O_RDWR | os.O_NONBLOCK)
+    os.write(pipe_descriptor, password)
+    helper.write_bytes(
+        b"#!/usr/bin/python3\nimport os,sys\n"
+        b"with open(os.environ['DATAPILOT_SUDO_ASKPASS_PIPE'], 'rb', buffering=0) as stream:\n"
+        b" sys.stdout.buffer.write(stream.read(2048))\n"
+    )
+    os.chmod(helper, stat.S_IRWXU)
+    environment = os.environ.copy()
+    environment.update({
+        "SUDO_ASKPASS": str(helper),
+        "DATAPILOT_SUDO_ASKPASS_PIPE": str(pipe),
+    })
+    executed = subprocess.run(
+        [
+            "/usr/bin/sudo", "-A", "-k", "-p",
+            "DataPilot sudo password:", "--", *sys.argv[1:],
+        ],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        check=False,
+    )
+    sys.stdout.buffer.write(executed.stdout)
+    sys.stderr.buffer.write(executed.stderr[-65536:])
+    raise SystemExit(executed.returncode)
+finally:
+    if pipe_descriptor is not None:
+        os.close(pipe_descriptor)
+    for index in range(len(password)):
+        password[index] = 0
+    shutil.rmtree(temporary, ignore_errors=True)
 '''
 
 
