@@ -32,7 +32,6 @@ from .worker_deployment import (
     PASSWORDLESS_SUDO_PROBE_ARGV,
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
-    SUDO_PROMPT,
     ServiceAccountSpec,
     SudoPasswordMode,
     TrainingNodeDeploymentError,
@@ -237,6 +236,39 @@ elif operation == "is_active":
     output(False, active)
 else:
     raise RuntimeError("unsupported deployment operation")
+'''
+
+
+_REMOTE_SUDO_BRIDGE = r'''import subprocess
+import sys
+
+password = sys.stdin.buffer.readline(1025)
+if not password or len(password) > 1024 or not password.endswith(b"\n"):
+    raise RuntimeError("invalid sudo input")
+payload = sys.stdin.buffer.read()
+authenticated = subprocess.run(
+    [
+        "/usr/bin/sudo", "-S", "-k", "-p",
+        "DataPilot sudo password:", "--", "/usr/bin/true",
+    ],
+    input=password,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+if authenticated.returncode != 0:
+    sys.stderr.buffer.write(authenticated.stderr[-4096:])
+    raise SystemExit(authenticated.returncode or 1)
+executed = subprocess.run(
+    ["/usr/bin/sudo", "-n", "--", *sys.argv[1:]],
+    input=payload,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+sys.stdout.buffer.write(executed.stdout)
+sys.stderr.buffer.write(executed.stderr[-65536:])
+raise SystemExit(executed.returncode)
 '''
 
 
@@ -557,17 +589,19 @@ class OpenSshWorkerDeploymentBackend:
         if privilege is DeploymentPrivilege.SUDO:
             if self._effective_sudo_password is None:
                 prefix = ("/usr/bin/sudo", "-n", "--")
+                remote_argv = prefix + installer_argv
             else:
-                prefix = (
-                    "/usr/bin/sudo",
-                    "-S",
-                    "-k",
-                    "-p",
-                    SUDO_PROMPT,
-                    "--",
+                remote_argv = (
+                    "/usr/bin/python3",
+                    "-c",
+                    _REMOTE_SUDO_BRIDGE,
+                    *installer_argv,
                 )
-                stdin = self._effective_sudo_password.encode("utf-8") + b"\n" + payload
-            remote_argv = prefix + installer_argv
+                stdin = (
+                    self._effective_sudo_password.encode("utf-8")
+                    + b"\n"
+                    + payload
+                )
         else:
             remote_argv = installer_argv
         result = self._session.run_fixed_argv(

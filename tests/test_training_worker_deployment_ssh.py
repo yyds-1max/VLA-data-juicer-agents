@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 from vla_data_juicer_agents.training.ssh_bootstrap import RemoteExecution
 from vla_data_juicer_agents.training.worker_deployment import (
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
-    SUDO_PROMPT,
     SudoPasswordMode,
     WORKER_CENTER_CA_PATH,
     TrainingWorkerSystemDeployer,
@@ -17,6 +18,7 @@ from vla_data_juicer_agents.training.worker_deployment import (
 )
 from vla_data_juicer_agents.training.worker_deployment_ssh import (
     OpenSshWorkerDeploymentBackend,
+    _REMOTE_SUDO_BRIDGE,
 )
 
 
@@ -90,15 +92,9 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     deployment_calls = session.calls[2:]
     assert deployment_calls
     for argv, _stdin, operation_name in deployment_calls:
-        assert argv[:6] == (
-            "/usr/bin/sudo",
-            "-S",
-            "-k",
-            "-p",
-            SUDO_PROMPT,
-            "--",
-        )
-        assert argv[6:9] == ("/usr/bin/python3", "-c", argv[8])
+        assert argv[:2] == ("/usr/bin/python3", "-c")
+        assert argv[3:5] == ("/usr/bin/python3", "-c")
+        assert len(argv) == 8
         assert operation_name.startswith("deploy:")
         serialized_argv = repr(argv)
         assert SSH_PASSWORD not in serialized_argv
@@ -135,3 +131,54 @@ def test_openssh_backend_rejects_non_catalogue_privilege_command() -> None:
         assert "non-catalogue" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("non-catalogue command was accepted")
+
+
+def test_remote_sudo_bridge_keeps_password_separate_from_installer_payload(
+    tmp_path: Path,
+) -> None:
+    fake_sudo = tmp_path / "sudo"
+    fake_sudo.write_text(
+        """#!/usr/bin/env python3
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+if "-S" in arguments:
+    raise SystemExit(0 if sys.stdin.buffer.readline() == b"sudo-secret\\n" else 1)
+separator = arguments.index("--")
+completed = subprocess.run(
+    arguments[separator + 1:],
+    input=sys.stdin.buffer.read(),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+sys.stdout.buffer.write(completed.stdout)
+sys.stderr.buffer.write(completed.stderr)
+raise SystemExit(completed.returncode)
+""",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o700)
+    bridge = _REMOTE_SUDO_BRIDGE.replace("/usr/bin/sudo", str(fake_sudo))
+    payload = b"worker-artifact-binary-payload"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            bridge,
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+        input=b"sudo-secret\n" + payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == payload
+    assert b"sudo-secret" not in completed.stdout + completed.stderr
