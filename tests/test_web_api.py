@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -454,7 +455,7 @@ def test_frontend_index_served_when_dist_provided(tmp_path: Path):
     assert api_response.status_code == 200
 
 
-def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
+def test_frontend_deep_links_serve_spa_index(tmp_path: Path):
     dist = tmp_path / "dist"
     dist.mkdir()
     index = "<!doctype html><main>Annotation workspace</main>"
@@ -468,6 +469,8 @@ def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
     client = TestClient(app)
 
     for path in (
+        "/data",
+        "/data/releases",
         "/annotation",
         "/annotation/jobs",
         "/annotation/jobs/job_0123456789abcdef0123456789abcdef",
@@ -477,6 +480,7 @@ def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
         ),
         "/annotation/reviews",
         "/annotation/reviews/review_0123456789abcdef0123456789abcdef",
+        "/annotation/verified/asset_0123456789abcdef0123456789abcdef",
     ):
         response = client.get(path)
         assert response.status_code == 200
@@ -756,6 +760,57 @@ def test_navigation_dataset_summary_returns_scanned_totals_and_sync_distribution
     assert body["sync_distribution"]["image"] == 2
 
 
+def test_navigation_dataset_event_cursor_is_public_and_starts_empty(tmp_path: Path):
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/events/cursor")
+
+    assert response.status_code == 200
+    assert response.json() == {"cursor": 0}
+
+
+def test_navigation_dataset_summary_joins_annotation_lifecycle_without_changing_ingestion(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_a")
+    _write_sync_file(root, "20270605", "clip_a", "0001", "front.jpg", b"jpg-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+    created = client.app.state.annotation_store.create_job(
+        job_ref="job_" + "7" * 32,
+        dataset_date="20270605",
+        source_clips=["clip_a"],
+        calibration={
+            "profile_ref": "20260529_go2w",
+            "label": "20260529_go2w",
+            "content_sha256": "c" * 64,
+        },
+        snapshot_dir=tmp_path / "calibration",
+        snapshot_files=[],
+        reserved_bytes=1,
+        idempotency_key="dataset-summary-annotation-job",
+    )
+
+    response = client.get("/api/navigation/datasets/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    clip = body["dates"][0]["clips"][0]
+    assert clip["status"] == "synced"
+    assert clip["annotation"]["status"] == "processing"
+    assert clip["annotation"]["job_ref"] == created["job_ref"]
+    assert body["dates"][0]["annotation"]["status"] == "processing"
+    assert body["annotation_totals"] == {
+        "annotated_clip_count": 0,
+        "annotated_duration_ns": 0,
+        "verified_clip_count": 0,
+        "annotated_unit_count": 0,
+        "verified_unit_count": 0,
+    }
+
+
 def test_navigation_date_returns_clip_detail_and_raw_only_status(tmp_path: Path, monkeypatch):
     root = tmp_path / "VLADatasets"
     _write_dataset_metadata(root / "raw_data" / "20270605" / "raw_clip")
@@ -923,6 +978,73 @@ def test_navigation_invalid_request_does_not_echo_private_error(
     )
     assert str(tmp_path) not in response.text
     assert "sk-abcdefghijklmnop" not in response.text
+
+
+def test_navigation_dataset_release_api_lists_and_records_ready_date(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = make_client(tmp_path)
+    artifact = tmp_path / "finish" / "segment_trajectory_fix_five.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"frame":1}', encoding="utf-8")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    client.app.state.annotation_store.import_historical_verified_assets(
+        manifest_sha256="a" * 64,
+        assets=[
+            {
+                "dataset_date": "20260623",
+                "source_clip": "clip_a",
+                "segment_ordinal": 1,
+                "segment_total": 1,
+                "artifact_sha256": artifact_sha,
+                "private_artifact_path": str(artifact),
+            }
+        ],
+    )
+    clip = SimpleNamespace(clip="clip_a", status="synced", duration_ns=3_000)
+    date = SimpleNamespace(date="20260623", clips=[clip])
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_navigation_dataset",
+        lambda: SimpleNamespace(dates=[date]),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_navigation_date",
+        lambda requested_date: date,
+    )
+
+    listing = client.get("/api/navigation/datasets/releases")
+
+    assert listing.status_code == 200
+    candidate = listing.json()["releases"][0]
+    assert candidate["status"] == "ready"
+    assert candidate["scope_manifest_sha256"]
+
+    released = client.post(
+        "/api/navigation/datasets/releases/20260623",
+        headers={"Idempotency-Key": "release-api"},
+        json={
+            "expected_scope_manifest_sha256": candidate["scope_manifest_sha256"],
+            "note": None,
+        },
+    )
+    replay = client.post(
+        "/api/navigation/datasets/releases/20260623",
+        headers={"Idempotency-Key": "release-api"},
+        json={
+            "expected_scope_manifest_sha256": candidate["scope_manifest_sha256"],
+            "note": None,
+        },
+    )
+
+    assert released.status_code == 200
+    assert released.json()["status"] == "released"
+    assert replay.json() == released.json()
+    assert client.get("/api/navigation/datasets/releases").json()["releases"][0][
+        "status"
+    ] == "released"
 
 
 def _create_session(client: TestClient) -> str:

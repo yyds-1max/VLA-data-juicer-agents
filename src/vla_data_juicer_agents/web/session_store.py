@@ -310,6 +310,46 @@ class WebSessionStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS navigation_dataset_public_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_ref TEXT NOT NULL UNIQUE,
+                    event_kind TEXT NOT NULL CHECK (
+                        event_kind = 'navigation.task.changed'
+                    ),
+                    payload_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS navigation_dataset_public_events_no_update
+                BEFORE UPDATE ON navigation_dataset_public_events BEGIN
+                    SELECT RAISE(ABORT, 'navigation dataset public events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS navigation_dataset_public_events_no_delete
+                BEFORE DELETE ON navigation_dataset_public_events BEGIN
+                    SELECT RAISE(ABORT, 'navigation dataset public events are immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS navigation_dataset_public_event_insert
+                AFTER INSERT ON timeline_events
+                WHEN NEW.type = 'task_state_updated'
+                BEGIN
+                    INSERT INTO navigation_dataset_public_events (
+                        event_ref, event_kind, payload_json, occurred_at
+                    ) VALUES (
+                        'navigation_dataset_event_' || lower(hex(randomblob(16))),
+                        'navigation.task.changed',
+                        NEW.payload_json,
+                        COALESCE(NEW.timestamp, NEW.created_at)
+                    );
+                END;
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS web_turns (
                     id TEXT PRIMARY KEY,
                     web_session_id TEXT NOT NULL,
@@ -1164,6 +1204,75 @@ class WebSessionStore:
                 (session_id, after_seq),
             ).fetchall()
         return [self._timeline_event_from_row(row) for row in rows]
+
+    def navigation_dataset_event_cursor(self) -> int:
+        """Return the durable cursor for public data-asset invalidations."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS cursor "
+                "FROM navigation_dataset_public_events"
+            ).fetchone()
+        return int(row["cursor"])
+
+    def list_navigation_dataset_events_after(
+        self,
+        *,
+        after_seq: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Project task events into a path-free, dataset-scoped event stream."""
+
+        if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < 0:
+            raise ValueError("after_seq must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("event limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT seq, event_ref, event_kind, payload_json, occurred_at
+                FROM navigation_dataset_public_events
+                WHERE seq > ?
+                ORDER BY seq
+                LIMIT ?
+                """,
+                (after_seq, limit),
+            ).fetchall()
+
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            nested = payload.get("task")
+            task = nested if isinstance(nested, dict) else payload
+            dataset_date = task.get("dataset_date", task.get("datasetDate"))
+            if (
+                not isinstance(dataset_date, str)
+                or len(dataset_date) != 8
+                or not dataset_date.isdigit()
+            ):
+                continue
+            state_revision = task.get("state_revision", task.get("stateRevision", 0))
+            if isinstance(state_revision, bool) or not isinstance(state_revision, int):
+                state_revision = 0
+            event = {
+                "seq": int(row["seq"]),
+                "event_ref": str(row["event_ref"]),
+                "event_kind": str(row["event_kind"]),
+                "dataset_date": dataset_date,
+                "state_revision": max(state_revision, 0),
+                "occurred_at": str(row["occurred_at"]),
+            }
+            for public_field in ("task_ref", "status", "phase"):
+                value = task.get(public_field)
+                if isinstance(value, str) and value.strip():
+                    event[public_field] = value.strip()
+            events.append(event)
+        return events
 
     def append_message(
         self,

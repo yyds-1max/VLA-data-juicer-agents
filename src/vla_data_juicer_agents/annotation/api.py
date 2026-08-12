@@ -322,6 +322,10 @@ def create_annotation_router(
     def get_review(review_ref: str) -> dict[str, Any]:
         return _translate(service.get_review, review_ref)
 
+    @router.get("/verified-assets/{asset_ref}")
+    def get_historical_verified_asset(asset_ref: str) -> dict[str, Any]:
+        return _translate(service.get_historical_verified_asset, asset_ref)
+
     @router.get("/reviews/{review_ref}/evidence/trajectory")
     def get_review_trajectory_evidence(
         review_ref: str,

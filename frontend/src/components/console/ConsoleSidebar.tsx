@@ -9,7 +9,7 @@ import {
   PanelLeftOpen,
   PenTool,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import type { ConsolePageId, NavItem } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
@@ -31,8 +31,14 @@ export const consoleNavItems: NavItem[] = [
   { id: "simulation", label: "测试/仿真", group: "验证", icon: FlaskConical, path: "/simulation" },
 ];
 
+const dataManagementSubpages = [
+  { label: "数据资产", path: "/data" },
+  { label: "训练发布", path: "/data/releases" },
+] as const;
+
 export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: ConsoleSidebarProps) {
   const navigate = useNavigate();
+  const location = useLocation();
 
   return (
     <aside
@@ -110,7 +116,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                     <TooltipTrigger asChild>
                       <button
                         type="button"
-                        aria-current={activePage === item.id ? "page" : undefined}
+                        aria-current={activePage === item.id && item.id !== "data" ? "page" : undefined}
                         className={cn(
                           "flex h-11 w-max min-w-32 shrink-0 items-center gap-3 overflow-hidden rounded-xl border border-transparent bg-transparent px-3 text-left text-sm font-medium text-[#647089] transition-[color,background-color,border-color,box-shadow,padding] duration-[240ms] ease-[cubic-bezier(0.2,0,0,1)] hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:w-full md:min-w-0 md:justify-start",
                           collapsed && "md:pl-[19px] md:pr-0",
@@ -132,6 +138,34 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                     </TooltipTrigger>
                     {collapsed ? <TooltipContent side="right">{item.label}</TooltipContent> : null}
                   </Tooltip>
+                  {item.id === "data" ? (
+                    <ul
+                      aria-label="数据管理子页面"
+                      className={cn(
+                        "mt-1 flex gap-1 md:ml-5 md:max-h-20 md:translate-x-0 md:flex-col md:overflow-hidden md:border-l md:border-[#dfe3eb] md:pl-3 md:opacity-100 md:transition-[max-height,opacity,transform,margin,border-color] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+                        collapsed && "md:pointer-events-none md:mt-0 md:max-h-0 md:-translate-x-1 md:border-transparent md:opacity-0",
+                      )}
+                    >
+                      {dataManagementSubpages.map((subpage) => {
+                        const isActive = location.pathname === subpage.path;
+                        return (
+                          <li key={subpage.path}>
+                            <button
+                              type="button"
+                              aria-current={isActive ? "page" : undefined}
+                              className={cn(
+                                "relative flex h-8 w-max min-w-24 items-center whitespace-nowrap rounded-md px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 before:absolute before:-left-[13px] before:inset-y-2 before:w-0.5 before:scale-y-0 before:rounded-full before:bg-[#3156c8] before:transition-transform before:duration-150 hover:bg-white/65 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none motion-reduce:before:transition-none md:w-full md:min-w-0",
+                                isActive && "bg-white/55 font-semibold text-[#3156c8] before:scale-y-100 hover:bg-white/70 hover:text-[#2849ad]",
+                              )}
+                              onClick={() => navigate(subpage.path)}
+                            >
+                              {subpage.label}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  ) : null}
                 </li>
               ))}
             </ul>

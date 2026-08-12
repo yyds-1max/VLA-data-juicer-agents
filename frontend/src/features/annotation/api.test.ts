@@ -3,6 +3,7 @@ import {
   applyFixCommand,
   createAnnotationJob,
   createFixSession,
+  getHistoricalVerifiedAsset,
   getTrajectoryReviewEvidence,
   listTrajectoryReviews,
   mutateAnnotationJob,
@@ -117,6 +118,27 @@ test("create job sends an idempotency key and the frozen calibration hash", asyn
     calibration_profile_ref: job.calibration.profile_ref,
     calibration_content_sha256: job.calibration.content_sha256,
   });
+});
+
+test("historical verified asset detail uses an encoded public ref", async () => {
+  const asset = {
+    asset_ref: "verified_asset_0123456789abcdef0123456789abcdef",
+    dataset_date: "20260623",
+    source_clip: "20260623_145550",
+    segment_ordinal: 1,
+    segment_total: 6,
+    content_sha256: "d".repeat(64),
+    provenance: "historical_import" as const,
+    imported_at: "2026-08-09T00:00:00+00:00",
+  };
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    jsonResponse({ asset }),
+  );
+
+  await expect(getHistoricalVerifiedAsset("verified asset/a")).resolves.toEqual(asset);
+  expect(fetchMock.mock.calls[0][0]).toBe(
+    "/api/annotation/verified-assets/verified%20asset%2Fa",
+  );
 });
 
 test("draft save URL-encodes refs and carries both CAS revisions", async () => {

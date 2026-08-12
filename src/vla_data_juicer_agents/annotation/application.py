@@ -365,6 +365,9 @@ class AnnotationApplicationService:
     def get_review(self, review_ref: str) -> dict[str, Any]:
         return self.store.get_review(review_ref)
 
+    def get_historical_verified_asset(self, asset_ref: str) -> dict[str, Any]:
+        return self.store.get_historical_verified_asset(asset_ref)
+
     def _review_evidence_source(
         self,
         review_ref: str,

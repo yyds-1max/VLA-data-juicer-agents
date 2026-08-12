@@ -6,6 +6,7 @@ import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import { AnnotationDomainEventBridge } from "../features/annotation/AnnotationDomainEventBridge";
+import { NavigationDatasetEventBridge } from "../features/console/NavigationDatasetEventBridge";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
 import { cn } from "../lib/utils";
 
@@ -32,6 +33,11 @@ const AnnotationReviewsPage = lazy(() =>
 const TrajectoryFixPage = lazy(() =>
   import("../features/annotation/TrajectoryFixPage").then(
     ({ TrajectoryFixPage }) => ({ default: TrajectoryFixPage }),
+  ),
+);
+const HistoricalVerifiedAssetPage = lazy(() =>
+  import("../features/annotation/HistoricalVerifiedAssetPage").then(
+    ({ HistoricalVerifiedAssetPage }) => ({ default: HistoricalVerifiedAssetPage }),
   ),
 );
 const DataManagementPage = lazy(() =>
@@ -149,6 +155,7 @@ export function AppShell({ children }: AppShellProps) {
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
       <AnnotationDomainEventBridge />
+      <NavigationDatasetEventBridge />
       <ConsoleSidebar
         activePage={activePage}
         collapsed={sidebarCollapsed}
@@ -175,6 +182,7 @@ export function AppShell({ children }: AppShellProps) {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/data/releases" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/annotation" element={<AnnotationWorkspaceLayout />}>
               <Route index element={<Navigate to="/annotation/jobs" replace />} />
               <Route path="jobs" element={<AnnotationPage />} />
@@ -182,6 +190,7 @@ export function AppShell({ children }: AppShellProps) {
               <Route path="jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
               <Route path="reviews" element={<AnnotationReviewsPage />} />
               <Route path="reviews/:reviewRef" element={<TrajectoryFixPage />} />
+              <Route path="verified/:assetRef" element={<HistoricalVerifiedAssetPage />} />
             </Route>
             <Route path="/model/*" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />

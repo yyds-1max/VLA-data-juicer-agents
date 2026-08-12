@@ -8,6 +8,7 @@ import type {
   CalibrationProfile,
   CreateAnnotationJobRequest,
   FixCommand,
+  HistoricalVerifiedAsset,
   TrajectoryReview,
   TrajectoryReviewEvidence,
   TrajectoryReviewStatus,
@@ -247,6 +248,17 @@ export async function getTrajectoryReview(reviewRef: string): Promise<Trajectory
     reviewPath(reviewRef),
   );
   return unwrapReview(data);
+}
+
+export async function getHistoricalVerifiedAsset(
+  assetRef: string,
+): Promise<HistoricalVerifiedAsset> {
+  const data = await requestJson<
+    HistoricalVerifiedAsset | { asset: HistoricalVerifiedAsset }
+  >(
+    `${ROOT}/verified-assets/${encodeURIComponent(assetRef)}`,
+  );
+  return "asset" in data ? data.asset : data;
 }
 
 export async function getTrajectoryReviewEvidence(
