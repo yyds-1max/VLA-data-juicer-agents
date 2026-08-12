@@ -8,6 +8,7 @@ from vla_data_juicer_agents.training.ssh_bootstrap import RemoteExecution
 from vla_data_juicer_agents.training.worker_deployment import (
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
+    SUDO_PROMPT,
     SudoPasswordMode,
     WORKER_CENTER_CA_PATH,
     TrainingWorkerSystemDeployer,
@@ -89,7 +90,14 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     deployment_calls = session.calls[2:]
     assert deployment_calls
     for argv, _stdin, operation_name in deployment_calls:
-        assert argv[:6] == ("/usr/bin/sudo", "-S", "-k", "-p", "", "--")
+        assert argv[:6] == (
+            "/usr/bin/sudo",
+            "-S",
+            "-k",
+            "-p",
+            SUDO_PROMPT,
+            "--",
+        )
         assert argv[6:9] == ("/usr/bin/python3", "-c", argv[8])
         assert operation_name.startswith("deploy:")
         serialized_argv = repr(argv)

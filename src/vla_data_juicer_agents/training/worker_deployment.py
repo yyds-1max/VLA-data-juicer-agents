@@ -37,6 +37,7 @@ WORKER_CENTER_CA_PATH = f"{WORKER_CONFIG_ROOT}/center-ca.pem"
 WORKER_SYSTEMD_UNIT_PATH = "/etc/systemd/system/datapilot-training-worker.service"
 WORKER_SYSTEMD_UNIT_NAME = "datapilot-training-worker.service"
 WORKER_ARTIFACT_NAME = "datapilot-training-worker.pyz"
+SUDO_PROMPT = "DataPilot sudo password:"
 
 ROOT_IDENTITY_PROBE_ARGV = ("/usr/bin/id", "-u")
 PASSWORDLESS_SUDO_PROBE_ARGV = ("/usr/bin/sudo", "-n", "--", "/usr/bin/true")
@@ -45,7 +46,7 @@ PASSWORD_SUDO_PROBE_ARGV = (
     "-S",
     "-k",
     "-p",
-    "",
+    SUDO_PROMPT,
     "--",
     "/usr/bin/true",
 )
@@ -360,10 +361,18 @@ class TrainingWorkerSystemDeployer:
         request: WorkerDeploymentRequest,
     ) -> WorkerDeploymentResult:
         request.validate()
-        privilege = backend.inspect_privilege(
-            sudo_password_mode=request.sudo_password_mode,
-            sudo_password=request.sudo_password,
-        )
+        try:
+            privilege = backend.inspect_privilege(
+                sudo_password_mode=request.sudo_password_mode,
+                sudo_password=request.sudo_password,
+            )
+        except TrainingNodeDeploymentError:
+            raise
+        except Exception as exc:
+            raise TrainingNodeDeploymentError(
+                DEPLOYMENT_FAILED_CODE,
+                "Training Worker deployment privilege check failed",
+            ) from exc
         if privilege is DeploymentPrivilege.INSUFFICIENT:
             raise TrainingNodeDeploymentError(
                 DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE,

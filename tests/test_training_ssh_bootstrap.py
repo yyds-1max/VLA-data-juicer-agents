@@ -29,6 +29,9 @@ from vla_data_juicer_agents.training.ssh_bootstrap import (
     _probe_argv,
     _write_public_temporary_file,
 )
+from vla_data_juicer_agents.training.worker_deployment import (
+    PASSWORD_SUDO_PROBE_ARGV,
+)
 import vla_data_juicer_agents.training.ssh_bootstrap as ssh_bootstrap
 
 
@@ -358,6 +361,43 @@ def test_default_password_backend_uses_private_one_use_socket(
                 if path.is_file():
                     assert password.encode() not in path.read_bytes()
     assert session.password is None  # type: ignore[attr-defined]
+
+
+def test_password_session_accepts_fixed_sudo_argv_through_transport_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "test-only password"
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        ssh_bootstrap,
+        "_required_executable",
+        lambda _name: "/usr/bin/ssh",
+    )
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured["argv"] = argv
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout=b"0\n", stderr=b"")
+
+    monkeypatch.setattr(ssh_bootstrap.subprocess, "run", run)
+
+    with OpenSshPasswordBackend().open_password_session(
+        endpoint=_endpoint(),
+        known_hosts_line=_host_key().known_hosts_line(_endpoint()),
+        password=password,
+        connect_timeout_seconds=10,
+    ) as session:
+        result = session.run_fixed_argv(  # type: ignore[attr-defined]
+            PASSWORD_SUDO_PROBE_ARGV,
+            stdin_payload=(password + "\n").encode("utf-8"),
+            timeout_seconds=10,
+            operation_name="privilege_probe",
+        )
+
+    assert result.return_code == 0
+    assert password not in repr(captured["argv"])
+    assert password not in repr(captured["environment"])
+    assert "DataPilot sudo password:" in captured["argv"][-1]  # type: ignore[index]
 
 
 def test_host_key_observation_is_unconfirmed_and_uses_no_credentials(

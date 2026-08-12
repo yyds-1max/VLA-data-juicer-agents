@@ -163,6 +163,21 @@ def test_insufficient_deployment_account_fails_before_any_write() -> None:
     assert "current user" not in raised.value.message.lower()
 
 
+def test_privilege_probe_internal_failure_is_sanitized() -> None:
+    class BrokenProbeBackend(_FakeDeploymentBackend):
+        def inspect_privilege(self, **_kwargs):
+            raise ValueError("raw transport implementation detail")
+
+    backend = BrokenProbeBackend(DeploymentPrivilege.SUDO)
+
+    with pytest.raises(TrainingNodeDeploymentError) as raised:
+        TrainingWorkerSystemDeployer().deploy(backend, _request())
+
+    assert raised.value.code == "training_node_deployment_failed"
+    assert "raw transport" not in raised.value.message
+    assert backend.calls == []
+
+
 def test_custom_center_ca_is_installed_and_used_for_enrollment() -> None:
     backend = _FakeDeploymentBackend(DeploymentPrivilege.SUDO)
 

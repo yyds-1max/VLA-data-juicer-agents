@@ -32,6 +32,7 @@ from .worker_deployment import (
     PASSWORDLESS_SUDO_PROBE_ARGV,
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
+    SUDO_PROMPT,
     ServiceAccountSpec,
     SudoPasswordMode,
     TrainingNodeDeploymentError,
@@ -557,7 +558,14 @@ class OpenSshWorkerDeploymentBackend:
             if self._effective_sudo_password is None:
                 prefix = ("/usr/bin/sudo", "-n", "--")
             else:
-                prefix = ("/usr/bin/sudo", "-S", "-k", "-p", "", "--")
+                prefix = (
+                    "/usr/bin/sudo",
+                    "-S",
+                    "-k",
+                    "-p",
+                    SUDO_PROMPT,
+                    "--",
+                )
                 stdin = self._effective_sudo_password.encode("utf-8") + b"\n" + payload
             remote_argv = prefix + installer_argv
         else:
