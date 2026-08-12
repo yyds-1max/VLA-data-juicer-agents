@@ -207,7 +207,16 @@ elif operation == "enroll":
         "--center-base-url", arguments["center_base_url"], "--node-ref",
         arguments["node_ref"], "--enrollment-token-stdin", "--once",
     ]
-    subprocess.run(command, input=token + b"\n", check=True)
+    environment = os.environ.copy()
+    center_ca_path = arguments.get("center_ca_path")
+    if center_ca_path:
+        environment["DATAPILOT_CENTER_CA_CERT_PATH"] = center_ca_path
+    subprocess.run(
+        command,
+        input=token + b"\n",
+        check=True,
+        env=environment,
+    )
     output(True)
 elif operation == "start_service":
     unit = arguments["unit_name"]
@@ -438,6 +447,7 @@ class OpenSshWorkerDeploymentBackend:
         center_base_url: str,
         node_ref: str,
         enrollment_token: str,
+        center_ca_path: str | None,
         run_as: str,
         privilege: DeploymentPrivilege,
     ) -> bool:
@@ -448,6 +458,7 @@ class OpenSshWorkerDeploymentBackend:
                 "state_directory": state_directory,
                 "center_base_url": center_base_url,
                 "node_ref": node_ref,
+                "center_ca_path": center_ca_path,
                 "run_as": run_as,
             },
             payload=enrollment_token.encode("utf-8"),

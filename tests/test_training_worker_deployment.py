@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from vla_data_juicer_agents.training.worker_deployment import (
     SYSTEM_DIRECTORIES,
     SYSTEMD_UNIT,
     WORKER_ACCOUNT,
+    WORKER_CENTER_CA_PATH,
     WORKER_CONFIG_ROOT,
     WORKER_CURRENT_LINK,
     WORKER_ENVIRONMENT_PATH,
@@ -34,6 +36,7 @@ from vla_data_juicer_agents.training.worker_deployment import (
 ARTIFACT = b"test-only executable worker artifact"
 DIGEST = hashlib.sha256(ARTIFACT).hexdigest()
 ENROLLMENT_TOKEN = "enroll_" + "e" * 48
+TEST_CENTER_CA = (Path(__file__).parent / "fixtures" / "training_center_ca.pem").read_bytes()
 
 
 def _request(**overrides: object) -> WorkerDeploymentRequest:
@@ -158,6 +161,40 @@ def test_insufficient_deployment_account_fails_before_any_write() -> None:
     ]
     assert "manual" not in raised.value.message.lower()
     assert "current user" not in raised.value.message.lower()
+
+
+def test_custom_center_ca_is_installed_and_used_for_enrollment() -> None:
+    backend = _FakeDeploymentBackend(DeploymentPrivilege.SUDO)
+
+    result = TrainingWorkerSystemDeployer().deploy(
+        backend,
+        _request(center_ca_certificate=TEST_CENTER_CA),
+    )
+
+    assert "center_ca_certificate" in result.changed_steps
+    files = [call[1] for call in backend.calls if call[0] == "write_managed_file"]
+    files_by_path = {spec.path: (spec, content) for spec, content in files}
+    ca_spec, ca_content = files_by_path[WORKER_CENTER_CA_PATH]
+    assert ca_spec.mode == 0o640
+    assert ca_content == TEST_CENTER_CA
+    environment = files_by_path[WORKER_ENVIRONMENT_PATH][1]
+    assert f"DATAPILOT_CENTER_CA_CERT_PATH={WORKER_CENTER_CA_PATH}".encode() in environment
+    enroll_call = next(call for call in backend.calls if call[0] == "enroll_worker")
+    assert enroll_call[1]["center_ca_path"] == WORKER_CENTER_CA_PATH
+    assert TEST_CENTER_CA.decode() not in repr(_request(center_ca_certificate=TEST_CENTER_CA))
+
+
+def test_invalid_center_ca_is_rejected_before_remote_writes() -> None:
+    backend = _FakeDeploymentBackend(DeploymentPrivilege.SUDO)
+
+    with pytest.raises(TrainingNodeDeploymentError) as raised:
+        TrainingWorkerSystemDeployer().deploy(
+            backend,
+            _request(center_ca_certificate=b"not a certificate"),
+        )
+
+    assert raised.value.code == "training_node_deployment_invalid_request"
+    assert backend.calls == []
 
 
 class _PrivilegeRunner:

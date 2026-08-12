@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 from vla_data_juicer_agents.training.ssh_bootstrap import RemoteExecution
 from vla_data_juicer_agents.training.worker_deployment import (
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
     SudoPasswordMode,
+    WORKER_CENTER_CA_PATH,
     TrainingWorkerSystemDeployer,
     WorkerDeploymentRequest,
     WorkerRelease,
@@ -20,6 +22,7 @@ from vla_data_juicer_agents.training.worker_deployment_ssh import (
 ARTIFACT = b"test-only worker zip application"
 SSH_PASSWORD = "ssh-test-password"
 ENROLLMENT_TOKEN = "enroll_" + "x" * 48
+TEST_CENTER_CA = (Path(__file__).parent / "fixtures" / "training_center_ca.pem").read_bytes()
 
 
 class _FakeFixedSshSession:
@@ -68,6 +71,7 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
             center_base_url="https://datapilot.example.internal",
             node_ref="node_adapter01",
             enrollment_token=ENROLLMENT_TOKEN,
+            center_ca_certificate=TEST_CENTER_CA,
             sudo_password_mode=SudoPasswordMode.SAME_AS_SSH,
         ),
     )
@@ -98,6 +102,14 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     assert release_call[1] == (SSH_PASSWORD + "\n").encode() + ARTIFACT
     enroll_call = next(call for call in deployment_calls if call[2] == "deploy:enroll")
     assert enroll_call[1] == (SSH_PASSWORD + "\n" + ENROLLMENT_TOKEN).encode()
+    assert json.loads(enroll_call[0][-1])["center_ca_path"] == WORKER_CENTER_CA_PATH
+    ca_call = next(
+        call
+        for call in deployment_calls
+        if call[2] == "deploy:write_file"
+        and json.loads(call[0][-1])["path"] == WORKER_CENTER_CA_PATH
+    )
+    assert ca_call[1] == (SSH_PASSWORD + "\n").encode() + TEST_CENTER_CA
     backend.clear_ephemeral_credentials()
     assert SSH_PASSWORD not in repr(backend)
 

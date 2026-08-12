@@ -97,6 +97,22 @@ def _password_worker_deployment_context(
     )
 
 
+def _load_training_center_ca_certificate(path: str | None) -> bytes | None:
+    if path is None:
+        return None
+    try:
+        certificate = Path(path).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(
+            "configured Training center CA certificate is unavailable"
+        ) from exc
+    if not 1 <= len(certificate) <= 256 * 1024:
+        raise RuntimeError(
+            "configured Training center CA certificate has an unsupported size"
+        )
+    return certificate
+
+
 def create_app(
     working_dir: str | None = None,
     model: str | None = None,
@@ -175,6 +191,9 @@ def create_app(
         node_deployment_manager = (
             AutomatedNodeDeploymentManager(
                 center_base_url=training_settings.center_base_url,
+                center_ca_certificate=_load_training_center_ca_certificate(
+                    training_settings.center_ca_certificate_path
+                ),
                 backend_factory=_password_worker_deployment_context,
             )
             if training_settings.center_base_url is not None

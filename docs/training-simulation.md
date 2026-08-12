@@ -134,6 +134,19 @@ Worker HTTP 客户端只允许固定中心 origin 上的 enroll 和 heartbeat �
 export VLA_TRAINING_CENTER_BASE_URL=https://datapilot.example.internal
 ```
 
+只有公网 IP、没有公共 CA 证书时，可以为中心入口签发带 IP SAN 的内部 TLS 证书，并配置
+其 CA 公钥证书路径：
+
+```bash
+export VLA_TRAINING_CENTER_BASE_URL=https://120.202.207.116:8777
+export VLA_TRAINING_CENTER_CA_CERT_PATH=/path/to/training-center-ca.pem
+```
+
+中心只读取 CA 公钥证书；CA 私钥和中心服务私钥不进入应用配置。一次性 SSH 部署会把
+CA 公钥证书安装为 `/etc/datapilot-training-worker/center-ca.pem`，首次注册和长期
+systemd 心跳都使用该证书验证中心身份。未配置自定义 CA 时，Worker 使用操作系统默认
+的公共 CA 信任库。无论哪种模式，都不会关闭 TLS 证书或主机名验证。
+
 用户登记节点后点击“部署 Worker”，页面先读取未受信任的 SSH host key 并显示
 `SHA256:...` 指纹。用户必须通过可信渠道核对并明确确认；实际连接随后固定该 public
 key，强制 `StrictHostKeyChecking=yes`，不会把首次扫描结果直接当作可信身份。

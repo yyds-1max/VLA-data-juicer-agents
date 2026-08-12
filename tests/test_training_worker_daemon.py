@@ -4,6 +4,7 @@ import json
 from io import StringIO
 import os
 from pathlib import Path
+import ssl
 import stat
 from urllib.error import HTTPError
 
@@ -31,7 +32,10 @@ from vla_data_juicer_agents.training_worker.resources import (
     ResourceCollector,
 )
 import vla_data_juicer_agents.training_worker.resources as worker_resources
-from vla_data_juicer_agents.training_worker.cli import _read_enrollment_token
+from vla_data_juicer_agents.training_worker.cli import (
+    _center_ssl_context,
+    _read_enrollment_token,
+)
 
 
 def test_worker_identity_is_stable_private_and_not_publicly_serialized(tmp_path: Path) -> None:
@@ -236,6 +240,28 @@ def test_enrollment_token_is_read_from_stdin_and_never_needs_argv() -> None:
     assert _read_enrollment_token(StringIO(token + "\n")) == token
     with pytest.raises(SystemExit, match="valid enrollment token"):
         _read_enrollment_token(StringIO("not-a-token\n"))
+
+
+def test_worker_loads_configured_center_ca_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certificate = Path(__file__).parent / "fixtures" / "training_center_ca.pem"
+    monkeypatch.setenv("DATAPILOT_CENTER_CA_CERT_PATH", str(certificate))
+
+    context = _center_ssl_context()
+
+    assert context is not None
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+
+
+def test_worker_rejects_unavailable_center_ca_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATAPILOT_CENTER_CA_CERT_PATH", "/missing/center-ca.pem")
+
+    with pytest.raises(SystemExit, match="could not be loaded"):
+        _center_ssl_context()
 
 
 class _FakeResponse:

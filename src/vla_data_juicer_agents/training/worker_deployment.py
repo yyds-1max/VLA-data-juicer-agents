@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+import ssl
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -32,6 +33,7 @@ WORKER_CURRENT_LINK = f"{WORKER_OPT_ROOT}/current"
 WORKER_STATE_ROOT = "/var/lib/datapilot-training-worker"
 WORKER_CONFIG_ROOT = "/etc/datapilot-training-worker"
 WORKER_ENVIRONMENT_PATH = f"{WORKER_CONFIG_ROOT}/worker.env"
+WORKER_CENTER_CA_PATH = f"{WORKER_CONFIG_ROOT}/center-ca.pem"
 WORKER_SYSTEMD_UNIT_PATH = "/etc/systemd/system/datapilot-training-worker.service"
 WORKER_SYSTEMD_UNIT_NAME = "datapilot-training-worker.service"
 WORKER_ARTIFACT_NAME = "datapilot-training-worker.pyz"
@@ -229,12 +231,14 @@ class WorkerDeploymentRequest:
     center_base_url: str
     node_ref: str
     enrollment_token: str | None = field(default=None, repr=False)
+    center_ca_certificate: bytes | None = field(default=None, repr=False)
     sudo_password_mode: SudoPasswordMode = SudoPasswordMode.SAME_AS_SSH
     sudo_password: str | None = field(default=None, repr=False)
 
     def validate(self) -> None:
         self.release.validate()
         _validate_center_base_url(self.center_base_url)
+        _validate_center_ca_certificate(self.center_ca_certificate)
         if not re.fullmatch(r"node_[A-Za-z0-9_-]{8,120}", self.node_ref):
             _invalid("Training node reference has an unsupported format")
         if self.enrollment_token is not None and not re.fullmatch(
@@ -327,6 +331,7 @@ class SystemWorkerDeploymentBackend(Protocol):
         center_base_url: str,
         node_ref: str,
         enrollment_token: str,
+        center_ca_path: str | None,
         run_as: str,
         privilege: DeploymentPrivilege,
     ) -> bool: ...
@@ -402,6 +407,20 @@ class TrainingWorkerSystemDeployer:
                     privilege=privilege,
                 ),
             )
+            if request.center_ca_certificate is not None:
+                record(
+                    "center_ca_certificate",
+                    backend.write_managed_file(
+                        ManagedFileSpec(
+                            WORKER_CENTER_CA_PATH,
+                            "root",
+                            WORKER_GROUP,
+                            0o640,
+                        ),
+                        request.center_ca_certificate,
+                        privilege=privilege,
+                    ),
+                )
             environment = _environment_content(request)
             record(
                 "configuration",
@@ -453,6 +472,11 @@ class TrainingWorkerSystemDeployer:
                         center_base_url=request.center_base_url,
                         node_ref=request.node_ref,
                         enrollment_token=request.enrollment_token,
+                        center_ca_path=(
+                            WORKER_CENTER_CA_PATH
+                            if request.center_ca_certificate is not None
+                            else None
+                        ),
                         run_as=WORKER_ACCOUNT,
                         privilege=privilege,
                     ),
@@ -497,10 +521,13 @@ class TrainingWorkerSystemDeployer:
 
 def _environment_content(request: WorkerDeploymentRequest) -> bytes:
     # Validation restricts values to single-line, EnvironmentFile-safe tokens.
-    return (
+    content = (
         f"DATAPILOT_CENTER_BASE_URL={request.center_base_url}\n"
         f"DATAPILOT_NODE_REF={request.node_ref}\n"
-    ).encode("utf-8")
+    )
+    if request.center_ca_certificate is not None:
+        content += f"DATAPILOT_CENTER_CA_CERT_PATH={WORKER_CENTER_CA_PATH}\n"
+    return content.encode("utf-8")
 
 
 def _validate_center_base_url(value: str) -> None:
@@ -521,6 +548,19 @@ def _validate_center_base_url(value: str) -> None:
         _invalid("Worker center URL must be an HTTPS origin without credentials")
     if not re.fullmatch(r"https://[A-Za-z0-9.:[\]_-]+(?::[0-9]{1,5})?/?", value):
         _invalid("Worker center URL contains unsupported characters")
+
+
+def _validate_center_ca_certificate(value: bytes | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, bytes) or not 1 <= len(value) <= 256 * 1024:
+        _invalid("Worker center CA certificate has an unsupported size")
+    try:
+        certificate = value.decode("ascii")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cadata=certificate)
+    except (UnicodeDecodeError, ssl.SSLError, ValueError):
+        _invalid("Worker center CA certificate is not valid PEM")
 
 
 def _valid_password(value: str | None) -> bool:
@@ -547,6 +587,7 @@ __all__ = [
     "SystemWorkerDeploymentBackend",
     "TrainingNodeDeploymentError",
     "TrainingWorkerSystemDeployer",
+    "WORKER_CENTER_CA_PATH",
     "WorkerDeploymentRequest",
     "WorkerDeploymentResult",
     "WorkerRelease",

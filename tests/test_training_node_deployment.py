@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,9 @@ from vla_data_juicer_agents.training.node_deployment import (
 )
 from vla_data_juicer_agents.training.ssh_bootstrap import SshTransportError
 from vla_data_juicer_agents.training.worker_deployment import WorkerRelease
+
+
+TEST_CENTER_CA = (Path(__file__).parent / "fixtures" / "training_center_ca.pem").read_bytes()
 
 
 def _host_key() -> dict[str, str]:
@@ -65,6 +69,7 @@ def test_deployment_manager_scopes_backend_to_one_context() -> None:
     )
     manager = AutomatedNodeDeploymentManager(
         center_base_url="https://center.example.internal",
+        center_ca_certificate=TEST_CENTER_CA,
         backend_factory=factory,
         release_builder=lambda: release,
     )
@@ -82,6 +87,7 @@ def test_deployment_manager_scopes_backend_to_one_context() -> None:
     assert lifecycle == ["entered", "exited"]
     assert result["worker_version"] == "0.1.0"
     assert seen["ssh_password"] == "one-use-password"
+    assert seen["request"].center_ca_certificate == TEST_CENTER_CA
 
 
 def test_deployment_manager_translates_sanitized_ssh_failure() -> None:

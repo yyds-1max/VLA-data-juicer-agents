@@ -82,6 +82,8 @@ Environment:
                         Optional absolute training SQLite path. Default: WORKING_DIR/training.sqlite.
   VLA_TRAINING_CENTER_BASE_URL
                         Public HTTPS origin reachable by Training Workers. Required for Worker deployment.
+  VLA_TRAINING_CENTER_CA_CERT_PATH
+                        Optional PEM CA certificate used when the center has a private TLS certificate.
   WEB_CMD               Override vla-data-agent-web command path.
   RUN_WEB_CONTROL_PYTHON
                         Python 3 used for safe PID/control operations.

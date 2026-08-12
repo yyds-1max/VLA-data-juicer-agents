@@ -43,11 +43,13 @@ class AutomatedNodeDeploymentManager:
         self,
         *,
         center_base_url: str,
+        center_ca_certificate: bytes | None = None,
         backend_factory: DeploymentBackendContextFactory,
         host_key_observer: OpenSshHostKeyObserver | None = None,
         release_builder: Callable[[], Any] = build_training_worker_release,
     ) -> None:
         self._center_base_url = center_base_url
+        self._center_ca_certificate = center_ca_certificate
         self._backend_factory = backend_factory
         self._host_key_observer = host_key_observer or OpenSshHostKeyObserver()
         self._release_builder = release_builder
@@ -105,6 +107,7 @@ class AutomatedNodeDeploymentManager:
             center_base_url=self._center_base_url,
             node_ref=str(node["node_ref"]),
             enrollment_token=enrollment_token,
+            center_ca_certificate=self._center_ca_certificate,
             sudo_password_mode=SudoPasswordMode(sudo_password_mode),
             sudo_password=sudo_password,
         )

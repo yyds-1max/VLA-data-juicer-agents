@@ -49,6 +49,7 @@ class TrainingSettings:
     simulation_enabled: bool = True
     development_admin: bool = False
     center_base_url: str | None = None
+    center_ca_certificate_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.development_admin and not self.simulation_enabled:
@@ -76,6 +77,21 @@ class TrainingSettings:
                 raise ValueError(
                     "VLA_TRAINING_CENTER_BASE_URL must be a valid HTTPS origin"
                 )
+        if self.center_ca_certificate_path is not None:
+            if self.center_base_url is None:
+                raise ValueError(
+                    "VLA_TRAINING_CENTER_CA_CERT_PATH requires VLA_TRAINING_CENTER_BASE_URL"
+                )
+            if (
+                len(self.center_ca_certificate_path) > 4096
+                or any(
+                    character in self.center_ca_certificate_path
+                    for character in ("\x00", "\r", "\n")
+                )
+            ):
+                raise ValueError(
+                    "VLA_TRAINING_CENTER_CA_CERT_PATH must be a valid file path"
+                )
 
     @classmethod
     def from_env(cls) -> TrainingSettings:
@@ -84,6 +100,10 @@ class TrainingSettings:
             development_admin=_env_bool("VLA_TRAINING_DEV_ADMIN", False),
             center_base_url=(
                 os.environ.get("VLA_TRAINING_CENTER_BASE_URL", "").strip() or None
+            ),
+            center_ca_certificate_path=(
+                os.environ.get("VLA_TRAINING_CENTER_CA_CERT_PATH", "").strip()
+                or None
             ),
         )
 

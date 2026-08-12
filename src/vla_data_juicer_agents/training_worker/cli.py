@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import ssl
 import sys
 from typing import Sequence
 
@@ -76,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             worker_token=worker_token,
             node_ref=node_ref,
             timeout_seconds=args.request_timeout_seconds,
+            ssl_context=_center_ssl_context(),
         )
         if enrollment_token:
             if worker_token is not None:
@@ -119,6 +121,23 @@ def _default_state_dir() -> Path:
 
 def parser_error(message: str) -> None:
     raise SystemExit(message)
+
+
+def _center_ssl_context() -> ssl.SSLContext | None:
+    certificate_path = os.environ.get("DATAPILOT_CENTER_CA_CERT_PATH")
+    if certificate_path is None:
+        return None
+    if (
+        not certificate_path
+        or len(certificate_path) > 4096
+        or any(character in certificate_path for character in ("\x00", "\r", "\n"))
+    ):
+        parser_error("configured center CA certificate path is invalid")
+    try:
+        return ssl.create_default_context(cafile=certificate_path)
+    except (OSError, ssl.SSLError, ValueError):
+        parser_error("configured center CA certificate could not be loaded")
+    return None
 
 
 def _read_enrollment_token(stream: io.TextIOBase | None = None) -> str:

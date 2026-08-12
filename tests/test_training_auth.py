@@ -16,6 +16,7 @@ def test_training_auth_defaults_to_read_only(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("VLA_TRAINING_DEV_ADMIN", raising=False)
     monkeypatch.delenv("VLA_TRAINING_SIMULATION_ENABLED", raising=False)
     monkeypatch.delenv("VLA_TRAINING_CENTER_BASE_URL", raising=False)
+    monkeypatch.delenv("VLA_TRAINING_CENTER_CA_CERT_PATH", raising=False)
 
     settings = TrainingSettings.from_env()
     principal = settings.principal()
@@ -70,4 +71,25 @@ def test_training_center_url_must_be_an_https_origin(
     )
     assert TrainingSettings.from_env().center_base_url == (
         "https://center.example:8443"
+    )
+
+
+def test_training_center_ca_path_requires_center_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLA_TRAINING_CENTER_BASE_URL", raising=False)
+    monkeypatch.setenv(
+        "VLA_TRAINING_CENTER_CA_CERT_PATH",
+        "/etc/datapilot/center-ca.pem",
+    )
+
+    with pytest.raises(ValueError, match="requires VLA_TRAINING_CENTER_BASE_URL"):
+        TrainingSettings.from_env()
+
+    monkeypatch.setenv(
+        "VLA_TRAINING_CENTER_BASE_URL",
+        "https://120.202.207.116:8777",
+    )
+    assert TrainingSettings.from_env().center_ca_certificate_path == (
+        "/etc/datapilot/center-ca.pem"
     )

@@ -82,6 +82,7 @@ def test_fixed_config_loads_allowlisted_string_values(
             "VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS": "21600",
             "VLA_TRAINING_DEV_ADMIN": "0",
             "VLA_TRAINING_SIMULATION_ENABLED": "1",
+            "VLA_TRAINING_CENTER_CA_CERT_PATH": "/srv/tls/center-ca.pem",
         },
     )
     monkeypatch.setenv("HOME", str(home))
@@ -92,6 +93,7 @@ def test_fixed_config_loads_allowlisted_string_values(
         "VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS": "21600",
         "VLA_TRAINING_DEV_ADMIN": "0",
         "VLA_TRAINING_SIMULATION_ENABLED": "1",
+        "VLA_TRAINING_CENTER_CA_CERT_PATH": "/srv/tls/center-ca.pem",
     }
 
 
