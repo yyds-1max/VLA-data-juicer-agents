@@ -77,6 +77,10 @@ class TrainingServiceProtocol(Protocol):
         self, node_ref: str, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
+    def preflight_node_worker(
+        self, node_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
     def enroll_node(self, payload: Any) -> dict[str, Any]: ...
 
     def heartbeat_node(
@@ -270,6 +274,38 @@ class DeployTrainingNodeWorkerRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_credentials(self) -> DeployTrainingNodeWorkerRequest:
+        ssh_password = self.ssh_password.get_secret_value()
+        if (
+            not ssh_password
+            or len(ssh_password) > 1024
+            or any(character in ssh_password for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("SSH credential has an unsupported format")
+        if self.sudo_password_mode == "separate":
+            if self.sudo_password is None:
+                raise ValueError("a separate sudo password is required")
+            sudo_password = self.sudo_password.get_secret_value()
+            if (
+                not sudo_password
+                or len(sudo_password) > 1024
+                or any(character in sudo_password for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("sudo credential has an unsupported format")
+        elif self.sudo_password is not None:
+            raise ValueError("sudo_password is only valid in separate mode")
+        return self
+
+
+class RemoveTrainingNodeWorkerRequest(StrictRequest):
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    ssh_password: SecretStr
+    sudo_password_mode: Literal["same_as_ssh", "separate", "not_required"] = (
+        "same_as_ssh"
+    )
+    sudo_password: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> RemoveTrainingNodeWorkerRequest:
         ssh_password = self.ssh_password.get_secret_value()
         if (
             not ssh_password
@@ -609,6 +645,7 @@ class LaunchTemplate(StrictRequest):
     domain: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.-]+$")
     server_ref: str = Field(min_length=1, max_length=200)
     working_directory: str = Field(min_length=1, max_length=1000)
+    launcher_kind: Literal["torchrun", "direct"] = "direct"
     executable: str = Field(min_length=1, max_length=500)
     entrypoint: str = Field(min_length=1, max_length=1000)
     fixed_argv: list[str] = Field(default_factory=list, max_length=200)
@@ -621,6 +658,19 @@ class LaunchTemplate(StrictRequest):
         default_factory=RuntimeEnvironment
     )
     monitoring: MonitoringContract = Field(default_factory=MonitoringContract)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_launcher_kind(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "launcher_kind" not in value:
+            executable = str(value.get("executable", ""))
+            value = dict(value)
+            value["launcher_kind"] = (
+                "torchrun"
+                if executable.rsplit("/", 1)[-1] == "torchrun"
+                else "direct"
+            )
+        return value
 
     @field_validator("server_ref")
     @classmethod
@@ -960,6 +1010,34 @@ def create_training_router(
         response.headers["Cache-Control"] = "no-store"
         return _translate(
             service.deploy_node_worker,
+            node_ref,
+            request,
+            get_principal(),
+        )
+
+    @router.post("/nodes/{node_ref}/preflight-worker")
+    def preflight_node_worker(
+        node_ref: str,
+        request: DeployTrainingNodeWorkerRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _translate(
+            service.preflight_node_worker,
+            node_ref,
+            request,
+            get_principal(),
+        )
+
+    @router.post("/nodes/{node_ref}/remove-worker")
+    def remove_node_worker(
+        node_ref: str,
+        request: RemoveTrainingNodeWorkerRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _translate(
+            service.remove_node_worker,
             node_ref,
             request,
             get_principal(),
@@ -1308,6 +1386,10 @@ def _server_projection(server: dict[str, Any]) -> dict[str, Any]:
         "name": server.get("name", server.get("label", server["server_ref"])),
         "kind": kind,
         "gpu_count": int(server.get("gpu_count", 0)),
+        "status": server.get("status"),
+        "online": bool(server.get("online", False)),
+        "available": bool(server.get("available", server.get("online", False))),
+        "stale": bool(server.get("stale", False)),
     }
 
 
@@ -1318,7 +1400,7 @@ def _resources_projection(
     if isinstance(sampled_at, (int, float)):
         sampled_at = datetime.fromtimestamp(sampled_at, UTC).isoformat()
     elif not isinstance(sampled_at, str):
-        sampled_at = datetime.now(UTC).isoformat()
+        sampled_at = None
     gpus = []
     for gpu in resources.get("gpus", []):
         gpus.append(
@@ -1343,6 +1425,7 @@ def _resources_projection(
     return {
         "server": _server_projection(server),
         "sampled_at": sampled_at,
+        "stale": bool(resources.get("stale", False)),
         "gpus": gpus,
     }
 
@@ -1428,15 +1511,24 @@ def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_spec_projection(spec: dict[str, Any]) -> dict[str, Any]:
+    launcher_kind = spec.get("launcher_kind", "torchrun")
+    master_port = spec.get("master_port")
+    master_addr = spec.get("master_addr")
+    node_rank = spec.get("node_rank")
     return {
         "contract_version": int(spec.get("contract_version", spec.get("version", 1))),
         "execution_mode": spec.get("execution_mode", spec.get("mode", "simulation")),
         "server_ref": spec["server_ref"],
         "gpu_uuids": spec.get("gpu_uuids", []),
         "nnodes": int(spec.get("nnodes", 1)),
-        "master_addr": spec.get("master_addr", "127.0.0.1"),
-        "master_port": int(spec.get("master_port", 0)),
-        "node_rank": int(spec.get("node_rank", 0)),
+        "launcher_kind": launcher_kind,
+        "master_addr": (
+            master_addr
+            if master_addr is not None
+            else "127.0.0.1" if launcher_kind == "torchrun" else None
+        ),
+        "master_port": int(master_port) if master_port is not None else None,
+        "node_rank": int(node_rank) if node_rank is not None else None,
         "nproc_per_node": int(spec.get("nproc_per_node", 0)),
         "environment": spec.get("environment", {}),
         "runtime_environment": spec.get(

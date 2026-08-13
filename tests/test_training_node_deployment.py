@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +13,17 @@ from vla_data_juicer_agents.training.errors import TrainingValidationError
 from vla_data_juicer_agents.training.node_deployment import (
     AutomatedNodeDeploymentManager,
 )
-from vla_data_juicer_agents.training.ssh_bootstrap import SshTransportError
-from vla_data_juicer_agents.training.worker_deployment import WorkerRelease
+from vla_data_juicer_agents.training.ssh_bootstrap import (
+    PreflightProbe,
+    PreflightReport,
+    ProbeAvailability,
+    ProbeResult,
+    SshTransportError,
+)
+from vla_data_juicer_agents.training.worker_deployment import (
+    DeploymentPrivilege,
+    WorkerRelease,
+)
 
 
 TEST_CENTER_CA = (Path(__file__).parent / "fixtures" / "training_center_ca.pem").read_bytes()
@@ -42,10 +52,42 @@ def _node() -> dict[str, object]:
     }
 
 
+class _PassingPreflightService:
+    def run_password_preflight(self, **kwargs: object) -> PreflightReport:
+        endpoint = kwargs["endpoint"]
+        outputs = {
+            PreflightProbe.OPERATING_SYSTEM: "Linux",
+            PreflightProbe.ARCHITECTURE: "x86_64",
+            PreflightProbe.PYTHON: "Python 3.11.9",
+        }
+        return PreflightReport(
+            endpoint=endpoint,  # type: ignore[arg-type]
+            install_directory=str(kwargs["install_directory"]),
+            read_only=True,
+            credential_mode="ephemeral_password",
+            completed_at=datetime.now(timezone.utc),
+            probes=tuple(
+                ProbeResult(
+                    probe=probe,
+                    availability=ProbeAvailability.AVAILABLE,
+                    return_code=0,
+                    stdout=outputs.get(probe, probe.value),
+                    stderr="",
+                )
+                for probe in PreflightProbe
+            ),
+        )
+
+
+class _DeploymentBackend:
+    def inspect_privilege(self, **_kwargs: object) -> DeploymentPrivilege:
+        return DeploymentPrivilege.SUDO
+
+
 def test_deployment_manager_scopes_backend_to_one_context() -> None:
     lifecycle: list[str] = []
     seen: dict[str, object] = {}
-    backend = object()
+    backend = _DeploymentBackend()
 
     @contextmanager
     def factory(**kwargs: object):
@@ -71,6 +113,7 @@ def test_deployment_manager_scopes_backend_to_one_context() -> None:
         center_base_url="https://center.example.internal",
         center_ca_certificate=TEST_CENTER_CA,
         backend_factory=factory,
+        preflight_service=_PassingPreflightService(),  # type: ignore[arg-type]
         release_builder=lambda: release,
     )
     manager._deployer = Deployer()  # type: ignore[assignment]
@@ -84,10 +127,58 @@ def test_deployment_manager_scopes_backend_to_one_context() -> None:
         enrollment_token="enroll_" + "x" * 48,
     )
 
-    assert lifecycle == ["entered", "exited"]
+    assert lifecycle == ["entered", "exited", "entered", "exited"]
     assert result["worker_version"] == "0.1.0"
     assert seen["ssh_password"] == "one-use-password"
     assert seen["request"].center_ca_certificate == TEST_CENTER_CA
+
+
+def test_removal_manager_reuses_the_confirmed_host_pin_and_one_ssh_context() -> None:
+    lifecycle: list[str] = []
+    seen: dict[str, object] = {}
+    backend = object()
+
+    @contextmanager
+    def factory(**kwargs: object):
+        seen.update(kwargs)
+        lifecycle.append("entered")
+        try:
+            yield backend
+        finally:
+            lifecycle.append("exited")
+
+    class Remover:
+        def remove(self, actual_backend: object, request: object) -> object:
+            assert actual_backend is backend
+            seen["request"] = request
+            return SimpleNamespace(removed=True)
+
+    manager = AutomatedNodeDeploymentManager(
+        center_base_url="https://center.example.internal",
+        backend_factory=factory,
+    )
+    manager._remover = Remover()  # type: ignore[assignment]
+    node = _node()
+    pin = _host_key()
+    node.update(
+        {
+            "host_key_algorithm": pin["algorithm"],
+            "host_public_key": pin["public_key"],
+            "host_key_fingerprint": pin["sha256_fingerprint"],
+        }
+    )
+
+    result = manager.remove_worker(
+        node=node,
+        ssh_password="one-use-removal-password",
+        sudo_password_mode="same_as_ssh",
+        sudo_password=None,
+    )
+
+    assert result["message"] == "Training Worker removed from the node."
+    assert lifecycle == ["entered", "exited"]
+    assert seen["ssh_password"] == "one-use-removal-password"
+    assert seen["request"].node_ref == "node_context01"
 
 
 def test_deployment_manager_translates_sanitized_ssh_failure() -> None:
@@ -99,6 +190,7 @@ def test_deployment_manager_translates_sanitized_ssh_failure() -> None:
     manager = AutomatedNodeDeploymentManager(
         center_base_url="https://center.example.internal",
         backend_factory=unavailable,
+        preflight_service=_PassingPreflightService(),  # type: ignore[arg-type]
         release_builder=lambda: WorkerRelease(
             version="0.1.0",
             sha256=hashlib.sha256(b"worker").hexdigest(),

@@ -64,10 +64,8 @@ class _FakeSession:
         timeout_seconds: int,
     ) -> RemoteExecution:
         self.calls.append((probe, install_directory, timeout_seconds))
-        if probe is PreflightProbe.SYSTEMD_USER:
-            return RemoteExecution(1, b"degraded\n", b"")
-        if probe is PreflightProbe.SYSTEMD_LINGER:
-            return RemoteExecution(0, b"no\n", b"")
+        if probe is PreflightProbe.SYSTEMD_SYSTEM:
+            return RemoteExecution(0, b"systemd 255\n", b"")
         if probe is PreflightProbe.NVIDIA_SMI:
             return RemoteExecution(
                 0,
@@ -152,9 +150,8 @@ def test_preflight_uses_only_fixed_read_only_probe_catalogue() -> None:
     assert report.read_only is True
     assert report.credential_mode == "ephemeral_private_key"
     by_probe = {result.probe: result for result in report.probes}
-    assert by_probe[PreflightProbe.SYSTEMD_USER].availability == "unavailable"
-    assert by_probe[PreflightProbe.SYSTEMD_LINGER].availability == "unavailable"
-    assert by_probe[PreflightProbe.SYSTEMD_LINGER].stdout == "no"
+    assert by_probe[PreflightProbe.SYSTEMD_SYSTEM].availability == "available"
+    assert by_probe[PreflightProbe.SYSTEMD_SYSTEM].stdout == "systemd 255"
     assert by_probe[PreflightProbe.NVIDIA_SMI].stdout.startswith("0, GPU-test")
     assert backend.known_hosts_line == (
         f"[192.0.2.10]:2222 ssh-ed25519 {HOST_PUBLIC_KEY}\n"
@@ -249,26 +246,17 @@ def test_remote_probe_argv_is_a_closed_allowlist() -> None:
         "df",
         "-Pk",
         "--",
-        install_directory,
+        "/data",
     )
-    assert commands[PreflightProbe.SYSTEMD_LINGER] == (
+    assert commands[PreflightProbe.SYSTEMD_SYSTEM] == (
         "/usr/bin/env",
-        "loginctl",
-        "show-user",
-        "trainer",
-        "--property=Linger",
-        "--value",
+        "systemctl",
+        "--version",
     )
     assert commands[PreflightProbe.INSTALL_DIRECTORY_EXISTS] == (
         "/usr/bin/env",
         "test",
         "-d",
-        install_directory,
-    )
-    assert commands[PreflightProbe.INSTALL_DIRECTORY_WRITABLE] == (
-        "/usr/bin/env",
-        "test",
-        "-w",
         install_directory,
     )
     assert all(argv[0] == "/usr/bin/env" for argv in commands.values())

@@ -8,7 +8,7 @@ from .errors import (
     TrainingValidationError,
 )
 from .models import ModelStatus, ParameterDefinition, RunStatus
-from .resources import FakeResourceProvider
+from .resources import FakeResourceProvider, TrainingResourceProvider
 from .service import TrainingService
 from .store import TrainingStore
 from .worker import TrainingWorker
@@ -18,6 +18,7 @@ __all__ = [
     "ParameterDefinition",
     "RunStatus",
     "FakeResourceProvider",
+    "TrainingResourceProvider",
     "TrainingService",
     "TrainingStore",
     "TrainingWorker",

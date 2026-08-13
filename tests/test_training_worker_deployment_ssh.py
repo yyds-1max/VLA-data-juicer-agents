@@ -14,7 +14,9 @@ from vla_data_juicer_agents.training.worker_deployment import (
     SudoPasswordMode,
     WORKER_CENTER_CA_PATH,
     TrainingWorkerSystemDeployer,
+    TrainingWorkerSystemRemover,
     WorkerDeploymentRequest,
+    WorkerRemovalRequest,
     WorkerRelease,
 )
 from vla_data_juicer_agents.training.worker_deployment_ssh import (
@@ -119,6 +121,34 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     assert ca_call[1] == (SSH_PASSWORD + "\n").encode() + TEST_CENTER_CA
     backend.clear_ephemeral_credentials()
     assert SSH_PASSWORD not in repr(backend)
+
+
+def test_openssh_worker_removal_uses_the_fixed_remote_operation() -> None:
+    session = _FakeFixedSshSession()
+    backend = OpenSshWorkerDeploymentBackend(
+        session,  # type: ignore[arg-type]
+        _ssh_password=SSH_PASSWORD,
+    )
+
+    result = TrainingWorkerSystemRemover().remove(
+        backend,
+        WorkerRemovalRequest(
+            node_ref="node_adapter01",
+            sudo_password_mode=SudoPasswordMode.SAME_AS_SSH,
+        ),
+    )
+
+    assert result.removed is True
+    removal_call = session.calls[-1]
+    assert removal_call[2] == "deploy:remove_worker"
+    assert removal_call[1] == (SSH_PASSWORD + "\n").encode()
+    arguments = json.loads(removal_call[0][-1])
+    assert arguments["unit_name"] == "datapilot-training-worker.service"
+    assert arguments["managed_directories"] == [
+        "/etc/datapilot-training-worker",
+        "/var/lib/datapilot-training-worker",
+        "/opt/datapilot-training-worker",
+    ]
 
 
 def test_openssh_backend_rejects_non_catalogue_privilege_command() -> None:

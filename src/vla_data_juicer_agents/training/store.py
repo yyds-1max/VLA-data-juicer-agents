@@ -458,6 +458,129 @@ class TrainingStore:
             )
         return self.get_node(node_ref)
 
+    def begin_node_worker_removal(
+        self,
+        node_ref: str,
+        expected_revision: int,
+        *,
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if int(row["state_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "training_node_revision_conflict",
+                    "The training node changed.",
+                    current=self._safe_node(row),
+                )
+            if row["deployment_status"] == "deploying":
+                raise TrainingConflictError(
+                    "training_node_deployment_in_progress",
+                    "A Worker operation is already in progress.",
+                    current=self._safe_node(row),
+                )
+            if not any(
+                row[field] is not None
+                for field in (
+                    "installed_worker_version",
+                    "worker_instance_id",
+                    "enrolled_at",
+                )
+            ):
+                raise TrainingConflictError(
+                    "training_node_worker_not_installed",
+                    "This training node has no installed Worker.",
+                    current=self._safe_node(row),
+                )
+            db.execute(
+                """UPDATE training_node_enrollment_tokens SET consumed_at=?
+                WHERE node_id=? AND consumed_at IS NULL""",
+                (timestamp, row["id"]),
+            )
+            db.execute(
+                """UPDATE training_nodes SET
+                status='disabled',worker_token_sha256=NULL,
+                deployment_status='deploying',
+                deployment_message='Training Worker removal is in progress.',
+                deployment_started_at=?,deployment_finished_at=NULL,
+                state_revision=state_revision+1,updated_at=? WHERE id=?""",
+                (timestamp, timestamp, row["id"]),
+            )
+            self._audit(
+                db,
+                actor,
+                "node.worker_removal_started",
+                node_ref,
+                {},
+                timestamp,
+            )
+        return self.get_node(node_ref)
+
+    def finish_node_worker_removal(
+        self,
+        node_ref: str,
+        *,
+        succeeded: bool,
+        message: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        safe_message = message[:1000]
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "training_node_not_found", "Training node was not found."
+                )
+            if succeeded:
+                db.execute(
+                    """UPDATE training_nodes SET
+                    status='pending_enrollment',deployment_status='not_started',
+                    deployment_message=?,deployment_finished_at=?,
+                    installed_worker_version=NULL,enrolled_at=NULL,
+                    last_heartbeat_at=NULL,worker_instance_id=NULL,
+                    worker_version=NULL,protocol_version=NULL,
+                    worker_token_sha256=NULL,health_message=NULL,
+                    capabilities_json=NULL,state_revision=state_revision+1,
+                    updated_at=? WHERE id=?""",
+                    (safe_message, timestamp, timestamp, row["id"]),
+                )
+                db.execute(
+                    "DELETE FROM training_node_resource_snapshots WHERE node_id=?",
+                    (row["id"],),
+                )
+            else:
+                db.execute(
+                    """UPDATE training_nodes SET
+                    status='repair_required',deployment_status='failed',
+                    deployment_message=?,deployment_finished_at=?,
+                    worker_token_sha256=NULL,state_revision=state_revision+1,
+                    updated_at=? WHERE id=?""",
+                    (safe_message, timestamp, timestamp, row["id"]),
+                )
+            self._audit(
+                db,
+                actor,
+                (
+                    "node.worker_removed"
+                    if succeeded
+                    else "node.worker_removal_failed"
+                ),
+                node_ref,
+                {"message": safe_message},
+                timestamp,
+            )
+        return self.get_node(node_ref)
+
     def invalidate_node_enrollment_tokens(self, node_ref: str) -> None:
         timestamp = now_iso()
         with self.transaction() as db:
@@ -570,7 +693,7 @@ class TrainingStore:
                 capabilities_json = canonical_json(data["capabilities"])
             db.execute(
                 """UPDATE training_nodes SET
-                status=?,state_revision=state_revision+1,last_heartbeat_at=?,
+                status=?,last_heartbeat_at=?,
                 worker_version=?,protocol_version=?,health_message=?,
                 capabilities_json=?,updated_at=? WHERE id=?""",
                 (
@@ -730,7 +853,11 @@ class TrainingStore:
                 raise TrainingConflictError("gpu_lease_conflict", "One or more GPUs are already leased.", current={"gpu_uuids": [row[0] for row in conflicts]})
             model = db.execute("SELECT id FROM registered_models WHERE model_ref=?", (data["model_ref"],)).fetchone()
             revision = db.execute("SELECT id FROM model_revisions WHERE revision_ref=?", (data["revision_ref"],)).fetchone()
-            port = self.find_available_port(data["server_ref"], db=db)
+            port = (
+                self.find_available_port(data["server_ref"], db=db)
+                if data.get("requires_master_port", True)
+                else None
+            )
             run_ref = new_ref("run")
             spec = run_spec_builder(run_ref, port)
             seed = int(hashlib.sha256(run_ref.encode()).hexdigest()[:8], 16)
@@ -742,7 +869,8 @@ class TrainingStore:
             )
             run_id = int(cursor.lastrowid)
             db.executemany("INSERT INTO gpu_leases(gpu_uuid,run_id,acquired_at) VALUES(?,?,?)", [(gpu, run_id, timestamp) for gpu in data["gpu_uuids"]])
-            db.execute("INSERT INTO port_leases(server_ref,master_port,run_id,acquired_at) VALUES(?,?,?,?)", (data["server_ref"], port, run_id, timestamp))
+            if port is not None:
+                db.execute("INSERT INTO port_leases(server_ref,master_port,run_id,acquired_at) VALUES(?,?,?,?)", (data["server_ref"], port, run_id, timestamp))
             db.execute("INSERT INTO training_idempotency(scope,idempotency_key,payload_sha256,response_ref,created_at) VALUES('create_run',?,?,?,?)", (idempotency_key, digest, run_ref, timestamp))
             self._log(db, run_id, "info", "Simulation run queued.", timestamp)
             self._event(db, "run.updated", run_ref, {}, timestamp)

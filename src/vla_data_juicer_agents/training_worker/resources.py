@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -16,6 +17,33 @@ NVIDIA_SMI_COMMAND = (
     "nvidia-smi",
     "--query-gpu=uuid,index,name,memory.total,memory.used,utilization.gpu,temperature.gpu",
     "--format=csv,noheader,nounits",
+)
+
+_NON_STORAGE_FILESYSTEMS = frozenset(
+    {
+        "autofs",
+        "bpf",
+        "binfmt_misc",
+        "cgroup",
+        "cgroup2",
+        "configfs",
+        "debugfs",
+        "devpts",
+        "devtmpfs",
+        "efivarfs",
+        "fusectl",
+        "hugetlbfs",
+        "mqueue",
+        "nsfs",
+        "proc",
+        "pstore",
+        "ramfs",
+        "rpc_pipefs",
+        "securityfs",
+        "sysfs",
+        "tmpfs",
+        "tracefs",
+    }
 )
 
 
@@ -35,10 +63,14 @@ class ResourceCollector:
     def __init__(
         self,
         *,
-        disk_paths: Sequence[Path] = (Path("/"),),
+        disk_paths: Sequence[Path] | None = None,
         gpu_command_runner: GpuCommandRunner | None = None,
     ) -> None:
-        self.disk_paths = tuple(Path(path).expanduser() for path in disk_paths)
+        self.disk_paths = (
+            tuple(Path(path).expanduser() for path in disk_paths)
+            if disk_paths is not None
+            else None
+        )
         self._gpu_command_runner = gpu_command_runner or _run_fixed_nvidia_smi
 
     def collect(self) -> dict[str, object]:
@@ -57,7 +89,14 @@ class ResourceCollector:
                 "load_1m": _load_one_minute(),
             },
             "memory": _memory_payload(),
-            "disks": [_disk_payload(path) for path in self.disk_paths],
+            "disks": [
+                _disk_payload(path)
+                for path in (
+                    self.disk_paths
+                    if self.disk_paths is not None
+                    else _discover_disk_paths()
+                )
+            ],
             "gpus": gpu_payload,
             "gpu_collection": {
                 "source": gpu_source,
@@ -218,3 +257,56 @@ def _disk_payload(path: Path) -> dict[str, object]:
         "total_bytes": usage.total,
         "available_bytes": usage.free,
     }
+
+
+def _discover_disk_paths(
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> tuple[Path, ...]:
+    """Return one useful mount point per mounted storage filesystem.
+
+    Linux exposes the current mount namespace through ``mountinfo``. Reading it
+    avoids shelling out and lets a system Worker follow mounts added after the
+    service starts. Virtual memory/kernel filesystems are omitted because they
+    are not storage capacity a training operator can use.
+    """
+
+    try:
+        lines = mountinfo_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return (Path("/"),)
+
+    by_device: dict[tuple[str, str], Path] = {}
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 5 or not right_fields:
+            continue
+        filesystem = right_fields[0]
+        if filesystem in _NON_STORAGE_FILESYSTEMS:
+            continue
+        mount = Path(_decode_mountinfo_path(left_fields[4]))
+        if not mount.is_absolute() or not mount.exists():
+            continue
+        device_key = (left_fields[2], filesystem)
+        previous = by_device.get(device_key)
+        if previous is None or len(mount.parts) < len(previous.parts):
+            by_device[device_key] = mount
+
+    paths = sorted(
+        by_device.values(),
+        key=lambda path: (path != Path("/"), str(path)),
+    )
+    return tuple(paths) or (Path("/"),)
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    # mountinfo escapes whitespace, backslash and a few control characters as
+    # three-digit octal sequences.
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )

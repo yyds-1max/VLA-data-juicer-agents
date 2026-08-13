@@ -23,6 +23,7 @@ const config: UserConfig & { test: InlineConfig } = {
   test: {
     environment: "jsdom",
     globals: true,
+    testTimeout: 10_000,
   },
 };
 

@@ -12,13 +12,14 @@ from .auth import (
     TRAINING_STOP_RUNS,
 )
 from .errors import (
+    TrainingConflictError,
     TrainingError,
     TrainingForbiddenError,
     TrainingUnavailableError,
     TrainingValidationError,
 )
 from .models import ParameterDefinition, normalize_parameter_value
-from .resources import FakeResourceProvider
+from .resources import FakeResourceProvider, TrainingResourceProvider
 from .store import TrainingStore
 
 
@@ -36,9 +37,28 @@ class TrainingNodeDeploymentManager(Protocol):
         enrollment_token: str,
     ) -> dict[str, str]: ...
 
+    def preflight_worker(
+        self,
+        *,
+        node: dict[str, Any],
+        confirmed_host_key: dict[str, str],
+        ssh_password: str,
+        sudo_password_mode: str,
+        sudo_password: str | None,
+    ) -> dict[str, Any]: ...
+
+    def remove_worker(
+        self,
+        *,
+        node: dict[str, Any],
+        ssh_password: str,
+        sudo_password_mode: str,
+        sudo_password: str | None,
+    ) -> dict[str, str]: ...
+
 
 class TrainingService:
-    def __init__(self, store: TrainingStore, provider: FakeResourceProvider, *, simulation_enabled: bool = True, node_deployment_manager: TrainingNodeDeploymentManager | None = None) -> None:
+    def __init__(self, store: TrainingStore, provider: FakeResourceProvider | TrainingResourceProvider, *, simulation_enabled: bool = True, node_deployment_manager: TrainingNodeDeploymentManager | None = None) -> None:
         self.store, self.provider = store, provider
         self.simulation_enabled = simulation_enabled
         self.node_deployment_manager = node_deployment_manager
@@ -183,6 +203,91 @@ class TrainingService:
             },
         }
 
+    def preflight_node_worker(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        if self.node_deployment_manager is None:
+            raise TrainingUnavailableError(
+                "training_node_deployment_unavailable",
+                "Training Worker deployment is not configured on this server.",
+            )
+        node = self.store.get_node(node_ref)
+        expected_revision = int(payload.expected_revision)
+        if int(node["state_revision"]) != expected_revision:
+            raise TrainingConflictError(
+                "training_node_revision_conflict",
+                "Training node was changed by another operation.",
+                current=node,
+            )
+        confirmed = payload.confirmed_host_key.model_dump(mode="json")
+        sudo_password = (
+            payload.sudo_password.get_secret_value()
+            if payload.sudo_password is not None
+            else None
+        )
+        return self.node_deployment_manager.preflight_worker(
+            node=node,
+            confirmed_host_key=confirmed,
+            ssh_password=payload.ssh_password.get_secret_value(),
+            sudo_password_mode=payload.sudo_password_mode,
+            sudo_password=sudo_password,
+        )
+
+    def remove_node_worker(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_NODES)
+        if self.node_deployment_manager is None:
+            raise TrainingUnavailableError(
+                "training_node_deployment_unavailable",
+                "Training Worker management is not configured on this server.",
+            )
+        ssh_password = payload.ssh_password.get_secret_value()
+        sudo_password = (
+            payload.sudo_password.get_secret_value()
+            if payload.sudo_password is not None
+            else None
+        )
+        removing = self.store.begin_node_worker_removal(
+            node_ref,
+            int(payload.expected_revision),
+            actor=principal.subject,
+        )
+        try:
+            removal = self.node_deployment_manager.remove_worker(
+                node=removing,
+                ssh_password=ssh_password,
+                sudo_password_mode=payload.sudo_password_mode,
+                sudo_password=sudo_password,
+            )
+        except Exception as exc:
+            message = (
+                str(exc)
+                if isinstance(exc, TrainingError)
+                else "Training Worker removal failed."
+            )
+            self.store.finish_node_worker_removal(
+                node_ref,
+                succeeded=False,
+                message=message,
+                actor=principal.subject,
+            )
+            raise
+        node = self.store.finish_node_worker_removal(
+            node_ref,
+            succeeded=True,
+            message=removal.get("message", "Training Worker removed."),
+            actor=principal.subject,
+        )
+        return {
+            "node": node,
+            "removal": {
+                "status": "succeeded",
+                "message": removal.get("message", "Training Worker removed."),
+            },
+        }
+
     def enroll_node(self, payload: Any) -> dict[str, Any]:
         return self.store.enroll_node(self._data(payload))
 
@@ -207,12 +312,25 @@ class TrainingService:
 
     def create_model(self, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
-        return self._project_model(self.store.create_model(self._adapt_model(self._data(payload)), principal.subject))
+        data = self._adapt_model(self._data(payload))
+        self._require_registered_server(data["launch_template"]["server_ref"])
+        return self._project_model(self.store.create_model(data, principal.subject))
 
     def update_model(self, model_ref: str, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
         data = self._adapt_model(self._data(payload)); expected = int(data.pop("expected_revision"))
+        self._require_registered_server(data["launch_template"]["server_ref"])
         return self._project_model(self.store.update_model(model_ref, expected, data, principal.subject))
+
+    def _require_registered_server(self, server_ref: str) -> None:
+        if not any(
+            server["server_ref"] == server_ref
+            for server in self.provider.list_servers()
+        ):
+            raise TrainingValidationError(
+                "server_not_found",
+                "请从已登记的训练节点或模拟服务器中选择模型运行位置。",
+            )
 
     @staticmethod
     def _project_model(model: dict[str, Any]) -> dict[str, Any]:
@@ -227,6 +345,13 @@ class TrainingService:
             template = model.get("launch_template")
             if isinstance(template, dict) and {"domain", "server_ref", "working_directory", "executable", "entrypoint", "output_root"} <= set(template):
                 projected_template = dict(template)
+                projected_template.setdefault(
+                    "launcher_kind",
+                    "torchrun"
+                    if str(template["executable"]).rsplit("/", 1)[-1]
+                    == "torchrun"
+                    else "direct",
+                )
                 projected_template.setdefault("output_flag", "--output_dir")
                 revision["launch_template"] = projected_template
             result["revision"] = revision
@@ -246,6 +371,19 @@ class TrainingService:
         data = self._data(payload)
         mode = data.get("execution_mode", data.get("mode"))
         if mode != "simulation": raise TrainingValidationError("unsupported_execution_mode", "Only simulation mode is supported.")
+        server = next(
+            (
+                item
+                for item in self.provider.list_servers()
+                if item["server_ref"] == data["server_ref"]
+            ),
+            None,
+        )
+        if server is not None and server.get("kind") != "simulation":
+            raise TrainingValidationError(
+                "real_execution_disabled",
+                "真实训练尚未启用；真实训练节点当前只用于登记模型和查看资源。",
+            )
         selected = self.provider.require_available(
             data["server_ref"],
             data["gpu_uuids"],
@@ -297,9 +435,38 @@ class TrainingService:
             resolve_parameter(definition)
         indexes = [item["index"] for item in selected]
         template = model["launch_template"]
-        def build(run_ref: str, port: int) -> dict[str, Any]:
+        launcher_kind = template.get("launcher_kind") or (
+            "torchrun"
+            if str(template["executable"]).rsplit("/", 1)[-1] == "torchrun"
+            else "direct"
+        )
+        uses_torchrun = launcher_kind == "torchrun"
+        nproc_per_node = len(indexes) if uses_torchrun else 1
+
+        def build(run_ref: str, port: int | None) -> dict[str, Any]:
             output = f"{template['output_root'].rstrip('/')}/{run_ref}"
-            argv = [template["executable"], "--nnodes=1", f"--nproc_per_node={len(indexes)}", "--master_addr=127.0.0.1", f"--master_port={port}", "--node_rank=0", template["entrypoint"], *template.get("fixed_argv", [])]
+            if uses_torchrun:
+                if port is None:
+                    raise TrainingValidationError(
+                        "master_port_required",
+                        "Torchrun requires an allocated master port.",
+                    )
+                argv = [
+                    template["executable"],
+                    "--nnodes=1",
+                    f"--nproc_per_node={nproc_per_node}",
+                    "--master_addr=127.0.0.1",
+                    f"--master_port={port}",
+                    "--node_rank=0",
+                    template["entrypoint"],
+                    *template.get("fixed_argv", []),
+                ]
+            else:
+                argv = [
+                    template["executable"],
+                    template["entrypoint"],
+                    *template.get("fixed_argv", []),
+                ]
             safe_argv = list(argv)
             for definition in definitions:
                 if definition.name not in normalized:
@@ -317,21 +484,30 @@ class TrainingService:
             output_flag = template.get("output_flag", "--output_dir")
             argv.extend([output_flag, output])
             safe_argv.extend([output_flag, output])
-            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "model_name": model["name"], "model_revision": model["revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "nnodes": 1, "nproc_per_node": len(indexes), "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
-            safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "nnodes": 1, "master_addr": "127.0.0.1", "master_port": port, "node_rank": 0, "nproc_per_node": len(indexes), "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "argv": safe_argv, "output_preview": output}
+            distributed = {
+                "master_addr": "127.0.0.1" if uses_torchrun else None,
+                "master_port": port if uses_torchrun else None,
+                "node_rank": 0 if uses_torchrun else None,
+            }
+            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "model_name": model["name"], "model_revision": model["revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "launcher_kind": launcher_kind, "nnodes": 1, "nproc_per_node": nproc_per_node, **distributed, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
+            safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "argv": safe_argv, "output_preview": output}
             safe["parameters"] = {key: "********" if key in sensitive else value for key,value in normalized.items()}
             private["public_spec"] = safe
             return {"private_spec": private, "run_spec": safe, "command_preview": private["safe_command_preview"]}
         total_steps = int(normalized.get("max_steps", 20))
         if total_steps < 1 or total_steps > 10_000:
             raise TrainingValidationError("invalid_max_steps", "Simulation max_steps must be between 1 and 10000.")
-        prepared = {"model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "parameters": normalized, "total_steps": total_steps}
+        prepared = {"model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "parameters": normalized, "total_steps": total_steps, "requires_master_port": uses_torchrun}
         return prepared, build
 
     def preview_run(self, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_CREATE_RUNS)
-        _, builder = self._prepare(payload)
-        port = self.store.find_available_port(self._data(payload)["server_ref"])
+        prepared, builder = self._prepare(payload)
+        port = (
+            self.store.find_available_port(self._data(payload)["server_ref"])
+            if prepared["requires_master_port"]
+            else None
+        )
         built = builder("preview", port)
         return {"run_spec": built["run_spec"], "command_preview": built["command_preview"], "preflight": [{"ok": True, "code": "simulation_ready", "message": "Simulation inputs and GPU availability are valid."}]}
 

@@ -5,7 +5,11 @@ import math
 import time
 from typing import Any
 
-from .errors import TrainingNotFoundError
+from .errors import (
+    TrainingConflictError,
+    TrainingNotFoundError,
+    TrainingValidationError,
+)
 from .store import TrainingStore
 
 
@@ -49,7 +53,6 @@ class FakeResourceProvider:
         by_uuid = {gpu["gpu_uuid"]: gpu for gpu in resources["gpus"]}
         missing = [item for item in gpu_uuids if item not in by_uuid]
         if missing:
-            from .errors import TrainingValidationError
             raise TrainingValidationError("unknown_gpu", "One or more selected GPUs do not exist.", current={"gpu_uuids": missing})
         occupied = [
             item
@@ -58,6 +61,166 @@ class FakeResourceProvider:
             or (by_uuid[item]["lease_run_ref"] is not None and not ignore_platform_leases)
         ]
         if occupied:
-            from .errors import TrainingConflictError
             raise TrainingConflictError("gpu_unavailable", "One or more selected GPUs are unavailable.", current={"gpu_uuids": occupied})
         return [by_uuid[item] for item in gpu_uuids]
+
+
+class TrainingResourceProvider:
+    """Unified inventory for simulation and enrolled Training Nodes.
+
+    This provider is deliberately an inventory adapter, not an execution
+    switch.  A real node appearing here does not enable real training.  The
+    service's execution-mode gate remains authoritative.
+
+    Fake resources retain their deterministic lease/external-occupancy
+    semantics.  Real node resources are trusted, authenticated Worker
+    snapshots: selection checks only node health and GPU identity.  It never
+    guesses external occupancy from utilisation or memory consumption.
+    """
+
+    _SCHEDULABLE_STATUS = "online"
+
+    def __init__(
+        self,
+        store: TrainingStore,
+        *,
+        simulation_provider: FakeResourceProvider | None = None,
+    ) -> None:
+        self.store = store
+        self.simulation_provider = simulation_provider or FakeResourceProvider(store)
+
+    def list_servers(self) -> list[dict[str, Any]]:
+        servers = [dict(server) for server in self.simulation_provider.list_servers()]
+        for node in self.store.list_nodes():
+            snapshot = self.store.get_node_resources(node["node_ref"])
+            resources = snapshot.get("resources")
+            gpu_count = (
+                len(resources.get("gpus", []))
+                if isinstance(resources, dict)
+                else 0
+            )
+            connected = node["status"] == self._SCHEDULABLE_STATUS
+            servers.append(
+                {
+                    "server_ref": node["node_ref"],
+                    "name": node["name"],
+                    "kind": "training_node",
+                    "status": node["status"],
+                    "online": connected,
+                    "available": node["status"] == self._SCHEDULABLE_STATUS
+                    and not bool(snapshot.get("stale", True)),
+                    "stale": bool(snapshot.get("stale", True)),
+                    # Keep the last reported inventory visible even when the
+                    # node is offline/degraded. ``available`` remains false,
+                    # so stale visibility never becomes schedulability.
+                    "gpu_count": gpu_count,
+                }
+            )
+        return servers
+
+    def resources(self, server_ref: str) -> dict[str, Any]:
+        if server_ref in self.simulation_provider.compatible_server_refs:
+            return self.simulation_provider.resources(server_ref)
+
+        node = self._get_node(server_ref)
+        snapshot = self.store.get_node_resources(server_ref)
+        connected = node["status"] == self._SCHEDULABLE_STATUS
+        raw_resources = snapshot.get("resources")
+        has_snapshot = isinstance(raw_resources, dict)
+        stale = bool(snapshot.get("stale", True)) or not connected or not has_snapshot
+        server = {
+            "server_ref": node["node_ref"],
+            "name": node["name"],
+            "kind": "training_node",
+            "status": node["status"],
+            "online": connected,
+            "available": node["status"] == self._SCHEDULABLE_STATUS and not stale,
+            "stale": stale,
+            "gpu_count": 0,
+        }
+        if not has_snapshot:
+            return {
+                "server": server,
+                "sampled_at": snapshot.get("captured_at"),
+                "stale": True,
+                "gpus": [],
+            }
+
+        gpus = [
+            self._node_gpu_projection(gpu, available=server["available"])
+            for gpu in raw_resources.get("gpus", [])
+            if isinstance(gpu, dict)
+        ]
+        server["gpu_count"] = len(gpus)
+        return {
+            "server": server,
+            "sampled_at": snapshot.get("captured_at"),
+            "stale": stale,
+            "gpus": gpus,
+        }
+
+    def require_available(
+        self,
+        server_ref: str,
+        gpu_uuids: list[str],
+        *,
+        ignore_platform_leases: bool = False,
+    ) -> list[dict[str, Any]]:
+        if server_ref in self.simulation_provider.compatible_server_refs:
+            return self.simulation_provider.require_available(
+                server_ref,
+                gpu_uuids,
+                ignore_platform_leases=ignore_platform_leases,
+            )
+
+        # ``ignore_platform_leases`` belongs exclusively to simulation retry
+        # handling.  Real-node validation intentionally does not consult the
+        # fake provider's platform leases or external-occupancy heuristic.
+        del ignore_platform_leases
+        node = self._get_node(server_ref)
+        resources = self.resources(server_ref)
+        if node["status"] != self._SCHEDULABLE_STATUS or resources["stale"]:
+            raise TrainingConflictError(
+                "training_node_unavailable",
+                "The selected training node is not available.",
+                current={"node_ref": server_ref, "status": node["status"]},
+            )
+        by_uuid = {gpu["gpu_uuid"]: gpu for gpu in resources["gpus"]}
+        missing = [gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid not in by_uuid]
+        if missing:
+            raise TrainingValidationError(
+                "unknown_gpu",
+                "One or more selected GPUs do not exist.",
+                current={"gpu_uuids": missing},
+            )
+        return [by_uuid[gpu_uuid] for gpu_uuid in gpu_uuids]
+
+    def _get_node(self, server_ref: str) -> dict[str, Any]:
+        try:
+            return self.store.get_node(server_ref)
+        except TrainingNotFoundError as exc:
+            raise TrainingNotFoundError(
+                "server_not_found", "Training server was not found."
+            ) from exc
+
+    @staticmethod
+    def _node_gpu_projection(
+        gpu: dict[str, Any], *, available: bool
+    ) -> dict[str, Any]:
+        temperature = gpu.get("temperature_celsius")
+        return {
+            "gpu_uuid": gpu["uuid"],
+            "index": int(gpu["index"]),
+            "name": gpu.get("name", "GPU"),
+            "total_memory_mib": _bytes_to_mib(gpu.get("memory_total_bytes", 0)),
+            "used_memory_mib": _bytes_to_mib(gpu.get("memory_used_bytes", 0)),
+            "utilization_percent": float(gpu.get("utilization_percent", 0)),
+            "temperature_c": float(temperature) if temperature is not None else 0.0,
+            "externally_occupied": False,
+            "lease_run_ref": None,
+            "available": available,
+        }
+
+
+def _bytes_to_mib(value: Any) -> int:
+    return max(0, int(value)) // (1024 * 1024)

@@ -176,6 +176,34 @@ def test_resource_collector_uses_only_fixed_nvidia_smi_argv(tmp_path: Path) -> N
     assert resources["disks"][0]["available_bytes"] >= 0  # type: ignore[index]
 
 
+def test_resource_collector_discovers_all_storage_mounts_without_shell(
+    tmp_path: Path,
+) -> None:
+    root_mount = tmp_path / "root"
+    data_mount = tmp_path / "data disk"
+    duplicate_bind = data_mount / "bind"
+    for path in (root_mount, data_mount, duplicate_bind):
+        path.mkdir(parents=True)
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "\n".join(
+            [
+                f"10 1 8:1 / {root_mount} rw - ext4 /dev/sda1 rw",
+                f"11 1 8:2 / {str(data_mount).replace(' ', r'\040')} rw - xfs /dev/sdb1 rw",
+                f"12 1 8:2 /sub {duplicate_bind} rw - xfs /dev/sdb1 rw",
+                "13 1 0:25 / /proc rw - proc proc rw",
+                "14 1 0:30 / /run rw - tmpfs tmpfs rw",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    discovered = worker_resources._discover_disk_paths(mountinfo)
+
+    assert set(discovered) == {root_mount, data_mount}
+    assert len(discovered) == 2
+
+
 def test_nvidia_smi_fallback_never_uses_shell(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded: dict[str, object] = {}
 

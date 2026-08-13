@@ -27,7 +27,9 @@ from vla_data_juicer_agents.training.worker_deployment import (
     SudoPasswordMode,
     TrainingNodeDeploymentError,
     TrainingWorkerSystemDeployer,
+    TrainingWorkerSystemRemover,
     WorkerDeploymentRequest,
+    WorkerRemovalRequest,
     WorkerRelease,
     inspect_deployment_privilege,
 )
@@ -116,6 +118,14 @@ class _FakeDeploymentBackend:
         self.calls.append(("system_service_is_active", unit_name))
         return self.active
 
+    def remove_system_worker(self, *, privilege):
+        self.calls.append(("remove_system_worker", privilege))
+        changed = bool(self.created or self.enrolled or self.active)
+        self.created.clear()
+        self.enrolled = False
+        self.active = False
+        return changed
+
 
 def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     backend = _FakeDeploymentBackend(DeploymentPrivilege.PASSWORDLESS_SUDO)
@@ -147,6 +157,33 @@ def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     assert WORKER_STATE_ROOT in SYSTEMD_UNIT
     assert WORKER_CONFIG_ROOT in WORKER_ENVIRONMENT_PATH
     assert WORKER_CURRENT_LINK in SYSTEMD_UNIT
+
+
+def test_system_worker_removal_is_fixed_idempotent_and_requires_privilege() -> None:
+    backend = _FakeDeploymentBackend(DeploymentPrivilege.SUDO)
+    TrainingWorkerSystemDeployer().deploy(backend, _request())
+    remover = TrainingWorkerSystemRemover()
+    request = WorkerRemovalRequest(
+        node_ref="node_test0001",
+        sudo_password_mode=SudoPasswordMode.SAME_AS_SSH,
+    )
+
+    first = remover.remove(backend, request)
+    second = remover.remove(backend, request)
+
+    assert first.removed is True
+    assert second.removed is False
+    assert backend.active is False
+    assert backend.enrolled is False
+    assert [call[0] for call in backend.calls].count("remove_system_worker") == 2
+
+    insufficient = _FakeDeploymentBackend(DeploymentPrivilege.INSUFFICIENT)
+    with pytest.raises(TrainingNodeDeploymentError) as raised:
+        remover.remove(insufficient, request)
+    assert raised.value.code == DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE
+    assert insufficient.calls == [
+        ("inspect_privilege", SudoPasswordMode.SAME_AS_SSH)
+    ]
 
 
 def test_insufficient_deployment_account_fails_before_any_write() -> None:

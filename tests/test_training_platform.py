@@ -11,7 +11,10 @@ from fastapi.testclient import TestClient
 from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
 from vla_data_juicer_agents.training.migrations import LATEST_TRAINING_SCHEMA_VERSION
-from vla_data_juicer_agents.training.resources import FakeResourceProvider
+from vla_data_juicer_agents.training.resources import (
+    FakeResourceProvider,
+    TrainingResourceProvider,
+)
 from vla_data_juicer_agents.training.service import TrainingService
 from vla_data_juicer_agents.training.store import TrainingStore
 from vla_data_juicer_agents.training.worker import TrainingWorker
@@ -414,6 +417,9 @@ def test_argument_styles_and_platform_launch_arguments(
     assert preview.status_code == 200, preview.text
     spec = preview.json()["run_spec"]
     argv = spec["argv"]
+    assert spec["launcher_kind"] == "torchrun"
+    assert spec["nproc_per_node"] == 2
+    assert isinstance(spec["master_port"], int)
     assert spec["node_rank"] == 0
     assert argv.index("--node_rank=0") < argv.index("train.py")
     assert argv[argv.index("--do_eval") + 1] == "False"
@@ -823,6 +829,44 @@ def test_legacy_noneditable_parameter_is_normalized_and_can_be_overridden(
     assert preview.json()["run_spec"]["parameters"]["num_video_frames"] == 8
 
 
+def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
+    tmp_path: Path,
+) -> None:
+    store = TrainingStore(tmp_path / "real-node-training.sqlite")
+    service = TrainingService(store, TrainingResourceProvider(store))
+    client = _client(service, admin=True)
+    node = store.create_node(
+        {
+            "name": "NaVILA test node",
+            "description": "Registered compute target.",
+            "address": "192.0.2.12",
+            "ssh_port": 1012,
+            "ssh_username": "trainer",
+        },
+        "development-admin",
+    )
+    payload = _model_payload(name="NaVILA real node draft")
+    payload["launch_template"]["server_ref"] = node["node_ref"]  # type: ignore[index]
+
+    created = client.post("/api/training/models", json=payload)
+
+    assert created.status_code == 201, created.text
+    model = created.json()["model"]
+    assert model["revision"]["launch_template"]["server_ref"] == node["node_ref"]
+    listed = client.get("/api/training/servers").json()["servers"]
+    real_server = next(item for item in listed if item["server_ref"] == node["node_ref"])
+    assert real_server["kind"] == "training_node"
+    preview = client.post(
+        "/api/training/runs/preview",
+        json={
+            **_run_payload(str(model["model_ref"]), gpu_uuids=["GPU-real-0"]),
+            "server_ref": node["node_ref"],
+        },
+    )
+    assert preview.status_code == 400
+    assert preview.json()["detail"]["code"] == "real_execution_disabled"
+
+
 def test_draft_revision_preview_and_submission_are_safe_and_idempotent(
     service: TrainingService,
 ) -> None:
@@ -844,7 +888,12 @@ def test_draft_revision_preview_and_submission_are_safe_and_idempotent(
     preview = client.post("/api/training/runs/preview", json=request)
     assert preview.status_code == 200, preview.text
     preview_body = preview.json()
-    assert preview_body["run_spec"]["nproc_per_node"] == 2
+    assert preview_body["run_spec"]["launcher_kind"] == "direct"
+    assert preview_body["run_spec"]["nproc_per_node"] == 1
+    assert preview_body["run_spec"]["master_addr"] is None
+    assert preview_body["run_spec"]["master_port"] is None
+    assert preview_body["run_spec"]["node_rank"] is None
+    assert "--nproc_per_node" not in preview_body["command_preview"]
     assert preview_body["run_spec"]["parameters"]["num_video_frames"] == 8
     assert "--num_video_frames 8" in preview_body["command_preview"]
     assert "private" not in preview_body["command_preview"]
@@ -859,6 +908,8 @@ def test_draft_revision_preview_and_submission_are_safe_and_idempotent(
     assert repeat.status_code == 201
     assert repeat.json()["run"]["run_ref"] == run["run_ref"]
     assert set(service.store.active_gpu_leases()) == {"fake-a100-00", "fake-a100-01"}
+    with service.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM port_leases").fetchone()[0] == 0
 
     conflict = client.post(
         "/api/training/runs",

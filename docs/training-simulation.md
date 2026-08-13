@@ -39,7 +39,8 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 ## 模型指令如何注册
 
-“模型注册”不是粘贴并执行一段 Shell。管理员在页面中登记 launcher、工作目录、
+“模型注册”不是粘贴并执行一段 Shell。管理员先从已登记训练节点或本地模拟服务器中
+选择运行位置，再登记 launcher、工作目录、
 训练入口、输出根目录，以及一组类型化的训练脚本参数。参数无需预先填写数量，可
 逐项添加或删除，并为每项设置字段名、CLI flag、类型、默认值、范围、枚举选项、
 是否敏感、argv 表达方式、参数用途和展示分组。字符串或枚举参数可标记为唯一的
@@ -53,6 +54,12 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 日志或 JSON Lines 指标。真实 Worker Runner 后续只能按这些已审核字段选择固定实现，
 不能把它们转换为任意 Shell。NaVILA 预置声明系统环境和 Transformers 日志格式，
 管理员可根据实际部署创建新 revision 调整。
+
+启动方式是显式契约，不再根据任意 executable 猜测。`torchrun` 会由平台加入单机
+`nnodes=1`、按所选 GPU 数计算的 `nproc_per_node`、master 地址/端口和 node rank；
+`direct` 只生成 `executable + entrypoint + argv`，不会加入任何 torchrun 参数，也不会
+申请 master port。旧 revision 没有该字段时，仅为兼容已有数据，按 executable 的文件名
+是否为 `torchrun` 推断一次，并在下一 revision 中保存明确类型。
 
 枚举参数使用结构化选项表，而不是解析自由文本：每项只登记一个选项值，该值同时
 写入 argv 并显示在新建训练页；选项可添加、排序、删除及指定默认项，且必须唯一。
@@ -87,8 +94,9 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 页面提供“NaVILA 轨迹训练”预置，覆盖当前已知训练脚本参数，并登记推荐展示分组；
 用户可以在注册时重新分组。预置中的路径都是 `/workspace/...` 占位值，不绑定或读取实际共享
-目录。GPU 选择、`CUDA_VISIBLE_DEVICES`、`nnodes`、`nproc_per_node`、master
-地址/端口、node rank 和每次运行的输出目录始终由平台生成，不能注册为普通参数。
+目录。GPU 选择、`CUDA_VISIBLE_DEVICES` 和每次运行的输出目录始终由平台生成，不能
+注册为普通参数；仅 torchrun 启动方式还由平台生成 `nnodes`、`nproc_per_node`、master
+地址/端口和 node rank。
 
 新建训练页按照模型 revision 保存的布局展示参数；常用参数常驻，优化器与正则、
 性能与显存、模型与多模态、数据与验证、日志与产物及用户新建分组默认折叠。
@@ -99,7 +107,10 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 ## 真实训练边界
 
-本里程碑已经建立训练节点、只读 Worker 和 SSH preflight 的基础契约，但真实 Runner
+本里程碑已经建立训练节点、只读 Worker 和 SSH preflight，并把真实节点资源接入模型
+注册与新建训练。Fake Server 只用于模拟模式；绑定真实节点的模型可以查看节点快照和
+填写参数，但页面不会开放模拟预览、GPU 选择或启动按钮，后端同样拒绝在真实节点上
+创建 Fake Run。真实 Runner
 仍保持关闭。在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用
 连接凭据确认前，不允许 Worker 接收任务或启动训练。路径 allowlist、训练进程创建与
 停止、artifact 校验以及 NaVILA metrics callback 均属于后续里程碑。
@@ -147,13 +158,22 @@ CA 公钥证书安装为 `/etc/datapilot-training-worker/center-ca.pem`，首次
 systemd 心跳都使用该证书验证中心身份。未配置自定义 CA 时，Worker 使用操作系统默认
 的公共 CA 信任库。无论哪种模式，都不会关闭 TLS 证书或主机名验证。
 
+Worker 默认读取 Linux 当前挂载表，自动上报所有持久存储挂载点，并过滤 `/proc`、
+`tmpfs`、cgroup 等非磁盘文件系统；同一设备的 bind mount 只显示一次。这样 `/data`
+等独立数据盘无需用户额外配置，新增挂载也会在后续心跳中自动出现。未挂载的裸设备不
+属于可用文件系统容量，不在资源页面展示。
+
 用户登记节点后点击“部署 Worker”，页面先读取未受信任的 SSH host key 并显示
 `SHA256:...` 指纹。用户必须通过可信渠道核对并明确确认；实际连接随后固定该 public
 key，强制 `StrictHostKeyChecking=yes`，不会把首次扫描结果直接当作可信身份。
 
 用户只需提供本次 SSH 登录密码，并选择 sudo 使用同一密码、独立密码或无需密码。
 密码通过本机短生命周期的受控 askpass 通道交给 OpenSSH，不使用 `sshpass`；部署结束
-即销毁。系统只执行内部固定的幂等安装操作，不接收 Shell 文本或自定义命令：
+即销毁。安装按钮前会显示一次只读部署条件检查，固定检查 Linux、系统级 systemd、
+Python 3、安装磁盘、NVIDIA 工具及 root/sudo 能力；未安装 NVIDIA 工具只会提示 GPU
+资源无法上报，安装目录尚不存在会提示由首次安装创建。修改密码、指纹确认或提权方式
+后必须重新检查，实际部署时服务端还会强制复查。系统只执行内部固定的幂等安装操作，
+不接收 Shell 文本或自定义命令：
 
 1. 检查部署账号是 root 或可用 sudo；
 2. 创建无登录权限的 `datapilot-worker` 系统账号；
@@ -169,6 +189,13 @@ key，强制 `StrictHostKeyChecking=yes`，不会把首次扫描结果直接当�
 系统级 service 不依赖登录会话或 systemd linger。正常升级可由仍在线的 Worker 后续
 接管；Worker 完全损坏时，用户可在页面再次提供一次 SSH 授权执行同一套幂等修复。
 修复只管理 Worker 自身，不扫描、重启、停止或修改已有训练进程。
+
+已安装的节点可在页面执行“删除 Worker”。操作要求再次提供一次临时 SSH/sudo 凭据，
+并经过影响说明和二次确认。中心会先撤销 Worker token、使节点退出可训练状态，再通过
+固定卸载操作停止并删除 systemd 服务、Worker 专用目录和 `datapilot-worker` 账号；
+不会删除模型工程、数据集、权重、checkpoint 或训练输出。成功后保留节点登记记录并
+恢复为“待部署 Worker”，以后可以重新一键部署；卸载失败时节点保持“需要修复”，不会
+继续被当作可用训练节点。
 
 即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。当前部署和 Worker
 都不会读取或修改模型工程、权重、checkpoint 或训练输出；真实 Runner 仍保持禁用。

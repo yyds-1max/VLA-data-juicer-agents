@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=Path,
         dest="disk_paths",
-        help="Filesystem root to inventory. May be repeated; defaults to '/'.",
+        help="Filesystem root to inventory. May be repeated; defaults to automatic discovery of all storage mounts.",
     )
     parser.add_argument("--interval-seconds", type=float, default=15.0)
     parser.add_argument(
@@ -64,7 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     identity = load_or_create_identity(args.state_dir)
     ledger = WorkerLedger(args.state_dir / "worker-ledger.sqlite")
-    collector = ResourceCollector(disk_paths=args.disk_paths or [Path("/")])
+    collector = ResourceCollector(disk_paths=args.disk_paths)
     center_client = None
     worker_token = load_worker_token(args.state_dir)
     node_ref = args.node_ref

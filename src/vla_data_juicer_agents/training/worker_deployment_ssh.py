@@ -36,6 +36,13 @@ from .worker_deployment import (
     ServiceAccountSpec,
     SudoPasswordMode,
     TrainingNodeDeploymentError,
+    WORKER_ACCOUNT,
+    WORKER_CONFIG_ROOT,
+    WORKER_GROUP,
+    WORKER_OPT_ROOT,
+    WORKER_STATE_ROOT,
+    WORKER_SYSTEMD_UNIT_NAME,
+    WORKER_SYSTEMD_UNIT_PATH,
     WorkerRelease,
     inspect_deployment_privilege,
 )
@@ -62,6 +69,7 @@ class _Operation(StrEnum):
     ENROLL = "enroll"
     START_SERVICE = "start_service"
     IS_ACTIVE = "is_active"
+    REMOVE_WORKER = "remove_worker"
 
 
 _REMOTE_INSTALLER = r'''import grp
@@ -237,6 +245,58 @@ elif operation == "is_active":
         "/usr/bin/systemctl", "is-active", "--quiet", arguments["unit_name"]
     ]).returncode == 0
     output(False, active)
+elif operation == "remove_worker":
+    unit = arguments["unit_name"]
+    changed = False
+    enabled = subprocess.run(
+        ["/usr/bin/systemctl", "is-enabled", "--quiet", unit],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    active = subprocess.run(
+        ["/usr/bin/systemctl", "is-active", "--quiet", unit],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    subprocess.run(
+        ["/usr/bin/systemctl", "disable", "--now", unit],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    changed = enabled or active
+    unit_path = pathlib.Path(arguments["unit_path"])
+    if unit_path.exists() or unit_path.is_symlink():
+        unit_path.unlink()
+        changed = True
+    for raw_path in arguments["managed_directories"]:
+        path = pathlib.Path(raw_path)
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            changed = True
+        elif path.is_dir():
+            shutil.rmtree(path)
+            changed = True
+    account = arguments["account"]
+    group = arguments["group"]
+    try:
+        pwd.getpwnam(account)
+    except KeyError:
+        pass
+    else:
+        if subprocess.run(
+            ["/usr/sbin/userdel", account], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0:
+            changed = True
+    try:
+        grp.getgrnam(group)
+    except KeyError:
+        pass
+    else:
+        if subprocess.run(
+            ["/usr/sbin/groupdel", group], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0:
+            changed = True
+    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+    output(changed)
 else:
     raise RuntimeError("unsupported deployment operation")
 '''
@@ -555,6 +615,27 @@ class OpenSshWorkerDeploymentBackend:
                 {"unit_name": unit_name},
                 privilege=privilege,
             )
+        )
+
+    def remove_system_worker(
+        self,
+        *,
+        privilege: DeploymentPrivilege,
+    ) -> bool:
+        return self._operation(
+            _Operation.REMOVE_WORKER,
+            {
+                "unit_name": WORKER_SYSTEMD_UNIT_NAME,
+                "unit_path": WORKER_SYSTEMD_UNIT_PATH,
+                "managed_directories": [
+                    WORKER_CONFIG_ROOT,
+                    WORKER_STATE_ROOT,
+                    WORKER_OPT_ROOT,
+                ],
+                "account": WORKER_ACCOUNT,
+                "group": WORKER_GROUP,
+            },
+            privilege=privilege,
         )
 
     def _operation(

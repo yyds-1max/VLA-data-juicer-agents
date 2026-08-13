@@ -383,6 +383,7 @@ export interface TrainingLaunchTemplate {
   domain: string;
   server_ref: string;
   working_directory: string;
+  launcher_kind: "torchrun" | "direct";
   executable: string;
   entrypoint: string;
   fixed_argv: string[];
@@ -421,11 +422,16 @@ export interface TrainingServer {
   name: string;
   kind: "simulation" | string;
   gpu_count: number;
+  status?: TrainingNodeStatus | null;
+  online?: boolean;
+  available?: boolean;
+  stale?: boolean;
 }
 
 export interface TrainingServerResources {
   server: TrainingServer;
-  sampled_at: string;
+  sampled_at: string | null;
+  stale?: boolean;
   gpus: TrainingGpuResource[];
 }
 
@@ -492,6 +498,27 @@ export interface TrainingNodeDeploymentResult {
   };
 }
 
+export interface TrainingNodePreflightCheck {
+  code: string;
+  label: string;
+  status: "passed" | "warning" | "failed";
+  detail: string;
+}
+
+export interface TrainingNodePreflightResult {
+  ready: boolean;
+  checked_at: string;
+  checks: TrainingNodePreflightCheck[];
+}
+
+export interface TrainingNodeRemovalResult {
+  node: TrainingNode;
+  removal: {
+    status: "succeeded";
+    message: string;
+  };
+}
+
 export interface TrainingNodeResourceSnapshot {
   node_ref: string;
   captured_at?: string | null;
@@ -502,12 +529,13 @@ export interface TrainingNodeResourceSnapshot {
 export interface TrainingRunSpec {
   contract_version: 1;
   execution_mode: "simulation";
+  launcher_kind: "torchrun" | "direct";
   server_ref: string;
   gpu_uuids: string[];
   nnodes: 1;
-  master_addr: "127.0.0.1";
-  master_port: number;
-  node_rank: 0;
+  master_addr: "127.0.0.1" | null;
+  master_port: number | null;
+  node_rank: 0 | null;
   nproc_per_node: number;
   environment: Record<string, string>;
   runtime_environment?: TrainingLaunchTemplate["runtime_environment"];

@@ -225,13 +225,11 @@ class PreflightProbe(StrEnum):
     OPERATING_SYSTEM = "operating_system"
     OS_RELEASE = "os_release"
     ARCHITECTURE = "architecture"
-    SYSTEMD_USER = "systemd_user"
-    SYSTEMD_LINGER = "systemd_linger"
+    SYSTEMD_SYSTEM = "systemd_system"
     PYTHON = "python"
     DISK = "disk"
     NVIDIA_SMI = "nvidia_smi"
     INSTALL_DIRECTORY_EXISTS = "install_directory_exists"
-    INSTALL_DIRECTORY_WRITABLE = "install_directory_writable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,8 +768,6 @@ def _run_preflight_session(
                 f"SSH transport failed during the {probe.value} probe"
             )
         available = execution.return_code == 0
-        if probe is PreflightProbe.SYSTEMD_LINGER:
-            available = available and execution.stdout.strip() == b"yes"
         results.append(
             ProbeResult(
                 probe=probe,
@@ -802,28 +798,29 @@ def _probe_argv(
     username: str,
 ) -> tuple[str, ...]:
     directory = _validate_install_directory(install_directory)
+    disk_probe_path = str(PurePosixPath(directory).parent)
     if not re.fullmatch(r"[a-z_][a-z0-9_.-]{0,63}", username):
         raise ValueError("SSH username has an unsupported format")
     commands: dict[PreflightProbe, tuple[str, ...]] = {
         PreflightProbe.OPERATING_SYSTEM: ("/usr/bin/env", "uname", "-s"),
         PreflightProbe.OS_RELEASE: ("/usr/bin/env", "cat", "/etc/os-release"),
         PreflightProbe.ARCHITECTURE: ("/usr/bin/env", "uname", "-m"),
-        PreflightProbe.SYSTEMD_USER: (
+        PreflightProbe.SYSTEMD_SYSTEM: (
             "/usr/bin/env",
             "systemctl",
-            "--user",
-            "is-system-running",
-        ),
-        PreflightProbe.SYSTEMD_LINGER: (
-            "/usr/bin/env",
-            "loginctl",
-            "show-user",
-            username,
-            "--property=Linger",
-            "--value",
+            "--version",
         ),
         PreflightProbe.PYTHON: ("/usr/bin/env", "python3", "--version"),
-        PreflightProbe.DISK: ("/usr/bin/env", "df", "-Pk", "--", directory),
+        # The release directory does not exist on a first installation. Probe
+        # its existing parent instead; the privileged installer creates the
+        # final root-owned directory later.
+        PreflightProbe.DISK: (
+            "/usr/bin/env",
+            "df",
+            "-Pk",
+            "--",
+            disk_probe_path,
+        ),
         PreflightProbe.NVIDIA_SMI: (
             "/usr/bin/env",
             "nvidia-smi",
@@ -834,12 +831,6 @@ def _probe_argv(
             "/usr/bin/env",
             "test",
             "-d",
-            directory,
-        ),
-        PreflightProbe.INSTALL_DIRECTORY_WRITABLE: (
-            "/usr/bin/env",
-            "test",
-            "-w",
             directory,
         ),
     }
@@ -868,8 +859,8 @@ def _deployment_plan(
                 "stage_release", "Stage a versioned worker release", True
             ),
             DeploymentPlanStep(
-                "install_user_service",
-                "Install or update the user systemd service",
+                "install_system_service",
+                "Install or update the system-level worker service",
                 True,
             ),
             DeploymentPlanStep(
@@ -892,7 +883,7 @@ def _deployment_plan(
             ),
             DeploymentPlanStep(
                 "collect_diagnostics",
-                "Inspect worker and user-service diagnostics",
+                "Inspect worker and system-service diagnostics",
                 False,
             ),
             DeploymentPlanStep(
@@ -904,7 +895,7 @@ def _deployment_plan(
                 "replace_release", "Atomically replace the broken worker release", True
             ),
             DeploymentPlanStep(
-                "restart_user_service", "Restart only the worker user service", True
+                "restart_system_service", "Restart only the worker system service", True
             ),
             DeploymentPlanStep(
                 "reconcile_runs",

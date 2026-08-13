@@ -24,6 +24,7 @@ DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE = (
 DEPLOYMENT_INVALID_REQUEST_CODE = "training_node_deployment_invalid_request"
 DEPLOYMENT_FAILED_CODE = "training_node_deployment_failed"
 DEPLOYMENT_ENROLLMENT_REQUIRED_CODE = "training_node_deployment_enrollment_required"
+WORKER_REMOVAL_FAILED_CODE = "training_node_worker_removal_failed"
 
 WORKER_ACCOUNT = "datapilot-worker"
 WORKER_GROUP = "datapilot-worker"
@@ -266,6 +267,29 @@ class WorkerDeploymentResult:
     unchanged_steps: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerRemovalRequest:
+    node_ref: str
+    sudo_password_mode: SudoPasswordMode = SudoPasswordMode.SAME_AS_SSH
+    sudo_password: str | None = field(default=None, repr=False)
+
+    def validate(self) -> None:
+        if not re.fullmatch(r"node_[A-Za-z0-9_-]{8,120}", self.node_ref):
+            _invalid("Training node reference has an unsupported format")
+        if self.sudo_password_mode is SudoPasswordMode.SEPARATE:
+            if not _valid_password(self.sudo_password):
+                _invalid("Separate sudo password is missing or malformed")
+        elif self.sudo_password is not None:
+            _invalid("sudo_password is only valid in separate mode")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRemovalResult:
+    node_ref: str
+    privilege: DeploymentPrivilege
+    removed: bool
+
+
 class SystemWorkerDeploymentBackend(Protocol):
     """High-level backend; every operation must be fixed and idempotent.
 
@@ -347,6 +371,12 @@ class SystemWorkerDeploymentBackend(Protocol):
     def system_service_is_active(
         self,
         unit_name: str,
+        *,
+        privilege: DeploymentPrivilege,
+    ) -> bool: ...
+
+    def remove_system_worker(
+        self,
         *,
         privilege: DeploymentPrivilege,
     ) -> bool: ...
@@ -528,6 +558,48 @@ class TrainingWorkerSystemDeployer:
         )
 
 
+class TrainingWorkerSystemRemover:
+    """Remove only the fixed DataPilot Worker system installation."""
+
+    def remove(
+        self,
+        backend: SystemWorkerDeploymentBackend,
+        request: WorkerRemovalRequest,
+    ) -> WorkerRemovalResult:
+        request.validate()
+        try:
+            privilege = backend.inspect_privilege(
+                sudo_password_mode=request.sudo_password_mode,
+                sudo_password=request.sudo_password,
+            )
+        except TrainingNodeDeploymentError:
+            raise
+        except Exception as exc:
+            raise TrainingNodeDeploymentError(
+                WORKER_REMOVAL_FAILED_CODE,
+                "Training Worker removal privilege check failed",
+            ) from exc
+        if privilege not in {DeploymentPrivilege.ROOT, DeploymentPrivilege.SUDO}:
+            raise TrainingNodeDeploymentError(
+                DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE,
+                "The deployment account is neither root nor permitted to use sudo",
+            )
+        try:
+            removed = backend.remove_system_worker(privilege=privilege)
+        except TrainingNodeDeploymentError:
+            raise
+        except Exception as exc:
+            raise TrainingNodeDeploymentError(
+                WORKER_REMOVAL_FAILED_CODE,
+                "Training Worker system removal failed",
+            ) from exc
+        return WorkerRemovalResult(
+            node_ref=request.node_ref,
+            privilege=privilege,
+            removed=removed,
+        )
+
+
 def _environment_content(request: WorkerDeploymentRequest) -> bytes:
     # Validation restricts values to single-line, EnvironmentFile-safe tokens.
     content = (
@@ -596,9 +668,13 @@ __all__ = [
     "SystemWorkerDeploymentBackend",
     "TrainingNodeDeploymentError",
     "TrainingWorkerSystemDeployer",
+    "TrainingWorkerSystemRemover",
     "WORKER_CENTER_CA_PATH",
     "WorkerDeploymentRequest",
     "WorkerDeploymentResult",
+    "WorkerRemovalRequest",
+    "WorkerRemovalResult",
     "WorkerRelease",
+    "WORKER_REMOVAL_FAILED_CODE",
     "inspect_deployment_privilege",
 ]

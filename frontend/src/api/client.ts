@@ -21,7 +21,9 @@ import type {
   TrainingMetricSample,
   TrainingNode,
   TrainingNodeDeploymentResult,
+  TrainingNodeRemovalResult,
   TrainingNodeHostKey,
+  TrainingNodePreflightResult,
   TrainingNodeResourceSnapshot,
   TrainingParameterDefinition,
   TrainingLaunchTemplate,
@@ -256,6 +258,32 @@ export async function deployTrainingNodeWorker(nodeRef: string, payload: {
   sudo_password?: string;
 }): Promise<TrainingNodeDeploymentResult> {
   return requestJson<TrainingNodeDeploymentResult>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/deploy-worker`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function preflightTrainingNodeWorker(nodeRef: string, payload: {
+  expected_revision: number;
+  confirmed_host_key: TrainingNodeHostKey;
+  host_key_confirmed: true;
+  ssh_password: string;
+  sudo_password_mode: "same_as_ssh" | "separate" | "not_required";
+  sudo_password?: string;
+}): Promise<TrainingNodePreflightResult> {
+  return requestJson<TrainingNodePreflightResult>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/preflight-worker`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function removeTrainingNodeWorker(nodeRef: string, payload: {
+  expected_revision: number;
+  ssh_password: string;
+  sudo_password_mode: "same_as_ssh" | "separate" | "not_required";
+  sudo_password?: string;
+}): Promise<TrainingNodeRemovalResult> {
+  return requestJson<TrainingNodeRemovalResult>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/remove-worker`, {
     method: "POST",
     body: JSON.stringify(payload),
   });

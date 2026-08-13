@@ -56,7 +56,7 @@ from vla_data_juicer_agents.training.auth import TrainingSettings
 from vla_data_juicer_agents.training.node_deployment import (
     AutomatedNodeDeploymentManager,
 )
-from vla_data_juicer_agents.training.resources import FakeResourceProvider
+from vla_data_juicer_agents.training.resources import TrainingResourceProvider
 from vla_data_juicer_agents.training.service import TrainingService
 from vla_data_juicer_agents.training.store import TrainingStore
 from vla_data_juicer_agents.training.worker import TrainingWorker
@@ -187,7 +187,7 @@ def create_app(
         )
         training_settings = TrainingSettings.from_env()
         training_store = TrainingStore(training_database_path)
-        training_provider = FakeResourceProvider(training_store)
+        training_provider = TrainingResourceProvider(training_store)
         node_deployment_manager = (
             AutomatedNodeDeploymentManager(
                 center_base_url=training_settings.center_base_url,

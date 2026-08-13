@@ -54,6 +54,7 @@ export const navilaTrajectoryLaunchTemplate = {
   domain: "vla",
   server_ref: "fake-local",
   working_directory: "/workspace/navila",
+  launcher_kind: "torchrun" as const,
   executable: "torchrun",
   entrypoint: "llava/train/train_mem.py",
   fixed_argv: [] as string[],
