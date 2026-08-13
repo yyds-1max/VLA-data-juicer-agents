@@ -4,6 +4,8 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -32,6 +34,9 @@ from vla_data_juicer_agents.training.worker_deployment import (
     WorkerRemovalRequest,
     WorkerRelease,
     inspect_deployment_privilege,
+)
+from vla_data_juicer_agents.training.worker_deployment_ssh import (
+    _REMOTE_INSTALLER,
 )
 
 
@@ -157,6 +162,38 @@ def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     assert WORKER_STATE_ROOT in SYSTEMD_UNIT
     assert WORKER_CONFIG_ROOT in WORKER_ENVIRONMENT_PATH
     assert WORKER_CURRENT_LINK in SYSTEMD_UNIT
+
+
+def test_remote_installer_restarts_an_already_active_worker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fixed_systemctl(command: list[str], **_kwargs: object) -> object:
+        calls.append(tuple(command))
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setattr(subprocess, "run", fixed_systemctl)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["remote-installer", "start_service", json.dumps({"unit_name": "datapilot-training-worker.service"})],
+    )
+
+    exec(compile(_REMOTE_INSTALLER, "<remote-installer>", "exec"), {})
+
+    assert ("/usr/bin/systemctl", "daemon-reload") in calls
+    assert (
+        "/usr/bin/systemctl",
+        "restart",
+        "datapilot-training-worker.service",
+    ) in calls
+    assert not any("enable --now" in " ".join(call) for call in calls)
+    assert json.loads(capsys.readouterr().out) == {"changed": True, "value": None}
 
 
 def test_system_worker_removal_is_fixed_idempotent_and_requires_privilege() -> None:

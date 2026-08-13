@@ -238,8 +238,16 @@ elif operation == "start_service":
     active = subprocess.run(
         ["/usr/bin/systemctl", "is-active", "--quiet", unit]
     ).returncode == 0
-    subprocess.run(["/usr/bin/systemctl", "enable", "--now", unit], check=True)
-    output(not enabled or not active)
+    if not enabled:
+        subprocess.run(["/usr/bin/systemctl", "enable", unit], check=True)
+    # ``enable --now`` leaves an already-running process untouched.  A repair
+    # or release activation must restart that process so it actually loads the
+    # newly selected immutable artifact and any updated unit/environment.
+    subprocess.run(
+        ["/usr/bin/systemctl", "restart" if active else "start", unit],
+        check=True,
+    )
+    output(True)
 elif operation == "is_active":
     active = subprocess.run([
         "/usr/bin/systemctl", "is-active", "--quiet", arguments["unit_name"]
