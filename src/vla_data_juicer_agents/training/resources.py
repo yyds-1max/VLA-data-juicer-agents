@@ -66,38 +66,26 @@ class FakeResourceProvider:
 
 
 class TrainingResourceProvider:
-    """Unified inventory for simulation and enrolled Training Nodes.
+    """Inventory backed exclusively by enrolled Training Nodes.
 
     This provider is deliberately an inventory adapter, not an execution
     switch.  A real node appearing here does not enable real training.  The
     service's execution-mode gate remains authoritative.
 
-    Fake resources retain their deterministic lease/external-occupancy
-    semantics.  Real node resources are trusted, authenticated Worker
-    snapshots: selection checks only node health and GPU identity.  It never
-    guesses external occupancy from utilisation or memory consumption.
+    Node resources are trusted, authenticated Worker snapshots: selection
+    checks only node health and GPU identity.  It never guesses external
+    occupancy from utilisation or memory consumption.  Local simulation tests
+    inject ``FakeResourceProvider`` directly instead of exposing fake hardware
+    through this production catalog.
     """
 
     _SCHEDULABLE_STATUS = "online"
 
-    def __init__(
-        self,
-        store: TrainingStore,
-        *,
-        simulation_provider: FakeResourceProvider | None = None,
-    ) -> None:
+    def __init__(self, store: TrainingStore) -> None:
         self.store = store
-        self.simulation_provider = simulation_provider or FakeResourceProvider(store)
 
     def list_servers(self) -> list[dict[str, Any]]:
         nodes = self.store.list_nodes()
-        # The deterministic Fake server is only a bootstrap fallback for a
-        # fresh local installation.  As soon as an administrator has
-        # registered a Training Node, the public resource catalog is backed
-        # exclusively by authenticated Worker snapshots.
-        if not nodes:
-            return [dict(server) for server in self.simulation_provider.list_servers()]
-
         servers: list[dict[str, Any]] = []
         for node in nodes:
             snapshot = self.store.get_node_resources(node["node_ref"])
@@ -127,9 +115,6 @@ class TrainingResourceProvider:
         return servers
 
     def resources(self, server_ref: str) -> dict[str, Any]:
-        if server_ref in self.simulation_provider.compatible_server_refs:
-            return self.simulation_provider.resources(server_ref)
-
         node = self._get_node(server_ref)
         snapshot = self.store.get_node_resources(server_ref)
         connected = node["status"] == self._SCHEDULABLE_STATUS
@@ -184,16 +169,9 @@ class TrainingResourceProvider:
         *,
         ignore_platform_leases: bool = False,
     ) -> list[dict[str, Any]]:
-        if server_ref in self.simulation_provider.compatible_server_refs:
-            return self.simulation_provider.require_available(
-                server_ref,
-                gpu_uuids,
-                ignore_platform_leases=ignore_platform_leases,
-            )
-
-        # ``ignore_platform_leases`` belongs exclusively to simulation retry
-        # handling.  Real-node validation intentionally does not consult the
-        # fake provider's platform leases or external-occupancy heuristic.
+        # ``ignore_platform_leases`` belongs exclusively to an explicitly
+        # injected simulation provider. Real-node validation intentionally
+        # does not infer external occupancy from utilization or memory use.
         del ignore_platform_leases
         node = self._get_node(server_ref)
         resources = self.resources(server_ref)

@@ -371,7 +371,7 @@ class TrainingService:
         ):
             raise TrainingValidationError(
                 "server_not_found",
-                "请从已登记的训练节点或模拟服务器中选择模型运行位置。",
+                "请先登记训练节点，并从已登记节点中选择模型运行位置。",
             )
 
     @staticmethod

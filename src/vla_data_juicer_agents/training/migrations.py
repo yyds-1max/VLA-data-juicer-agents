@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 5
+LATEST_TRAINING_SCHEMA_VERSION = 6
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -55,6 +55,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(5,?,?)",
             ("model_worker_verification_m5", applied_at),
+        )
+        connection.commit()
+        versions.append(5)
+    if 6 not in versions:
+        connection.executescript(_MIGRATION_006)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(6,?,?)",
+            ("training_node_revision_split_m6", applied_at),
         )
         connection.commit()
 
@@ -312,5 +320,14 @@ CREATE INDEX idx_model_verification_node_status
   ON model_verification_requests(node_id,status,id);
 CREATE INDEX idx_model_verification_model
   ON model_verification_requests(model_id,id DESC);
+COMMIT;
+"""
+
+
+_MIGRATION_006 = """
+BEGIN IMMEDIATE;
+ALTER TABLE training_nodes ADD COLUMN heartbeat_revision INTEGER NOT NULL DEFAULT 0;
+UPDATE training_nodes
+SET heartbeat_revision=CASE WHEN last_heartbeat_at IS NULL THEN 0 ELSE 1 END;
 COMMIT;
 """

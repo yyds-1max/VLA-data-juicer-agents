@@ -125,6 +125,7 @@ class TrainingStore:
                 row, offline_after_seconds=offline_after_seconds
             ),
             "state_revision": row["state_revision"],
+            "heartbeat_revision": row["heartbeat_revision"],
             "enrolled_at": row["enrolled_at"],
             "last_heartbeat_at": row["last_heartbeat_at"],
             "last_seen_at": row["last_heartbeat_at"],
@@ -627,7 +628,7 @@ class TrainingStore:
             )
             db.execute(
                 """UPDATE training_nodes SET
-                status='online',state_revision=state_revision+1,
+                status='online',heartbeat_revision=heartbeat_revision+1,
                 enrolled_at=COALESCE(enrolled_at,?),last_heartbeat_at=?,
                 worker_instance_id=?,worker_version=?,protocol_version=?,
                 worker_token_sha256=?,health_message=NULL,capabilities_json=?,
@@ -695,7 +696,8 @@ class TrainingStore:
                 """UPDATE training_nodes SET
                 status=?,last_heartbeat_at=?,
                 worker_version=?,protocol_version=?,health_message=?,
-                capabilities_json=?,updated_at=? WHERE id=?""",
+                capabilities_json=?,heartbeat_revision=heartbeat_revision+1
+                WHERE id=?""",
                 (
                     status,
                     timestamp,
@@ -703,7 +705,6 @@ class TrainingStore:
                     data["protocol_version"],
                     data.get("health_message"),
                     capabilities_json,
-                    timestamp,
                     row["id"],
                 ),
             )

@@ -1134,6 +1134,7 @@ def create_training_router(
             "node_ref": node["node_ref"],
             "status": node["status"],
             "state_revision": node["state_revision"],
+            "heartbeat_revision": node["heartbeat_revision"],
             "server_time": datetime.now(UTC).isoformat(timespec="milliseconds"),
             "next_heartbeat_seconds": 15,
             "command": heartbeat.get("command"),

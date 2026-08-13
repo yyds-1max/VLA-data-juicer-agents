@@ -489,6 +489,7 @@ export interface TrainingNode {
   installed_worker_version?: string | null;
   status: TrainingNodeStatus;
   state_revision: number;
+  heartbeat_revision: number;
   enrolled_at?: string | null;
   last_heartbeat_at?: string | null;
   last_seen_at?: string | null;

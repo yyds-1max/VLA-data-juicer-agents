@@ -30,12 +30,13 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 1. 打开“模型训练”，确认页面标明真实训练未启用。
 2. 登记一个模型族及其 `v1` 训练配置；`num_video_frames` 的实际字段值决定帧数。
-3. 在尚未登记真实节点的本地环境中，选择 Fake A100 资源并生成 RunSpec 预览。
-4. 点击“启动模拟训练”，观察日志、Loss、学习率和 GPU 指标更新。
-5. 停止运行中的模拟任务，确认状态变为已取消且 GPU 可再次选择。
+3. 尚未登记训练节点时，确认“服务器资源”显示空状态，不出现示例 GPU。
+4. 登记训练节点并部署 Worker，确认真实 CPU、内存、磁盘和 GPU 快照出现在
+   “服务器资源”。
+5. 在模型版本上执行配置验证，确认检查由绑定节点的 Worker 只读完成。
 
-预览中的 argv 仅用于展示。Fake Runner 直接生成确定性的模拟事件，不执行预览
-文本或登记的入口路径。
+预览中的 argv 仅用于展示。Fake Provider 和 Fake Runner 仍用于自动化测试，但不会
+作为 Web 资源目录的兜底数据；没有已登记训练节点时，公共服务器列表为空。
 
 ## 模型族与版本如何登记
 
@@ -45,8 +46,7 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 用于草稿并发控制和历史 RunSpec 还原；API 只把当前值作为 `edit_revision` 并发令牌，
 页面不展示，也不能用它选择历史训练配置。
 
-管理员先从已登记训练节点或本地模拟服务器中
-选择运行位置，再登记 launcher、工作目录、
+管理员先从已登记训练节点中选择运行位置，再登记 launcher、工作目录、
 训练入口、输出根目录，以及一组类型化的训练脚本参数。参数无需预先填写数量，可
 逐项添加或删除，并为每项设置字段名、CLI flag、类型、默认值、范围、枚举选项、
 是否敏感、argv 表达方式、参数用途和展示分组。字符串或枚举参数可标记为唯一的
@@ -134,10 +134,9 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 ## 真实训练边界
 
 本里程碑已经建立训练节点、只读 Worker 和 SSH preflight，并把真实节点资源接入模型
-注册与新建训练。没有登记节点的开发环境仍提供 Fake Server 作为模拟链路入口；一旦
-登记任意真实节点，服务器目录与“服务器资源”页面只展示 Worker 上报的真实节点，不再
-混入 Fake GPU。资源详情集中在“服务器资源”，训练节点页只负责登记、部署、修复、删除
-Worker 和查看节点状态。绑定真实节点的模型可以查看节点快照和
+注册与新建训练。服务器目录与“服务器资源”页面只展示 Worker 上报的真实节点；没有
+登记节点时显示空状态，不混入 Fake GPU。资源详情集中在“服务器资源”，训练节点页
+只负责登记、部署、修复、删除 Worker 和查看节点状态。绑定真实节点的模型可以查看节点快照和
 填写参数，但页面不会开放模拟预览、GPU 选择或启动按钮，后端同样拒绝在真实节点上
 创建 Fake Run。真实 Runner
 仍保持关闭。在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用
@@ -151,6 +150,9 @@ Worker 和查看节点状态。绑定真实节点的模型可以查看节点快�
 环境变量或远端文件。节点状态为 `pending_enrollment / online / degraded / offline /
 repair_required / disabled`，在线状态由中心根据最近心跳计算，不能由 Worker 自报。
 默认只读身份只能查看安全投影，地址和 SSH 信息仅 `training:manage_nodes` 可见。
+节点的 `state_revision` 只用于名称、地址、部署、停用等管理操作的乐观并发；Worker
+注册和每次心跳使用独立的 `heartbeat_revision`。心跳只更新运行状态、资源快照和
+`last_heartbeat_at`，不会让已经打开的管理表单失效。
 
 部署时中心内部签发 600 秒有效的一次性 enrollment token；新 token 会使此前未使用的
 token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换取的 bearer token

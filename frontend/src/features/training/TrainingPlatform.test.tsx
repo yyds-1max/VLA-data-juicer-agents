@@ -36,7 +36,7 @@ const launchTemplate = { domain: "vla", server_ref: "fake-local", working_direct
 const model: TrainingModel = { model_ref: "navila", family_ref: "navila-family", family_name: "NaVILA", version_number: 1, version_description: "draft model", based_on_model_ref: null, status: "draft", edit_revision: 1, has_runs: false, configuration_editable: true, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", configuration: { fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
 const runningRun: TrainingRun = { run_ref: "run-running", model_ref: "navila", family_ref: "navila-family", family_name: "NaVILA", model_version_number: 1, model_display_name: "NaVILA v1", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", model_version_number: 2, model_display_name: "NaVILA v2", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20 };
-const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer", status: "pending_enrollment", state_revision: 1, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
+const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer", status: "pending_enrollment", state_revision: 1, heartbeat_revision: 0, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
 
 class TestResizeObserver {
   observe() {}
@@ -145,6 +145,20 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("1200 GiB / 2000 GiB")).toBeVisible();
     expect(screen.getByLabelText("/ 可用 40%")).toBeVisible();
     expect(screen.getByLabelText("/data 可用 60%")).toBeVisible();
+  });
+
+  it("shows an honest empty state when no training node is registered", async () => {
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([]);
+    renderPlatform();
+
+    fireEvent.click(await screen.findByRole("tab", { name: "服务器资源" }));
+    expect(await screen.findByText("尚未发现训练服务器")).toBeVisible();
+    expect(screen.getByText("服务器接入后可在此切换查看资源。")).toBeVisible();
+    expect(trainingApi.getTrainingServerResources).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+    expect(await screen.findByRole("option", { name: "尚未登记训练节点" })).toBeVisible();
   });
 
   it("requires two confirmations and temporary SSH credentials before removing a Worker", async () => {

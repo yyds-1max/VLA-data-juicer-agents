@@ -120,10 +120,10 @@ def _heartbeat(
     )
 
 
-def test_catalog_replaces_fake_server_after_first_node_registration(
+def test_catalog_is_empty_until_first_node_registration(
     store: TrainingStore, provider: TrainingResourceProvider
 ) -> None:
-    assert provider.list_servers() == FakeResourceProvider(store).list_servers()
+    assert provider.list_servers() == []
     node = _create_node(store)
 
     servers = provider.list_servers()
@@ -269,9 +269,10 @@ def test_expired_heartbeat_hides_old_snapshot_but_preserves_timestamp(
     assert all(gpu["available"] is False for gpu in resources["gpus"])
 
 
-def test_fake_provider_selection_semantics_are_unchanged(
-    provider: TrainingResourceProvider,
+def test_fake_provider_remains_available_only_when_explicitly_injected(
+    store: TrainingStore,
 ) -> None:
+    provider = FakeResourceProvider(store)
     selected = provider.require_available("fake-local", ["fake-a100-00"])
     assert selected[0]["gpu_uuid"] == "fake-a100-00"
 
@@ -280,9 +281,10 @@ def test_fake_provider_selection_semantics_are_unchanged(
     assert raised.value.code == "gpu_unavailable"
 
 
-def test_unknown_catalog_server_uses_existing_server_error_contract(
-    provider: TrainingResourceProvider,
+@pytest.mark.parametrize("server_ref", ["node_missing", "fake-local"])
+def test_unknown_or_fake_catalog_server_uses_existing_server_error_contract(
+    provider: TrainingResourceProvider, server_ref: str
 ) -> None:
     with pytest.raises(TrainingNotFoundError) as raised:
-        provider.resources("node_missing")
+        provider.resources(server_ref)
     assert raised.value.code == "server_not_found"

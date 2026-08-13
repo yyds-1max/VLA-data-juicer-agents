@@ -12,7 +12,13 @@ from fastapi.testclient import TestClient
 from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
 from vla_data_juicer_agents.training.errors import TrainingValidationError
-from vla_data_juicer_agents.training.migrations import _MIGRATION_001
+from vla_data_juicer_agents.training.migrations import (
+    _MIGRATION_001,
+    _MIGRATION_002,
+    _MIGRATION_003,
+    _MIGRATION_004,
+    _MIGRATION_005,
+)
 from vla_data_juicer_agents.training.resources import FakeResourceProvider
 from vla_data_juicer_agents.training.service import TrainingService
 from vla_data_juicer_agents.training.store import TrainingStore
@@ -196,9 +202,61 @@ def test_existing_m1_database_is_upgraded_without_recreating_training_data(
             """SELECT name FROM sqlite_master
             WHERE type='table' AND name='training_nodes'"""
         ).fetchone()
-    assert versions == [(1,), (2,), (3,), (4,), (5,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
     assert model_name == "Existing"
     assert node_table == ("training_nodes",)
+
+
+def test_m5_upgrade_preserves_management_revision_and_starts_heartbeat_revision(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "training.sqlite"
+    migrations = (
+        (1, "training_platform_m1", _MIGRATION_001),
+        (2, "training_nodes_m2", _MIGRATION_002),
+        (3, "training_node_deployment_m3", _MIGRATION_003),
+        (4, "model_families_m4", _MIGRATION_004),
+        (5, "model_worker_verification_m5", _MIGRATION_005),
+    )
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """CREATE TABLE training_schema_migrations (
+            version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"""
+        )
+        for version, name, script in migrations:
+            db.executescript(script)
+            db.execute(
+                """INSERT INTO training_schema_migrations(version,name,applied_at)
+                VALUES(?,?,?)""",
+                (version, name, "2026-01-01T00:00:00+00:00"),
+            )
+        db.execute(
+            """INSERT INTO training_nodes(
+            node_ref,name,description,address,ssh_port,ssh_username,status,
+            state_revision,last_heartbeat_at,created_at,updated_at)
+            VALUES('node_existing','Existing','','192.0.2.1',22,'trainer','online',
+            812,'2026-01-01T00:01:00+00:00',
+            '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')"""
+        )
+        db.execute(
+            """INSERT INTO training_nodes(
+            node_ref,name,description,address,ssh_port,ssh_username,status,
+            state_revision,created_at,updated_at)
+            VALUES('node_pending','Pending','','192.0.2.2',22,'trainer',
+            'pending_enrollment',3,
+            '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')"""
+        )
+        db.commit()
+
+    store = TrainingStore(path)
+    TrainingStore(path)
+
+    existing = store.get_node("node_existing", offline_after_seconds=10**9)
+    pending = store.get_node("node_pending")
+    assert existing["state_revision"] == 812
+    assert existing["heartbeat_revision"] == 1
+    assert pending["state_revision"] == 3
+    assert pending["heartbeat_revision"] == 0
 
 
 def _issue_token(client: TestClient, node: dict[str, object]) -> str:
@@ -383,6 +441,8 @@ def test_heartbeat_does_not_change_management_revision(
     node = _create_node(client)
     enrolled = _enroll(client, _issue_token(client, node))
     before = enrolled["node"]["state_revision"]
+    heartbeat_before = enrolled["node"]["heartbeat_revision"]
+    management_updated_at = enrolled["node"]["updated_at"]
 
     response = client.post(
         f"/api/training/nodes/{node['node_ref']}/heartbeat",
@@ -398,6 +458,18 @@ def test_heartbeat_does_not_change_management_revision(
 
     assert response.status_code == 200
     assert response.json()["state_revision"] == before
+    assert response.json()["heartbeat_revision"] == heartbeat_before + 1
+    refreshed = client.get(f"/api/training/nodes/{node['node_ref']}").json()["node"]
+    assert refreshed["state_revision"] == before
+    assert refreshed["heartbeat_revision"] == heartbeat_before + 1
+    assert refreshed["updated_at"] == management_updated_at
+
+    updated = client.put(
+        f"/api/training/nodes/{node['node_ref']}",
+        json={"expected_revision": before, "description": "still current"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["node"]["state_revision"] == before + 1
 
 
 def test_deployment_account_without_root_or_sudo_returns_explicit_error(

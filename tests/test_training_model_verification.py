@@ -185,16 +185,25 @@ def test_verification_requires_online_real_worker_and_worker_authentication(tmp_
     store = TrainingStore(tmp_path / "training.sqlite")
     service = TrainingService(store, TrainingResourceProvider(store))
     admin = _client(service)
-    fake_model = admin.post(
+    pending_node = admin.post(
+        "/api/training/nodes",
+        json={
+            "name": "Pending node",
+            "address": "192.0.2.21",
+            "ssh_port": 22,
+            "ssh_username": "trainer",
+        },
+    ).json()["node"]
+    pending_model = admin.post(
         "/api/training/models",
-        json={**_model_payload("fake-local")},
+        json=_model_payload(str(pending_node["node_ref"])),
     ).json()["model"]
     rejected = admin.post(
-        f"/api/training/models/{fake_model['model_ref']}/verify",
-        json={"expected_revision": fake_model["edit_revision"]},
+        f"/api/training/models/{pending_model['model_ref']}/verify",
+        json={"expected_revision": pending_model["edit_revision"]},
     )
     assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "model_verification_requires_training_node"
+    assert rejected.json()["detail"]["code"] == "model_verification_node_unavailable"
 
     node, worker_token = _register_online_node(admin)
     _heartbeat(admin, str(node["node_ref"]), worker_token)
