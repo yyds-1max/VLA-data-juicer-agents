@@ -357,7 +357,7 @@ export interface TrainingParameterDefinition {
   string_max_length?: number | null;
   /** Enable and emit this parameter only while the referenced parameter equals the configured value. */
   visible_when?: { parameter_key: string; equals: string | number | boolean } | null;
-  /** Revision-owned layout metadata. Legacy revisions omit these fields and are grouped by known keys. */
+  /** Model-version-owned layout metadata. Older configurations omit these fields and are grouped by known keys. */
   display_group?: string | null;
   display_group_label?: string | null;
   display_group_order?: number | null;
@@ -369,9 +369,7 @@ export interface TrainingParameterDefinition {
   cli_flag?: string | null;
 }
 
-export interface TrainingModelRevision {
-  revision: number;
-  created_at: string;
+export interface TrainingModelConfiguration {
   parameter_definitions: TrainingParameterDefinition[];
   fixed_argv: string[];
   output_preview?: string | null;
@@ -396,13 +394,18 @@ export interface TrainingLaunchTemplate {
 
 export interface TrainingModel {
   model_ref: string;
-  name: string;
-  description?: string | null;
+  family_ref: string;
+  family_name: string;
+  version_number: number;
+  version_description?: string | null;
+  based_on_model_ref?: string | null;
   status: TrainingModelStatus;
-  latest_revision: number;
+  edit_revision: number;
+  has_runs: boolean;
+  configuration_editable: boolean;
   created_at: string;
   updated_at: string;
-  revision?: TrainingModelRevision;
+  configuration?: TrainingModelConfiguration;
 }
 
 export interface TrainingGpuResource {
@@ -581,8 +584,10 @@ export interface TrainingRunLog {
 export interface TrainingRun {
   run_ref: string;
   model_ref: string;
-  model_name: string;
-  model_revision: number;
+  family_ref: string;
+  family_name: string;
+  model_version_number: number;
+  model_display_name: string;
   status: TrainingRunStatus;
   state_revision: number;
   server_ref: string;

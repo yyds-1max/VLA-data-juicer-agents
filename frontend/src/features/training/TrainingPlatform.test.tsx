@@ -15,7 +15,7 @@ vi.mock("../../api/client", () => ({
     }
   },
   getTrainingCapabilities: vi.fn(), listTrainingModels: vi.fn(), listTrainingServers: vi.fn(),
-  getTrainingServerResources: vi.fn(), listTrainingNodes: vi.fn(), getTrainingNodeResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(),
+  getTrainingServerResources: vi.fn(), listTrainingNodes: vi.fn(), getTrainingNodeResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(), createTrainingModelVersion: vi.fn(),
   createTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), preflightTrainingNodeWorker: vi.fn(), deployTrainingNodeWorker: vi.fn(), removeTrainingNodeWorker: vi.fn(),
   updateTrainingModel: vi.fn(),
   previewTrainingRun: vi.fn(), createTrainingRun: vi.fn(), getTrainingRun: vi.fn(),
@@ -33,9 +33,9 @@ const resources: TrainingServerResources = { server, sampled_at: "2026-08-06T00:
 const secondaryServer: TrainingServer = { server_ref: "fake-west", name: "Fake L40S Server", kind: "simulation", gpu_count: 4 };
 const secondaryResources: TrainingServerResources = { server: secondaryServer, sampled_at: "2026-08-06T00:01:00Z", gpus: [{ gpu_uuid: "GPU-WEST-1", index: 1, name: "L40S", total_memory_mib: 49152, used_memory_mib: 12288, utilization_percent: 38, temperature_c: 52, externally_occupied: false }] };
 const launchTemplate = { domain: "vla", server_ref: "fake-local", working_directory: "/workspace/project", launcher_kind: "direct" as const, executable: "python", entrypoint: "train.py", fixed_argv: ["--deepspeed", "configs/zero3.json"], output_root: "/workspace/outputs", output_flag: "--output_dir", runtime_environment: { kind: "system" as const }, monitoring: { source: "stdout" as const, format: "plain" as const } };
-const model: TrainingModel = { model_ref: "navila", name: "NaVILA", description: "draft model", status: "draft", latest_revision: 1, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", revision: { revision: 1, created_at: "2026-08-06T00:00:00Z", fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
-const runningRun: TrainingRun = { run_ref: "run-running", model_ref: "navila", model_name: "NaVILA Running", model_revision: 1, status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
-const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", model_name: "NaVILA Succeeded", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20 };
+const model: TrainingModel = { model_ref: "navila", family_ref: "navila-family", family_name: "NaVILA", version_number: 1, version_description: "draft model", based_on_model_ref: null, status: "draft", edit_revision: 1, has_runs: false, configuration_editable: true, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", configuration: { fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
+const runningRun: TrainingRun = { run_ref: "run-running", model_ref: "navila", family_ref: "navila-family", family_name: "NaVILA", model_version_number: 1, model_display_name: "NaVILA v1", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
+const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", model_version_number: 2, model_display_name: "NaVILA v2", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20 };
 const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer", status: "pending_enrollment", state_revision: 1, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
 
 class TestResizeObserver {
@@ -66,7 +66,7 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     expect(await screen.findByText("真实训练未启用")).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
-    expect(await screen.findByRole("button", { name: "创建草稿" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "创建 v1" })).toBeDisabled();
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
     expect(await screen.findByRole("button", { name: "启动模拟训练" })).toBeDisabled();
   });
@@ -215,9 +215,9 @@ describe("TrainingPlatform", () => {
   });
 
   it("surfaces a registered dataset parameter separately from hyperparameters", async () => {
-    const datasetModel: TrainingModel = { ...model, revision: { ...model.revision!, parameter_definitions: [
+    const datasetModel: TrainingModel = { ...model, configuration: { ...model.configuration!, parameter_definitions: [
       { key: "data_mixture", label: "数据混合配置", type: "string", semantic_role: "dataset", default: "rxr", editable: true },
-      ...model.revision!.parameter_definitions,
+      ...model.configuration!.parameter_definitions,
     ] } };
     mockApi(adminCapabilities, [datasetModel]);
     renderPlatform();
@@ -245,12 +245,12 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
     expect(screen.getByLabelText("启动方式 · Launcher")).toHaveValue("torchrun");
     expect(screen.getByText(/--master_port=<自动分配>/)).toBeVisible();
-    fireEvent.click(await screen.findByRole("button", { name: "创建草稿" }));
+    fireEvent.click(await screen.findByRole("button", { name: "创建 v1" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     expect(trainingApi.createTrainingModel).toHaveBeenCalledWith(expect.objectContaining({
-      name: "NaVILA 轨迹训练",
-      launch_template: expect.objectContaining({ server_ref: "fake-local", launcher_kind: "torchrun", executable: "torchrun", entrypoint: "llava/train/train_mem.py", fixed_argv: [], output_flag: "--output_dir", runtime_environment: { kind: "system" }, monitoring: { source: "stdout", format: "transformers" } }),
-      parameter_definitions: expect.arrayContaining([expect.objectContaining({ key: "num_video_frames", default: 4 }), expect.objectContaining({ key: "tune_vision_tower", argument_style: "explicit_boolean" }), expect.objectContaining({ key: "longvila_sampler", editable: true }), expect.objectContaining({ key: "save_steps", visible_when: { parameter_key: "save_strategy", equals: "steps" } })]),
+      family_name: "NaVILA 轨迹训练",
+      configuration: expect.objectContaining({ launch_template: expect.objectContaining({ server_ref: "fake-local", launcher_kind: "torchrun", executable: "torchrun", entrypoint: "llava/train/train_mem.py", fixed_argv: [], output_flag: "--output_dir", runtime_environment: { kind: "system" }, monitoring: { source: "stdout", format: "transformers" } }),
+      parameter_definitions: expect.arrayContaining([expect.objectContaining({ key: "num_video_frames", default: 4 }), expect.objectContaining({ key: "tune_vision_tower", argument_style: "explicit_boolean" }), expect.objectContaining({ key: "longvila_sampler", editable: true }), expect.objectContaining({ key: "save_steps", visible_when: { parameter_key: "save_strategy", equals: "steps" } })]) }),
     }));
   });
 
@@ -269,17 +269,58 @@ describe("TrainingPlatform", () => {
     expect(commandSummary).not.toHaveTextContent("--nproc_per_node");
     expect(screen.getByText("GPU 和输出目录由平台管理；直接执行不会注入 Torchrun 分布式参数。")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     expect(trainingApi.createTrainingModel).toHaveBeenCalledWith(expect.objectContaining({
-      launch_template: expect.objectContaining({ launcher_kind: "direct", executable: "python", entrypoint: "llava/train/train_mem.py" }),
+      configuration: expect.objectContaining({ launch_template: expect.objectContaining({ launcher_kind: "direct", executable: "python", entrypoint: "llava/train/train_mem.py" }) }),
     }));
+  });
+
+  it("groups model versions and creates the next version from the latest base", async () => {
+    const version2: TrainingModel = {
+      ...model,
+      model_ref: "navila-v2",
+      version_number: 2,
+      version_description: "冻结版本",
+      based_on_model_ref: model.model_ref,
+      edit_revision: 2,
+      has_runs: true,
+      configuration_editable: false,
+    };
+    const version3: TrainingModel = { ...version2, model_ref: "navila-v3", version_number: 3, version_description: "轨迹分支调整", based_on_model_ref: version2.model_ref, has_runs: false, configuration_editable: true };
+    mockApi(adminCapabilities, [model, version2]);
+    vi.mocked(trainingApi.createTrainingModelVersion).mockResolvedValue(version3);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
+
+    expect(screen.getByText("2 个版本 · 最新 v2")).toBeVisible();
+    expect(screen.getByText("配置已冻结")).toBeVisible();
+    expect(screen.getByRole("button", { name: "编辑 v1" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "登记新版本" }));
+    expect(screen.getByRole("heading", { name: "登记新版本 v3" })).toBeVisible();
+    const baseSelect = screen.getByRole("combobox", { name: "基于版本" });
+    expect(baseSelect).toHaveValue(version2.model_ref);
+
+    const help = screen.getByRole("button", { name: "基于版本说明" });
+    fireEvent.focus(help);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("复制所选版本的训练节点、启动入口和参数定义作为新版本的初始配置。创建后可继续修改，不会影响原版本及其训练记录。");
+    fireEvent.change(screen.getByLabelText("版本说明（可选）"), { target: { value: "轨迹分支调整" } });
+    expect(screen.getByText("6/500")).toBeVisible();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    fireEvent.change(baseSelect, { target: { value: model.model_ref } });
+    expect(baseSelect).toHaveValue(version2.model_ref);
+    fireEvent.change(baseSelect, { target: { value: model.model_ref } });
+    expect(baseSelect).toHaveValue(model.model_ref);
+    fireEvent.change(screen.getByLabelText("版本说明（可选）"), { target: { value: "轨迹分支调整" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建 v3" }));
+    await waitFor(() => expect(trainingApi.createTrainingModelVersion).toHaveBeenCalledWith("navila-family", expect.objectContaining({ based_on_model_ref: model.model_ref, version_description: "轨迹分支调整", configuration: expect.objectContaining({ launch_template: launchTemplate }) })));
+    confirm.mockRestore();
   });
 
   it("binds model registration and new training to a real node without enabling execution", async () => {
     const realServer: TrainingServer = { server_ref: "node-real", name: "NaVILA 训练节点", kind: "training_node", gpu_count: 1, status: "online", online: true, available: true, stale: false };
     const realResources: TrainingServerResources = { server: realServer, sampled_at: "2026-08-13T08:00:00Z", stale: false, gpus: [{ gpu_uuid: "GPU-real-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 2048, utilization_percent: 3, temperature_c: 42, externally_occupied: false }] };
-    const realModel: TrainingModel = { ...model, model_ref: "navila-real", revision: { ...model.revision!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
+    const realModel: TrainingModel = { ...model, model_ref: "navila-real", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
     mockApi(adminCapabilities, [realModel]);
     vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, realServer]);
     vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === realServer.server_ref ? realResources : resources);
@@ -300,12 +341,12 @@ describe("TrainingPlatform", () => {
     delete legacyLaunchTemplate.launcher_kind;
     const legacyModel = {
       ...model,
-      revision: { ...model.revision!, launch_template: legacyLaunchTemplate },
+      configuration: { ...model.configuration!, launch_template: legacyLaunchTemplate },
     } as unknown as TrainingModel;
     mockApi(adminCapabilities, [legacyModel]);
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
-    fireEvent.click(screen.getByRole("button", { name: "编辑并创建新 revision" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑 v1" }));
     expect(screen.getByLabelText("启动方式 · Launcher")).toHaveValue("direct");
   });
 
@@ -326,10 +367,10 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
 
     expect(screen.getByText("仅当「启用 BF16」等于 True 时，「训练视觉网络」才可设置。")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     const payload = vi.mocked(trainingApi.createTrainingModel).mock.calls[0][0];
-    expect(payload.parameter_definitions).toContainEqual(expect.objectContaining({
+    expect(payload.configuration.parameter_definitions).toContainEqual(expect.objectContaining({
       key: "tune_vision_tower",
       visible_when: { parameter_key: "bf16", equals: true },
     }));
@@ -385,8 +426,12 @@ describe("TrainingPlatform", () => {
 
   it("uses num_video_frames from the editable parameter and starts only after preview", async () => {
     mockApi(adminCapabilities, [model]);
+    const createdRun: TrainingRun = { run_ref: "run-1", model_ref: "navila", family_ref: "navila-family", family_name: "NaVILA", model_version_number: 1, model_display_name: "NaVILA v1", status: "queued", state_revision: 1, server_ref: "fake-a100", gpu_uuids: ["GPU-0"], progress_percent: 0, current_step: 0, total_steps: 20, current_epoch: 0, total_epochs: 1, created_at: "2026-08-06T00:00:00Z" };
     vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ command_preview: "python train.py --num_video_frames 8", run_spec: { contract_version: 1, execution_mode: "simulation", launcher_kind: "direct", server_ref: "fake-local", gpu_uuids: ["GPU-0"], nnodes: 1, master_addr: null, master_port: null, node_rank: null, nproc_per_node: 1, environment: { CUDA_VISIBLE_DEVICES: "0" }, parameters: { num_video_frames: 8 }, argv: ["python", "train.py"] }, preflight: [{ ok: true, message: "资源可用" }] });
-    vi.mocked(trainingApi.createTrainingRun).mockResolvedValue({ run_ref: "run-1", model_ref: "navila", model_name: "NaVILA", model_revision: 1, status: "queued", state_revision: 1, server_ref: "fake-a100", gpu_uuids: ["GPU-0"], progress_percent: 0, current_step: 0, total_steps: 20, current_epoch: 0, total_epochs: 1, created_at: "2026-08-06T00:00:00Z" });
+    vi.mocked(trainingApi.createTrainingRun).mockResolvedValue(createdRun);
+    vi.mocked(trainingApi.getTrainingRun).mockResolvedValue(createdRun);
+    vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
+    vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
     renderPlatform();
     await screen.findByRole("tab", { name: "训练任务" });
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
@@ -407,18 +452,24 @@ describe("TrainingPlatform", () => {
     fireEvent.change(frames, { target: { value: "8" } });
     expect(screen.getByRole("button", { name: "启动模拟训练" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
-    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ model_revision: 1, parameters: { num_video_frames: 8 }, gpu_uuids: ["GPU-0"] })));
+    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ parameters: { num_video_frames: 8 }, gpu_uuids: ["GPU-0"] })));
+    expect(vi.mocked(trainingApi.previewTrainingRun).mock.calls[0][0]).not.toHaveProperty("model_revision");
     expect(await screen.findByText("不需要")).toBeVisible();
     fireEvent.click(await screen.findByRole("button", { name: "启动模拟训练" }));
-    await waitFor(() => expect(trainingApi.createTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ model_revision: 1, parameters: { num_video_frames: 8 }, execution_mode: "simulation" })));
+    await waitFor(() => expect(trainingApi.createTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ parameters: { num_video_frames: 8 }, execution_mode: "simulation" })));
+    expect(vi.mocked(trainingApi.createTrainingRun).mock.calls[0][0]).not.toHaveProperty("model_revision");
+    await screen.findByText("任务 run-1");
+    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+    expect(await screen.findByText("配置已冻结")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "编辑 v1" })).not.toBeInTheDocument();
   });
 
   it("preserves edited parameters and the generated preview across background polling", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const pollingModel: TrainingModel = {
       ...model,
-      revision: {
-        ...model.revision!,
+      configuration: {
+        ...model.configuration!,
         parameter_definitions: [
           { key: "test_argv", label: "测试参数", type: "integer", default: 0, minimum: 0, maximum: 10, editable: true, display_group: "common", display_group_label: "常用参数", display_group_order: 0 },
         ],
@@ -446,8 +497,8 @@ describe("TrainingPlatform", () => {
   it("disables a dependent parameter until its availability condition matches", async () => {
     const conditionalModel: TrainingModel = {
       ...model,
-      revision: {
-        ...model.revision!,
+      configuration: {
+        ...model.configuration!,
         parameter_definitions: [
           { key: "bf16", label: "启用 BF16", type: "boolean", default: false, editable: true, argument_style: "explicit_boolean" },
           { key: "learning_rate", label: "学习率", type: "number", default: 0.00001, editable: true, visible_when: { parameter_key: "bf16", equals: true } },
@@ -485,8 +536,8 @@ describe("TrainingPlatform", () => {
   it("validates run values inline and masks sensitive inputs", async () => {
     const constrainedModel: TrainingModel = {
       ...model,
-      revision: {
-        ...model.revision!,
+      configuration: {
+        ...model.configuration!,
         parameter_definitions: [
           { key: "seed", label: "随机种子", type: "integer", default: 10, minimum: 0, editable: true, display_group: "common", display_group_label: "常用参数", display_group_order: 0 },
           { key: "run_name", label: "运行名称", type: "string", default: "demo", string_min_length: 3, string_max_length: 8, editable: true, display_group: "common", display_group_label: "常用参数", display_group_order: 0 },
@@ -515,7 +566,7 @@ describe("TrainingPlatform", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
     fireEvent.change(screen.getByLabelText("额外固定 argv（每行一个 token）"), { target: { value: "--seed=10" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("额外固定 argv 与训练参数重复声明了 --seed");
     expect(trainingApi.createTrainingModel).not.toHaveBeenCalled();
@@ -524,8 +575,8 @@ describe("TrainingPlatform", () => {
   it("keeps common parameters visible and folds advanced and custom parameters by category", async () => {
     const groupedModel: TrainingModel = {
       ...model,
-      revision: {
-        ...model.revision!,
+      configuration: {
+        ...model.configuration!,
         parameter_definitions: [
           ...navilaTrajectoryParameters,
           { key: "custom_temperature", label: "自定义温度", type: "number", default: 0.5, editable: true, cli_flag: "--custom_temperature", description: "自定义模型参数。" },
@@ -566,11 +617,11 @@ describe("TrainingPlatform", () => {
     mockApi(readonlyCapabilities);
     vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([runningRun, succeededRun]);
     renderPlatform();
-    expect(await screen.findByText("NaVILA Running")).toBeVisible();
-    expect(screen.getByText("NaVILA Succeeded")).toBeVisible();
+    expect(await screen.findByText("NaVILA v1")).toBeVisible();
+    expect(screen.getByText("NaVILA v2")).toBeVisible();
     fireEvent.change(screen.getByLabelText("状态筛选"), { target: { value: "succeeded" } });
-    expect(screen.queryByText("NaVILA Running")).not.toBeInTheDocument();
-    expect(screen.getByText("NaVILA Succeeded")).toBeVisible();
+    expect(screen.queryByText("NaVILA v1")).not.toBeInTheDocument();
+    expect(screen.getByText("NaVILA v2")).toBeVisible();
   });
 
   it("presents training runs as a searchable operations table", async () => {
@@ -583,9 +634,9 @@ describe("TrainingPlatform", () => {
     expect(screen.getByRole("columnheader", { name: "训练进度" })).toBeVisible();
     expect(screen.getByRole("region", { name: "训练概览" })).toBeVisible();
 
-    fireEvent.change(screen.getByLabelText("搜索训练任务"), { target: { value: "succeeded" } });
-    expect(screen.queryByText("NaVILA Running")).not.toBeInTheDocument();
-    expect(screen.getByText("NaVILA Succeeded")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("搜索训练任务"), { target: { value: "run-succeeded" } });
+    expect(screen.queryByText("NaVILA v1")).not.toBeInTheDocument();
+    expect(screen.getByText("NaVILA v2")).toBeVisible();
   });
 
   it("switches between independently loaded server resource cards", async () => {
@@ -610,8 +661,8 @@ describe("TrainingPlatform", () => {
     expect(trainingApi.getTrainingServerResources).toHaveBeenCalledWith("fake-west");
   });
 
-  it("scopes selectable GPUs to the server bound to the selected model revision", async () => {
-    const secondaryModel: TrainingModel = { ...model, model_ref: "navila-west", name: "NaVILA West", revision: { ...model.revision!, launch_template: { ...launchTemplate, server_ref: secondaryServer.server_ref } } };
+  it("scopes selectable GPUs to the server bound to the selected model version", async () => {
+    const secondaryModel: TrainingModel = { ...model, model_ref: "navila-west", family_ref: "navila-west-family", family_name: "NaVILA West", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: secondaryServer.server_ref } } };
     mockApi(adminCapabilities, [model, secondaryModel]);
     vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, secondaryServer]);
     vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === secondaryServer.server_ref ? secondaryResources : resources);
@@ -620,7 +671,7 @@ describe("TrainingPlatform", () => {
 
     expect(screen.getByRole("checkbox", { name: "选择 GPU 0" })).toBeVisible();
     expect(screen.getByRole("combobox", { name: "训练节点" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("模型"), { target: { value: secondaryModel.model_ref } });
+    fireEvent.change(screen.getByLabelText("模型族"), { target: { value: secondaryModel.family_ref } });
     expect(screen.getByRole("checkbox", { name: "选择 GPU 1" })).toBeVisible();
     expect(screen.queryByRole("checkbox", { name: "选择 GPU 0" })).not.toBeInTheDocument();
   });
@@ -632,7 +683,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
     vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([{ seq: 1, created_at: "2026-08-06T00:01:00Z", step: 8, total_steps: 20, epoch: 1, loss: 1.2, learning_rate: 0.0001, gpu_utilization_percent: 76, gpu_memory_mib: 24576 }]);
     renderPlatform();
-    fireEvent.click(await screen.findByText("NaVILA Running"));
+    fireEvent.click(await screen.findByText("NaVILA v1"));
     expect(await screen.findByText("参数快照")).toBeVisible();
     expect(screen.getAllByText("num_video_frames")[0]).toBeVisible();
     expect(screen.getByText("模拟训练已启动 · 2026-08-06T00:01:00Z")).toBeVisible();
@@ -648,7 +699,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
     vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
     renderPlatform("/model/runs/run-running");
-    expect(await screen.findByText("任务 run-running · 模型 revision 1")).toBeVisible();
+    expect(await screen.findByText("任务 run-running")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "返回任务列表" }));
     await waitFor(() => expect(screen.getByLabelText("状态筛选")).toBeVisible());
     expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
@@ -663,12 +714,12 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
 
     renderPlatform("/model/runs/run-running");
-    expect(await screen.findByText("任务 run-running · 模型 revision 1")).toBeVisible();
+    expect(await screen.findByText("任务 run-running")).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
 
     expect(screen.getByRole("tab", { name: "模型注册" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
-    expect(screen.queryByText("任务 run-running · 模型 revision 1")).not.toBeInTheDocument();
+    expect(screen.queryByText("任务 run-running")).not.toBeInTheDocument();
 
     await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
 
@@ -676,19 +727,19 @@ describe("TrainingPlatform", () => {
     expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
   });
 
-  it("updates a draft by creating a new immutable revision with expected_revision", async () => {
+  it("updates an unused draft version in place with expected_revision", async () => {
     mockApi(adminCapabilities, [model]);
-    const revised = { ...model, latest_revision: 2, revision: { ...model.revision!, revision: 2 } };
+    const revised = { ...model, edit_revision: 2 };
     vi.mocked(trainingApi.updateTrainingModel).mockResolvedValue(revised);
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
-    fireEvent.click(screen.getByRole("button", { name: "编辑并创建新 revision" }));
-    const editedDefinitions = [{ ...model.revision!.parameter_definitions[0], default: 8, display_group: "common", display_group_label: "常用参数", display_group_order: 0 }];
+    fireEvent.click(screen.getByRole("button", { name: "编辑 v1" }));
+    const editedDefinitions = [{ ...model.configuration!.parameter_definitions[0], default: 8, display_group: "common", display_group_label: "常用参数", display_group_order: 0 }];
     fireEvent.change(screen.getByLabelText("num_video_frames 默认值"), { target: { value: "8" } });
-    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "NaVILA revised" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建新 revision" }));
-    await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila", expect.objectContaining({ expected_revision: 1, name: "NaVILA revised", parameter_definitions: editedDefinitions, launch_template: launchTemplate })));
-    expect(screen.getByRole("button", { name: "创建新模型" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("版本说明（可选）"), { target: { value: "调整帧数" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila", expect.objectContaining({ expected_revision: 1, version_description: "调整帧数", configuration: { parameter_definitions: editedDefinitions, launch_template: launchTemplate } })));
+    expect(screen.getByRole("button", { name: "登记新模型" })).toBeVisible();
   });
 
   it("validates dynamic parameter fields before model creation", async () => {
@@ -697,7 +748,7 @@ describe("TrainingPlatform", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
     fireEvent.change(screen.getByLabelText("longvila_sampler 参数字段名"), { target: { value: "bad key" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("字段名无效");
     expect(trainingApi.createTrainingModel).not.toHaveBeenCalled();
   });
@@ -707,7 +758,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.createTrainingModel).mockResolvedValue(model);
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
-    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "枚举注册测试" } });
+    fireEvent.change(screen.getByLabelText("模型族名称"), { target: { value: "枚举注册测试" } });
     fireEvent.click(screen.getByRole("button", { name: "添加参数" }));
     fireEvent.change(screen.getByLabelText("parameter_1 参数字段名"), { target: { value: "optimizer" } });
     fireEvent.change(screen.getByLabelText("optimizer 类型"), { target: { value: "enum" } });
@@ -724,10 +775,10 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("optimizer 第 2 个枚举实际值"), { target: { value: "sgd_momentum" } });
     expect(screen.getByLabelText("optimizer 第 2 个枚举设为默认值")).toBeChecked();
 
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     const payload = vi.mocked(trainingApi.createTrainingModel).mock.calls[0][0];
-    expect(payload.parameter_definitions).toEqual([expect.objectContaining({
+    expect(payload.configuration.parameter_definitions).toEqual([expect.objectContaining({
       key: "optimizer",
       type: "enum",
       default: "sgd_momentum",
@@ -788,7 +839,7 @@ describe("TrainingPlatform", () => {
     fireEvent.change(explanation, { target: { value: "控制是否启用长视频采样。" } });
     expect(within(explanation.closest("label")!).getByText("12/120")).toBeInTheDocument();
     fireEvent.change(explanation, { target: { value: "x".repeat(121) } });
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("不能超过 120 个字符");
     expect(trainingApi.createTrainingModel).not.toHaveBeenCalled();
   });
@@ -822,12 +873,12 @@ describe("TrainingPlatform", () => {
     expect(argumentStyle).toHaveValue("explicit_boolean");
     expect(Array.from(argumentStyle.options, (option) => option.value)).toEqual(["explicit_boolean", "flag_when_true"]);
     fireEvent.click(screen.getByRole("button", { name: "删除参数 custom_toggle" }));
-    fireEvent.click(screen.getByRole("button", { name: "创建草稿" }));
+    fireEvent.click(screen.getByRole("button", { name: "创建 v1" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalled());
     const payload = vi.mocked(trainingApi.createTrainingModel).mock.calls[0][0];
-    expect(payload.parameter_definitions).toHaveLength(navilaTrajectoryParameters.length);
-    expect(payload.parameter_definitions.map((parameter) => parameter.key)).toEqual(navilaTrajectoryParameters.map((parameter) => parameter.key));
-    expect(payload.parameter_definitions.filter((parameter) => parameter.type === "boolean")).toEqual(expect.arrayContaining([expect.objectContaining({ argument_style: "explicit_boolean" })]));
+    expect(payload.configuration.parameter_definitions).toHaveLength(navilaTrajectoryParameters.length);
+    expect(payload.configuration.parameter_definitions.map((parameter) => parameter.key)).toEqual(navilaTrajectoryParameters.map((parameter) => parameter.key));
+    expect(payload.configuration.parameter_definitions.filter((parameter) => parameter.type === "boolean")).toEqual(expect.arrayContaining([expect.objectContaining({ argument_style: "explicit_boolean" })]));
   });
 
   it("loads logs and metrics incrementally from their last sequence", async () => {
@@ -842,7 +893,7 @@ describe("TrainingPlatform", () => {
       .mockResolvedValueOnce([{ seq: 7, created_at: "2026-08-06T00:01:00Z", step: 7, total_steps: 20, epoch: 1, loss: 1.3, learning_rate: 0.0001 }])
       .mockResolvedValueOnce([{ seq: 8, created_at: "2026-08-06T00:01:02Z", step: 8, total_steps: 20, epoch: 1, loss: 1.2, learning_rate: 0.0001 }]);
     renderPlatform();
-    fireEvent.click(await screen.findByText("NaVILA Running"));
+    fireEvent.click(await screen.findByText("NaVILA v1"));
     expect(await screen.findByText(/first log/)).toBeVisible();
     expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 0);
     expect(trainingApi.getTrainingRunMetrics).toHaveBeenCalledWith("run-running", 0);

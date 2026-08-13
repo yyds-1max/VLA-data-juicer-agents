@@ -22,52 +22,54 @@ from vla_data_juicer_agents.training.worker import TrainingWorker
 
 def _model_payload(*, name: str = "NaVILA draft") -> dict[str, object]:
     return {
-        "name": name,
-        "description": "Simulation-only launch template.",
-        "launch_template": {
-            "domain": "vla",
-            "server_ref": "fake-local",
-            "working_directory": "/workspace/navila",
-            "executable": "python",
-            "entrypoint": "train.py",
-            "fixed_argv": ["--deepspeed", "configs/zero3.json"],
-            "output_root": "/workspace/outputs",
+        "family_name": name,
+        "version_description": "Simulation-only launch template.",
+        "configuration": {
+            "launch_template": {
+                "domain": "vla",
+                "server_ref": "fake-local",
+                "working_directory": "/workspace/navila",
+                "executable": "python",
+                "entrypoint": "train.py",
+                "fixed_argv": ["--deepspeed", "configs/zero3.json"],
+                "output_root": "/workspace/outputs",
+            },
+            "parameter_definitions": [
+                {
+                    "key": "num_video_frames",
+                    "label": "Video frames",
+                    "type": "integer",
+                    "default": 4,
+                    "minimum": 1,
+                    "maximum": 8,
+                    "cli_flag": "--num_video_frames",
+                },
+                {
+                    "key": "max_steps",
+                    "label": "Max steps",
+                    "type": "integer",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 10,
+                    "cli_flag": "--max_steps",
+                },
+                {
+                    "key": "hub_token",
+                    "label": "Hub token",
+                    "type": "string",
+                    "default": "local-token",
+                    "sensitive": True,
+                    "cli_flag": "--hub_token",
+                },
+                {
+                    "key": "simulate_failure",
+                    "label": "Simulate failure",
+                    "type": "boolean",
+                    "default": False,
+                    "cli_flag": "--simulate_failure",
+                },
+            ],
         },
-        "parameter_definitions": [
-            {
-                "key": "num_video_frames",
-                "label": "Video frames",
-                "type": "integer",
-                "default": 4,
-                "minimum": 1,
-                "maximum": 8,
-                "cli_flag": "--num_video_frames",
-            },
-            {
-                "key": "max_steps",
-                "label": "Max steps",
-                "type": "integer",
-                "default": 2,
-                "minimum": 1,
-                "maximum": 10,
-                "cli_flag": "--max_steps",
-            },
-            {
-                "key": "hub_token",
-                "label": "Hub token",
-                "type": "string",
-                "default": "local-token",
-                "sensitive": True,
-                "cli_flag": "--hub_token",
-            },
-            {
-                "key": "simulate_failure",
-                "label": "Simulate failure",
-                "type": "boolean",
-                "default": False,
-                "cli_flag": "--simulate_failure",
-            },
-        ],
     }
 
 
@@ -93,7 +95,7 @@ def _run_payload(
 
 def _conditional_model_payload() -> dict[str, object]:
     payload = _model_payload(name="NaVILA conditional draft")
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     definitions.extend(
         [
@@ -122,7 +124,7 @@ def _conditional_model_payload() -> dict[str, object]:
 
 def _typed_model_payload() -> dict[str, object]:
     payload = _model_payload(name="NaVILA typed parameter draft")
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     definitions.extend(
         [
@@ -171,7 +173,7 @@ def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload(name="NaVILA dataset input")
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     definitions.append(
         {
@@ -187,7 +189,7 @@ def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
     response = client.post("/api/training/models", json=payload)
 
     assert response.status_code == 201
-    registered = response.json()["model"]["revision"]["parameter_definitions"]
+    registered = response.json()["model"]["configuration"]["parameter_definitions"]
     dataset = next(item for item in registered if item["key"] == "data_mixture")
     assert dataset["semantic_role"] == "dataset"
 
@@ -210,7 +212,7 @@ def test_runtime_and_monitoring_contracts_roundtrip_and_reach_run_spec(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload(name="NaVILA conda runtime")
-    launch_template = payload["launch_template"]
+    launch_template = payload["configuration"]["launch_template"]  # type: ignore[index]
     assert isinstance(launch_template, dict)
     launch_template["runtime_environment"] = {
         "kind": "conda",
@@ -225,7 +227,7 @@ def test_runtime_and_monitoring_contracts_roundtrip_and_reach_run_spec(
 
     assert created.status_code == 201, created.text
     model = created.json()["model"]
-    registered_template = model["revision"]["launch_template"]
+    registered_template = model["configuration"]["launch_template"]
     assert registered_template["runtime_environment"] == {
         "kind": "conda",
         "conda_environment": "navila-train",
@@ -250,7 +252,7 @@ def test_conda_runtime_requires_a_safe_environment_name(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    launch_template = payload["launch_template"]
+    launch_template = payload["configuration"]["launch_template"]  # type: ignore[index]
     assert isinstance(launch_template, dict)
     launch_template["runtime_environment"] = {"kind": "conda"}
 
@@ -290,7 +292,8 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
     assert rows == [
         (1, "training_platform_m1"),
         (2, "training_nodes_m2"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "training_node_deployment_m3"),
+        (3, "training_node_deployment_m3"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "model_families_m4"),
     ]
 
 
@@ -334,7 +337,7 @@ def test_read_only_projection_hides_launch_paths_and_rejects_stop(
     assert "configs/zero3.json" not in serialized_model
     hub_token = next(
         definition
-        for definition in model_body["revision"]["parameter_definitions"]
+        for definition in model_body["configuration"]["parameter_definitions"]
         if definition["key"] == "hub_token"
     )
     assert hub_token["default"] == "********"
@@ -354,7 +357,7 @@ def test_frame_count_comes_from_parameter_not_entrypoint_name(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["launch_template"]["entrypoint"] = "train_4frames.py"  # type: ignore[index]
+    payload["configuration"]["launch_template"]["entrypoint"] = "train_4frames.py"  # type: ignore[index]
     created = client.post("/api/training/models", json=payload)
     assert created.status_code == 201, created.text
 
@@ -373,9 +376,9 @@ def test_argument_styles_and_platform_launch_arguments(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["launch_template"]["executable"] = "torchrun"  # type: ignore[index]
-    payload["launch_template"]["output_flag"] = "--save_to"  # type: ignore[index]
-    definitions = payload["parameter_definitions"]  # type: ignore[assignment]
+    payload["configuration"]["launch_template"]["executable"] = "torchrun"  # type: ignore[index]
+    payload["configuration"]["launch_template"]["output_flag"] = "--save_to"  # type: ignore[index]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index,assignment]
     definitions.extend(  # type: ignore[union-attr]
         [
             {
@@ -402,12 +405,12 @@ def test_argument_styles_and_platform_launch_arguments(
     model = created.json()["model"]
     projected = {
         definition["key"]: definition["argument_style"]
-        for definition in model["revision"]["parameter_definitions"]
+        for definition in model["configuration"]["parameter_definitions"]
     }
     assert projected["num_video_frames"] == "value"
     assert projected["do_eval"] == "explicit_boolean"
     assert projected["gradient_checkpointing"] == "flag_when_true"
-    assert model["revision"]["launch_template"]["output_flag"] == "--save_to"
+    assert model["configuration"]["launch_template"]["output_flag"] == "--save_to"
 
     request = _run_payload(str(model["model_ref"]))
     request["parameters"].update(  # type: ignore[union-attr]
@@ -445,7 +448,7 @@ def test_registration_rejects_invalid_argument_style_combinations(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    definition = payload["parameter_definitions"][0]  # type: ignore[index]
+    definition = payload["configuration"]["parameter_definitions"][0]  # type: ignore[index]
     definition["type"] = parameter_type
     definition["default"] = False if parameter_type == "boolean" else 4
     definition["argument_style"] = argument_style
@@ -460,7 +463,7 @@ def test_registration_rejects_parameter_using_platform_output_flag(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["parameter_definitions"][0]["cli_flag"] = "--output_dir"  # type: ignore[index]
+    payload["configuration"]["parameter_definitions"][0]["cli_flag"] = "--output_dir"  # type: ignore[index]
 
     response = client.post("/api/training/models", json=payload)
     assert response.status_code == 422
@@ -472,7 +475,7 @@ def test_registration_rejects_fixed_argv_redeclaring_parameter_flag(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["launch_template"]["fixed_argv"].append("--num_video_frames=8")  # type: ignore[index,union-attr]
+    payload["configuration"]["launch_template"]["fixed_argv"].append("--num_video_frames=8")  # type: ignore[index,union-attr]
 
     response = client.post("/api/training/models", json=payload)
 
@@ -485,7 +488,7 @@ def test_registration_rejects_overlong_parameter_explanation(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["parameter_definitions"][0]["description"] = "x" * 121  # type: ignore[index]
+    payload["configuration"]["parameter_definitions"][0]["description"] = "x" * 121  # type: ignore[index]
 
     response = client.post("/api/training/models", json=payload)
 
@@ -493,7 +496,7 @@ def test_registration_rejects_overlong_parameter_explanation(
     assert "120" in response.text
 
 
-def test_enum_choice_value_and_label_roundtrip_through_read_and_revision(
+def test_enum_choice_value_and_label_roundtrip_through_read_and_configuration(
     service: TrainingService,
 ) -> None:
     client = _client(service, admin=True)
@@ -509,9 +512,9 @@ def test_enum_choice_value_and_label_roundtrip_through_read_and_revision(
     model_ref = model["model_ref"]
 
     def choices_from(body: dict[str, object]) -> list[dict[str, str]]:
-        revision = body["model"]["revision"]  # type: ignore[index]
+        configuration = body["model"]["configuration"]  # type: ignore[index]
         definition = next(
-            item for item in revision["parameter_definitions"]  # type: ignore[index]
+            item for item in configuration["parameter_definitions"]  # type: ignore[index]
             if item["key"] == "optimizer"
         )
         return definition["choices"]
@@ -519,10 +522,13 @@ def test_enum_choice_value_and_label_roundtrip_through_read_and_revision(
     assert choices_from(created.json()) == expected_choices
     assert choices_from(client.get(f"/api/training/models/{model_ref}").json()) == expected_choices
 
-    revision_payload = _typed_model_payload()
-    revision_payload["description"] = "Revision keeps presentation labels."
-    revision_payload["expected_revision"] = 1
-    updated = client.put(f"/api/training/models/{model_ref}", json=revision_payload)
+    update_source = _typed_model_payload()
+    update_payload = {
+        "version_description": "Configuration keeps presentation labels.",
+        "configuration": update_source["configuration"],
+        "expected_revision": model["edit_revision"],
+    }
+    updated = client.put(f"/api/training/models/{model_ref}", json=update_payload)
     assert updated.status_code == 200, updated.text
     assert choices_from(updated.json()) == expected_choices
     assert choices_from(client.get(f"/api/training/models/{model_ref}").json()) == expected_choices
@@ -546,7 +552,7 @@ def test_registration_strictly_validates_parameter_type_defaults(
 ) -> None:
     client = _client(service, admin=True)
     payload = _typed_model_payload()
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     definition = next(item for item in definitions if item["key"] == key)
     definition["default"] = invalid_default
@@ -575,7 +581,7 @@ def test_registration_validates_type_specific_parameter_constraints(
 ) -> None:
     client = _client(service, admin=True)
     payload = _typed_model_payload()
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     definition = next(item for item in definitions if item["key"] == key)
     definition.update(changes)
@@ -627,7 +633,7 @@ def test_string_length_constraints_roundtrip_and_apply_to_run_values(
 ) -> None:
     client = _client(service, admin=True)
     payload = _typed_model_payload()
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     run_name = next(item for item in definitions if item["key"] == "run_name")
     run_name.update({"string_min_length": 3, "string_max_length": 12})
@@ -637,7 +643,7 @@ def test_string_length_constraints_roundtrip_and_apply_to_run_values(
     model = created.json()["model"]
     projected = next(
         item
-        for item in model["revision"]["parameter_definitions"]
+        for item in model["configuration"]["parameter_definitions"]
         if item["key"] == "run_name"
     )
     assert projected["string_min_length"] == 3
@@ -658,12 +664,12 @@ def test_string_length_constraints_roundtrip_and_apply_to_run_values(
     assert "maximum length" in response.json()["detail"]["message"]
 
 
-def test_parameter_display_group_roundtrips_with_model_revision(
+def test_parameter_display_group_roundtrips_with_model_configuration(
     service: TrainingService,
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["parameter_definitions"][0].update(  # type: ignore[index,union-attr]
+    payload["configuration"]["parameter_definitions"][0].update(  # type: ignore[index,union-attr]
         {
             "display_group": "common",
             "display_group_label": "常用参数",
@@ -674,7 +680,7 @@ def test_parameter_display_group_roundtrips_with_model_revision(
     response = client.post("/api/training/models", json=payload)
 
     assert response.status_code == 201, response.text
-    definition = response.json()["model"]["revision"]["parameter_definitions"][0]
+    definition = response.json()["model"]["configuration"]["parameter_definitions"][0]
     assert definition["display_group"] == "common"
     assert definition["display_group_label"] == "常用参数"
     assert definition["display_group_order"] == 0
@@ -685,7 +691,7 @@ def test_parameter_display_group_rejects_partial_metadata(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["parameter_definitions"][0]["display_group"] = "common"  # type: ignore[index]
+    payload["configuration"]["parameter_definitions"][0]["display_group"] = "common"  # type: ignore[index]
 
     response = client.post("/api/training/models", json=payload)
 
@@ -702,7 +708,7 @@ def test_visible_when_roundtrips_and_omits_stale_values_until_enabled(
     model = created.json()["model"]
     condition = next(
         definition["visible_when"]
-        for definition in model["revision"]["parameter_definitions"]
+        for definition in model["configuration"]["parameter_definitions"]
         if definition["key"] == "lora_rank"
     )
     assert condition == {"parameter_key": "use_lora", "equals": True}
@@ -747,7 +753,7 @@ def test_registration_rejects_invalid_visible_when_dependencies(
 ) -> None:
     client = _client(service, admin=True)
     payload = _conditional_model_payload()
-    definitions = payload["parameter_definitions"]
+    definitions = payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     target = next(item for item in definitions if item["key"] == target_key)
     target["visible_when"] = invalid_condition
@@ -763,7 +769,7 @@ def test_registration_rejects_visible_when_cycles_and_invalid_enum_value(
     client = _client(service, admin=True)
 
     cyclic = _conditional_model_payload()
-    definitions = cyclic["parameter_definitions"]
+    definitions = cyclic["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(definitions, list)
     use_lora = next(item for item in definitions if item["key"] == "use_lora")
     lora_rank = next(item for item in definitions if item["key"] == "lora_rank")
@@ -774,7 +780,7 @@ def test_registration_rejects_visible_when_cycles_and_invalid_enum_value(
     assert "cannot contain a cycle" in cycle_response.text
 
     enum_payload = _conditional_model_payload()
-    enum_definitions = enum_payload["parameter_definitions"]
+    enum_definitions = enum_payload["configuration"]["parameter_definitions"]  # type: ignore[index]
     assert isinstance(enum_definitions, list)
     enum_definitions.extend(
         [
@@ -809,14 +815,14 @@ def test_legacy_noneditable_parameter_is_normalized_and_can_be_overridden(
 ) -> None:
     client = _client(service, admin=True)
     payload = _model_payload()
-    payload["parameter_definitions"][0]["editable"] = False  # type: ignore[index]
+    payload["configuration"]["parameter_definitions"][0]["editable"] = False  # type: ignore[index]
 
     created = client.post("/api/training/models", json=payload)
     assert created.status_code == 201, created.text
     model = created.json()["model"]
     frames = next(
         item
-        for item in model["revision"]["parameter_definitions"]
+        for item in model["configuration"]["parameter_definitions"]
         if item["key"] == "num_video_frames"
     )
     assert frames["editable"] is True
@@ -846,13 +852,13 @@ def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
         "development-admin",
     )
     payload = _model_payload(name="NaVILA real node draft")
-    payload["launch_template"]["server_ref"] = node["node_ref"]  # type: ignore[index]
+    payload["configuration"]["launch_template"]["server_ref"] = node["node_ref"]  # type: ignore[index]
 
     created = client.post("/api/training/models", json=payload)
 
     assert created.status_code == 201, created.text
     model = created.json()["model"]
-    assert model["revision"]["launch_template"]["server_ref"] == node["node_ref"]
+    assert model["configuration"]["launch_template"]["server_ref"] == node["node_ref"]
     listed = client.get("/api/training/servers").json()["servers"]
     real_server = next(item for item in listed if item["server_ref"] == node["node_ref"])
     assert real_server["kind"] == "training_node"
@@ -867,22 +873,27 @@ def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
     assert preview.json()["detail"]["code"] == "real_execution_disabled"
 
 
-def test_draft_revision_preview_and_submission_are_safe_and_idempotent(
+def test_draft_configuration_preview_and_submission_are_safe_and_idempotent(
     service: TrainingService,
 ) -> None:
     client = _client(service, admin=True)
     model = _create_model(client)
     model_ref = str(model["model_ref"])
 
-    # Revisions are append-only and stale edit attempts are rejected.
-    updated = _model_payload(name="NaVILA draft v2")
-    updated["expected_revision"] = 1
-    revision = client.put(f"/api/training/models/{model_ref}", json=updated)
-    assert revision.status_code == 200, revision.text
-    assert revision.json()["model"]["revision"]["revision"] == 2
+    # Internal edits remain optimistic, but their revision is not user-facing.
+    update_source = _model_payload(name="NaVILA draft v2")
+    updated = {
+        "version_description": "Updated draft configuration.",
+        "configuration": update_source["configuration"],
+        "expected_revision": model["edit_revision"],
+    }
+    edit = client.put(f"/api/training/models/{model_ref}", json=updated)
+    assert edit.status_code == 200, edit.text
+    assert edit.json()["model"]["edit_revision"] == model["edit_revision"] + 1
+    assert "revision" not in edit.json()["model"]["configuration"]
     stale = client.put(f"/api/training/models/{model_ref}", json=updated)
     assert stale.status_code == 409
-    assert stale.json()["detail"]["code"] == "model_revision_conflict"
+    assert stale.json()["detail"]["code"] == "model_configuration_edit_conflict"
 
     request = _run_payload(model_ref)
     preview = client.post("/api/training/runs/preview", json=request)

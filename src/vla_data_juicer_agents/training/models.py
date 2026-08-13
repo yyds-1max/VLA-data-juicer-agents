@@ -218,7 +218,6 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_ref: str = Field(min_length=1, max_length=128)
-    model_revision: int | None = Field(default=None, ge=1)
     server_ref: str = Field(default="fake-local", min_length=1, max_length=128)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     parameters: dict[str, Any] = Field(default_factory=dict)

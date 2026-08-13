@@ -316,6 +316,16 @@ class TrainingService:
         self._require_registered_server(data["launch_template"]["server_ref"])
         return self._project_model(self.store.create_model(data, principal.subject))
 
+    def create_model_version(
+        self, family_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_MODELS)
+        data = self._adapt_model(self._data(payload))
+        self._require_registered_server(data["launch_template"]["server_ref"])
+        return self._project_model(
+            self.store.create_model_version(family_ref, data, principal.subject)
+        )
+
     def update_model(self, model_ref: str, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
         data = self._adapt_model(self._data(payload)); expected = int(data.pop("expected_revision"))
@@ -334,36 +344,44 @@ class TrainingService:
 
     @staticmethod
     def _project_model(model: dict[str, Any]) -> dict[str, Any]:
-        result = {**model, "latest_revision": model.get("revision")}
+        result = dict(model)
         if "parameter_definitions" in model:
             definitions = []
             for item in model["parameter_definitions"]:
                 visible_when = item.get("visible_when")
                 choices = [choice if isinstance(choice, dict) else {"value": choice, "label": choice} for choice in (item.get("choices") or [])]
                 definitions.append({"key": item["name"], "label": item.get("label", item["name"]), "type": "number" if item["kind"] == "float" else item["kind"], "semantic_role": item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description"), "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": choices, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_key": visible_when["parameter_name"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag"), "argument_style": item.get("argument_style") or ("flag_when_true" if item["kind"] == "boolean" else "value")})
-            revision = {"revision": model["revision"], "created_at": model["updated_at"], "parameter_definitions": definitions, "fixed_argv": model.get("launch_template", {}).get("fixed_argv", [])}
+            configuration: dict[str, Any] = {"parameter_definitions": definitions}
             template = model.get("launch_template")
-            if isinstance(template, dict) and {"domain", "server_ref", "working_directory", "executable", "entrypoint", "output_root"} <= set(template):
+            if isinstance(template, dict):
                 projected_template = dict(template)
-                projected_template.setdefault(
-                    "launcher_kind",
-                    "torchrun"
-                    if str(template["executable"]).rsplit("/", 1)[-1]
-                    == "torchrun"
-                    else "direct",
-                )
-                projected_template.setdefault("output_flag", "--output_dir")
-                revision["launch_template"] = projected_template
-            result["revision"] = revision
+                if "executable" in template:
+                    projected_template.setdefault(
+                        "launcher_kind",
+                        "torchrun"
+                        if str(template["executable"]).rsplit("/", 1)[-1]
+                        == "torchrun"
+                        else "direct",
+                    )
+                    projected_template.setdefault("output_flag", "--output_dir")
+                configuration["launch_template"] = projected_template
+            result["configuration"] = configuration
+        for internal in ("parameter_definitions", "launch_template", "output_template"):
+            result.pop(internal, None)
         return result
 
     def _adapt_model(self, data: dict[str, Any]) -> dict[str, Any]:
+        configuration = data.pop("configuration")
         definitions = []
-        for item in data["parameter_definitions"]:
+        for item in configuration["parameter_definitions"]:
             kind = "float" if item["type"] == "number" else item["type"]
             visible_when = item.get("visible_when")
             definitions.append({"name": item["key"], "label": item["label"], "kind": kind, "semantic_role": item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description") or "", "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": item.get("choices") or None, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_name": visible_when["parameter_key"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag") or f"--{item['key']}", "argument_style": item.get("argument_style") or ("flag_when_true" if kind == "boolean" else "value")})
-        adapted = {**data, "parameter_definitions": definitions}
+        adapted = {
+            **data,
+            "launch_template": configuration["launch_template"],
+            "parameter_definitions": definitions,
+        }
         return adapted
 
     def _prepare(self, payload: Any, *, ignore_platform_leases: bool = False) -> tuple[dict[str, Any], Any]:
@@ -389,7 +407,7 @@ class TrainingService:
             data["gpu_uuids"],
             ignore_platform_leases=ignore_platform_leases,
         )
-        model = self.store.get_model_record(data["model_ref"], data.get("model_revision"))
+        model = self.store.get_model_record(data["model_ref"])
         if model["status"] != "draft": raise TrainingValidationError("model_unavailable", "The selected model is not an editable simulation draft.")
         if model["launch_template"]["server_ref"] != data["server_ref"]: raise TrainingValidationError("server_mismatch", "The model template belongs to another server.")
         normalized: dict[str, Any] = {}
@@ -489,7 +507,7 @@ class TrainingService:
                 "master_port": port if uses_torchrun else None,
                 "node_rank": 0 if uses_torchrun else None,
             }
-            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "model_name": model["name"], "model_revision": model["revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "launcher_kind": launcher_kind, "nnodes": 1, "nproc_per_node": nproc_per_node, **distributed, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
+            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "family_ref": model["family_ref"], "family_name": model["family_name"], "model_version_number": model["version_number"], "model_display_name": f"{model['family_name']} v{model['version_number']}", "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "launcher_kind": launcher_kind, "nnodes": 1, "nproc_per_node": nproc_per_node, **distributed, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
             safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "argv": safe_argv, "output_preview": output}
             safe["parameters"] = {key: "********" if key in sensitive else value for key,value in normalized.items()}
             private["public_spec"] = safe
@@ -524,7 +542,7 @@ class TrainingService:
         metric_page = self.store.list_metrics(run["run_ref"], 0, 2000)
         latest = metric_page["items"][-1] if metric_page["items"] else None
         current_epoch = latest["epoch"] if latest else 0
-        return {**run, "model_name": run.get("model_name", run["model_ref"]), "progress_percent": round(run["progress"] * 100, 2), "current_epoch": current_epoch, "total_epochs": 3, "latest_metric": latest, "failure_code": run.get("failure", {}).get("code") if run.get("failure") else None, "failure_message": run.get("failure", {}).get("message") if run.get("failure") else None, "audit_events": self.store.list_audit_events(run["run_ref"])}
+        return {**run, "progress_percent": round(run["progress"] * 100, 2), "current_epoch": current_epoch, "total_epochs": 3, "latest_metric": latest, "failure_code": run.get("failure", {}).get("code") if run.get("failure") else None, "failure_message": run.get("failure", {}).get("message") if run.get("failure") else None, "audit_events": self.store.list_audit_events(run["run_ref"])}
 
     def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:
         page = self.store.list_runs(status=status, after=after, limit=limit); page["items"] = [self._project_run(item) for item in page["items"]]; return page

@@ -303,11 +303,15 @@ export async function getTrainingModel(modelRef: string): Promise<TrainingModel>
   return data.model;
 }
 
-export type TrainingModelDraftInput = {
-  name: string;
-  description?: string;
+export type TrainingModelConfigurationInput = {
   parameter_definitions: TrainingParameterDefinition[];
   launch_template: TrainingLaunchTemplate;
+};
+
+export type TrainingModelDraftInput = {
+  family_name: string;
+  version_description?: string;
+  configuration: TrainingModelConfigurationInput;
 };
 
 export async function createTrainingModel(payload: TrainingModelDraftInput): Promise<TrainingModel> {
@@ -315,12 +319,17 @@ export async function createTrainingModel(payload: TrainingModelDraftInput): Pro
   return data.model;
 }
 
-export async function updateTrainingModel(modelRef: string, payload: { expected_revision: number; name?: string; description?: string; parameter_definitions: TrainingParameterDefinition[]; launch_template: TrainingLaunchTemplate }): Promise<TrainingModel> {
+export async function createTrainingModelVersion(familyRef: string, payload: { based_on_model_ref: string; version_description?: string; configuration: TrainingModelConfigurationInput }): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/model-families/${encodeURIComponent(familyRef)}/versions`, { method: "POST", body: JSON.stringify(payload) });
+  return data.model;
+}
+
+export async function updateTrainingModel(modelRef: string, payload: { expected_revision: number; version_description?: string; configuration: TrainingModelConfigurationInput }): Promise<TrainingModel> {
   const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}`, { method: "PUT", body: JSON.stringify(payload) });
   return data.model;
 }
 
-type TrainingRunRequest = { model_ref: string; model_revision?: number; server_ref: string; gpu_uuids: string[]; parameters: Record<string, string | number | boolean>; execution_mode: "simulation" };
+type TrainingRunRequest = { model_ref: string; server_ref: string; gpu_uuids: string[]; parameters: Record<string, string | number | boolean>; execution_mode: "simulation" };
 
 export async function previewTrainingRun(payload: TrainingRunRequest): Promise<TrainingRunPreview> {
   return requestJson<TrainingRunPreview>(`${trainingPath}/runs/preview`, { method: "POST", body: JSON.stringify(payload) });

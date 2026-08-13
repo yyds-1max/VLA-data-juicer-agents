@@ -101,6 +101,10 @@ class TrainingServiceProtocol(Protocol):
         self, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
+    def create_model_version(
+        self, family_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
     def update_model(
         self, model_ref: str, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
@@ -711,9 +715,7 @@ class LaunchTemplate(StrictRequest):
         return value
 
 
-class CreateModelRequest(StrictRequest):
-    name: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
+class ModelConfigurationRequest(StrictRequest):
     launch_template: LaunchTemplate
     parameter_definitions: list[ParameterDefinition] = Field(
         min_length=1,
@@ -731,7 +733,7 @@ class CreateModelRequest(StrictRequest):
         return value
 
     @model_validator(mode="after")
-    def reserve_platform_output_flag(self) -> CreateModelRequest:
+    def reserve_platform_output_flag(self) -> ModelConfigurationRequest:
         if sum(
             definition.semantic_role == "dataset"
             for definition in self.parameter_definitions
@@ -837,14 +839,33 @@ class CreateModelRequest(StrictRequest):
         return self
 
 
-class UpdateModelRequest(CreateModelRequest):
+class CreateModelRequest(StrictRequest):
+    family_name: str = Field(min_length=1, max_length=200)
+    version_description: str | None = Field(default=None, max_length=500)
+    configuration: ModelConfigurationRequest
+
+
+class CreateModelVersionRequest(StrictRequest):
+    based_on_model_ref: str = Field(min_length=1, max_length=200)
+    version_description: str | None = Field(default=None, max_length=500)
+    configuration: ModelConfigurationRequest
+
+    @field_validator("based_on_model_ref")
+    @classmethod
+    def safe_model_ref(cls, value: str) -> str:
+        if not _SAFE_REF.fullmatch(value):
+            raise ValueError("resource reference contains unsupported characters")
+        return value
+
+
+class UpdateModelRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    version_description: str | None = Field(default=None, max_length=500)
+    configuration: ModelConfigurationRequest
 
 
 class RunRequest(StrictRequest):
     model_ref: str = Field(min_length=1, max_length=200)
-    model_revision: Annotated[int, Field(strict=True, ge=1)] | None = None
     server_ref: str = Field(min_length=1, max_length=200)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     parameters: dict[str, JsonScalar] = Field(default_factory=dict, max_length=200)
@@ -1104,6 +1125,29 @@ def create_training_router(
     def create_model(request: CreateModelRequest) -> dict[str, Any]:
         model = _normalize_model(
             _translate(service.create_model, request, get_principal())
+        )
+        return {"model": model}
+
+    @router.post("/model-families/{family_ref}/versions", status_code=201)
+    def create_model_version(
+        family_ref: str,
+        request: CreateModelVersionRequest,
+    ) -> dict[str, Any]:
+        if not _SAFE_REF.fullmatch(family_ref):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_model_family_ref",
+                    "message": "Model family reference contains unsupported characters.",
+                },
+            )
+        model = _normalize_model(
+            _translate(
+                service.create_model_version,
+                family_ref,
+                request,
+                get_principal(),
+            )
         )
         return {"model": model}
 
@@ -1467,46 +1511,33 @@ def _normalize_parameter_definition(definition: dict[str, Any]) -> dict[str, Any
 
 
 def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
-    raw_revision = model.get("revision")
-    revision_number = model.get("latest_revision")
-    if revision_number is None:
-        if isinstance(raw_revision, dict):
-            revision_number = raw_revision.get("revision")
-        else:
-            revision_number = raw_revision
     result = {
         "model_ref": model["model_ref"],
-        "name": model["name"],
-        "description": model.get("description") or None,
+        "family_ref": model["family_ref"],
+        "family_name": model["family_name"],
+        "version_number": int(model["version_number"]),
+        "version_description": model.get("version_description") or None,
+        "based_on_model_ref": model.get("based_on_model_ref"),
         "status": model.get("status", "draft"),
-        "latest_revision": int(revision_number or 1),
+        "edit_revision": int(model.get("edit_revision", 1)),
+        "has_runs": bool(model.get("has_runs", False)),
+        "configuration_editable": bool(model.get("configuration_editable", False)),
         "created_at": model.get("created_at"),
         "updated_at": model.get("updated_at"),
     }
-    revision_source = raw_revision if isinstance(raw_revision, dict) else model
-    definitions = revision_source.get("parameter_definitions")
-    if definitions is not None:
-        launch_template = revision_source.get("launch_template")
-        revision = {
-            "revision": result["latest_revision"],
-            "created_at": revision_source.get(
-                "created_at", model.get("updated_at", model.get("created_at"))
-            ),
-            "parameter_definitions": [
+    configuration = model.get("configuration")
+    if isinstance(configuration, dict):
+        definitions = configuration.get("parameter_definitions")
+        normalized_configuration: dict[str, Any] = {}
+        if isinstance(definitions, list):
+            normalized_configuration["parameter_definitions"] = [
                 _normalize_parameter_definition(definition)
                 for definition in definitions
-            ],
-            "fixed_argv": revision_source.get(
-                "fixed_argv",
-                launch_template.get("fixed_argv", [])
-                if isinstance(launch_template, dict)
-                else [],
-            ),
-            "output_preview": revision_source.get("output_preview"),
-        }
+            ]
+        launch_template = configuration.get("launch_template")
         if isinstance(launch_template, dict):
-            revision["launch_template"] = launch_template
-        result["revision"] = revision
+            normalized_configuration["launch_template"] = launch_template
+        result["configuration"] = normalized_configuration
     return result
 
 
@@ -1574,8 +1605,10 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
     result = {
         "run_ref": run["run_ref"],
         "model_ref": run.get("model_ref", "unknown-model"),
-        "model_name": run.get("model_name", run.get("model_ref", "Training model")),
-        "model_revision": int(run.get("model_revision", 1)),
+        "family_ref": run.get("family_ref"),
+        "family_name": run.get("family_name"),
+        "model_version_number": int(run.get("model_version_number", 1)),
+        "model_display_name": run.get("model_display_name"),
         "status": run["status"],
         "state_revision": int(run.get("state_revision", 1)),
         "server_ref": run.get("server_ref", ""),
@@ -1681,12 +1714,12 @@ def _model_projection(
     if principal.can("training:manage_models"):
         return model
     projected = dict(model)
-    revision = projected.get("revision")
-    if isinstance(revision, dict):
-        safe_revision = dict(revision)
-        definitions = safe_revision.get("parameter_definitions")
+    configuration = projected.get("configuration")
+    if isinstance(configuration, dict):
+        safe_configuration = dict(configuration)
+        definitions = safe_configuration.get("parameter_definitions")
         if isinstance(definitions, list):
-            safe_revision["parameter_definitions"] = [
+            safe_configuration["parameter_definitions"] = [
                 {
                     **definition,
                     "default": "********",
@@ -1695,16 +1728,14 @@ def _model_projection(
                 else definition
                 for definition in definitions
             ]
-        for field in (
-            "fixed_argv",
-            "launch_template",
-            "output_preview",
-            "working_directory",
-            "entrypoint",
-            "output_template",
-        ):
-            safe_revision.pop(field, None)
-        projected["revision"] = safe_revision
+        template = safe_configuration.get("launch_template")
+        if isinstance(template, dict):
+            safe_configuration["launch_template"] = {
+                key: template[key]
+                for key in ("domain", "server_ref")
+                if key in template
+            }
+        projected["configuration"] = safe_configuration
     return projected
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 3
+LATEST_TRAINING_SCHEMA_VERSION = 4
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -39,6 +39,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(3,?,?)",
             ("training_node_deployment_m3", applied_at),
+        )
+        connection.commit()
+        versions.append(3)
+    if 4 not in versions:
+        connection.executescript(_MIGRATION_004)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(4,?,?)",
+            ("model_families_m4", applied_at),
         )
         connection.commit()
 
@@ -228,5 +236,44 @@ ALTER TABLE training_nodes ADD COLUMN deployment_message TEXT;
 ALTER TABLE training_nodes ADD COLUMN deployment_started_at TEXT;
 ALTER TABLE training_nodes ADD COLUMN deployment_finished_at TEXT;
 ALTER TABLE training_nodes ADD COLUMN installed_worker_version TEXT;
+COMMIT;
+"""
+
+
+_MIGRATION_004 = """
+BEGIN IMMEDIATE;
+CREATE TABLE model_families (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  family_ref TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+ALTER TABLE registered_models ADD COLUMN family_id INTEGER REFERENCES model_families(id);
+ALTER TABLE registered_models ADD COLUMN version_number INTEGER;
+ALTER TABLE registered_models ADD COLUMN based_on_model_id INTEGER REFERENCES registered_models(id);
+ALTER TABLE registered_models ADD COLUMN version_description TEXT;
+ALTER TABLE registered_models ADD COLUMN configuration_locked_at TEXT;
+INSERT INTO model_families(family_ref,name,created_at,updated_at)
+SELECT 'family_' || model_ref,name,created_at,updated_at
+FROM registered_models ORDER BY id;
+UPDATE registered_models
+SET family_id=(
+      SELECT family.id FROM model_families AS family
+      WHERE family.family_ref='family_' || registered_models.model_ref
+    ),
+    version_number=1,
+    version_description=NULLIF(description,''),
+    configuration_locked_at=CASE
+      WHEN EXISTS(
+        SELECT 1 FROM training_runs AS run
+        WHERE run.model_id=registered_models.id
+      ) THEN updated_at
+      ELSE NULL
+    END;
+CREATE UNIQUE INDEX uq_registered_models_family_version
+  ON registered_models(family_id,version_number);
+CREATE INDEX idx_registered_models_family
+  ON registered_models(family_id,version_number DESC);
 COMMIT;
 """
