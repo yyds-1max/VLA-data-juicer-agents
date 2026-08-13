@@ -166,6 +166,9 @@ token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换�
 Worker HTTP 客户端只允许固定中心 origin 上的 enroll、heartbeat 和验证结果回传端点，
 拒绝重定向并限制超时和响应大小。部署模板位于 `deployment/systemd/`，使用独立的
 `datapilot-worker` 系统账号、系统级 systemd、`NoNewPrivileges` 和只读文件系统保护。
+中心公网 Nginx 的最小端点白名单模板位于
+`deployment/nginx/datapilot-training-center.conf`；新增 Worker 命令时必须同时更新该
+白名单，否则请求会在到达中心应用前被拒绝。
 
 ## Training Worker 一次性 SSH 部署
 

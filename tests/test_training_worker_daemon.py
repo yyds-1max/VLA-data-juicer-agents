@@ -197,6 +197,7 @@ def test_resource_collector_discovers_all_storage_mounts_without_shell(
                 f"12 1 8:2 /sub {duplicate_bind} rw - xfs /dev/sdb1 rw",
                 "13 1 0:25 / /proc rw - proc proc rw",
                 "14 1 0:30 / /run rw - tmpfs tmpfs rw",
+                "15 1 7:0 / /snap/runtime/1 ro - squashfs /dev/loop0 ro",
             ]
         ),
         encoding="utf-8",

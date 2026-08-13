@@ -40,6 +40,7 @@ _NON_STORAGE_FILESYSTEMS = frozenset(
         "ramfs",
         "rpc_pipefs",
         "securityfs",
+        "squashfs",
         "sysfs",
         "tmpfs",
         "tracefs",
