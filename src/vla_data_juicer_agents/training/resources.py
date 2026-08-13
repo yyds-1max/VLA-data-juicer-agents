@@ -90,8 +90,16 @@ class TrainingResourceProvider:
         self.simulation_provider = simulation_provider or FakeResourceProvider(store)
 
     def list_servers(self) -> list[dict[str, Any]]:
-        servers = [dict(server) for server in self.simulation_provider.list_servers()]
-        for node in self.store.list_nodes():
+        nodes = self.store.list_nodes()
+        # The deterministic Fake server is only a bootstrap fallback for a
+        # fresh local installation.  As soon as an administrator has
+        # registered a Training Node, the public resource catalog is backed
+        # exclusively by authenticated Worker snapshots.
+        if not nodes:
+            return [dict(server) for server in self.simulation_provider.list_servers()]
+
+        servers: list[dict[str, Any]] = []
+        for node in nodes:
             snapshot = self.store.get_node_resources(node["node_ref"])
             resources = snapshot.get("resources")
             gpu_count = (
@@ -143,6 +151,9 @@ class TrainingResourceProvider:
                 "server": server,
                 "sampled_at": snapshot.get("captured_at"),
                 "stale": True,
+                "cpu": None,
+                "memory": None,
+                "disks": [],
                 "gpus": [],
             }
 
@@ -156,6 +167,13 @@ class TrainingResourceProvider:
             "server": server,
             "sampled_at": snapshot.get("captured_at"),
             "stale": stale,
+            "cpu": raw_resources.get("cpu"),
+            "memory": raw_resources.get("memory"),
+            "disks": [
+                disk
+                for disk in raw_resources.get("disks", [])
+                if isinstance(disk, dict)
+            ],
             "gpus": gpus,
         }
 

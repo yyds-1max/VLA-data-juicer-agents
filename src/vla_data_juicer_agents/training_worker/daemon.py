@@ -9,6 +9,7 @@ from .client import CenterClientError, OfflineCenterClient, WorkerCenterClient
 from .identity import WorkerIdentity
 from .ledger import WorkerLedger
 from .resources import ResourceCollector
+from .model_verification import verify_model_configuration
 
 
 class TrainingWorkerDaemon:
@@ -68,8 +69,39 @@ class TrainingWorkerDaemon:
             "resources": resource_payload,
             "reconciliation": reconciliation_payload,
         }
-        self.center_client.publish_heartbeat(self.identity, payload)
+        response = self.center_client.publish_heartbeat(self.identity, payload)
+        command = response.get("command") if isinstance(response, dict) else None
+        if isinstance(command, dict):
+            self._handle_command(command)
         return payload
+
+    def _handle_command(self, command: dict[str, object]) -> None:
+        command_ref = command.get("command_ref")
+        kind = command.get("kind")
+        command_payload = command.get("payload")
+        if (
+            not isinstance(command_ref, str)
+            or kind != "verify_model_configuration"
+            or not isinstance(command_payload, dict)
+        ):
+            return
+        try:
+            result = verify_model_configuration(command_payload)
+        except (OSError, ValueError):
+            result = {
+                "status": "failed",
+                "checks": [
+                    {
+                        "code": "verification_request",
+                        "label": "验证请求",
+                        "status": "failed",
+                        "detail": "Worker 无法解析该验证请求。",
+                    }
+                ],
+            }
+        self.center_client.publish_command_result(
+            self.identity, command_ref, result
+        )
 
     def run_forever(self) -> None:
         while not self._stop_event.is_set():

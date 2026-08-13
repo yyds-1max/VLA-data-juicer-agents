@@ -87,6 +87,14 @@ class TrainingServiceProtocol(Protocol):
         self, node_ref: str, worker_token: str, payload: Any
     ) -> dict[str, Any]: ...
 
+    def finish_model_verification(
+        self,
+        node_ref: str,
+        command_ref: str,
+        worker_token: str,
+        payload: Any,
+    ) -> dict[str, Any]: ...
+
     def get_node_resources(self, node_ref: str) -> dict[str, Any]: ...
 
     def list_models(
@@ -106,6 +114,10 @@ class TrainingServiceProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def update_model(
+        self, model_ref: str, payload: Any, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def verify_model(
         self, model_ref: str, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
@@ -495,6 +507,39 @@ class TrainingNodeHeartbeatRequest(StrictRequest):
         return value
 
 
+class ModelVerificationCheck(StrictRequest):
+    code: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
+    label: str = Field(min_length=1, max_length=120)
+    status: Literal["passed", "warning", "failed"]
+    detail: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("label", "detail")
+    @classmethod
+    def safe_text(cls, value: str) -> str:
+        if any(character in value for character in ("\x00", "\r")):
+            raise ValueError("verification text contains control characters")
+        return value
+
+
+class ModelVerificationResultRequest(StrictRequest):
+    worker_instance_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    status: Literal["succeeded", "failed"]
+    checks: list[ModelVerificationCheck] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def status_matches_checks(self) -> ModelVerificationResultRequest:
+        has_failure = any(check.status == "failed" for check in self.checks)
+        if (self.status == "succeeded" and has_failure) or (
+            self.status == "failed" and not has_failure
+        ):
+            raise ValueError("verification status must match its checks")
+        return self
+
+
 class ParameterChoice(StrictRequest):
     value: str = Field(min_length=1, max_length=200)
     label: str = Field(min_length=1, max_length=200)
@@ -864,6 +909,10 @@ class UpdateModelRequest(StrictRequest):
     configuration: ModelConfigurationRequest
 
 
+class VerifyModelRequest(StrictRequest):
+    expected_revision: Annotated[int, Field(strict=True, ge=1)]
+
+
 class RunRequest(StrictRequest):
     model_ref: str = Field(min_length=1, max_length=200)
     server_ref: str = Field(min_length=1, max_length=200)
@@ -1074,19 +1123,47 @@ def create_training_router(
         ] = None,
     ) -> dict[str, Any]:
         worker_token = _worker_bearer_token(authorization)
-        node = _translate(
+        heartbeat = _translate(
             service.heartbeat_node,
             node_ref,
             worker_token,
             request,
         )
+        node = heartbeat["node"]
         return {
             "node_ref": node["node_ref"],
             "status": node["status"],
             "state_revision": node["state_revision"],
             "server_time": datetime.now(UTC).isoformat(timespec="milliseconds"),
             "next_heartbeat_seconds": 15,
+            "command": heartbeat.get("command"),
         }
+
+    @router.post("/nodes/{node_ref}/commands/{command_ref}/result")
+    def finish_model_verification(
+        node_ref: str,
+        command_ref: str,
+        request: ModelVerificationResultRequest,
+        authorization: Annotated[
+            str | None,
+            Header(alias="Authorization", max_length=512),
+        ] = None,
+    ) -> dict[str, Any]:
+        if not _SAFE_REF.fullmatch(command_ref):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_command_ref",
+                    "message": "Worker command reference contains unsupported characters.",
+                },
+            )
+        return _translate(
+            service.finish_model_verification,
+            node_ref,
+            command_ref,
+            _worker_bearer_token(authorization),
+            request,
+        )
 
     @router.get("/nodes/{node_ref}/resources")
     def node_resources(node_ref: str) -> dict[str, Any]:
@@ -1159,6 +1236,21 @@ def create_training_router(
         model = _normalize_model(
             _translate(
                 service.update_model,
+                model_ref,
+                request,
+                get_principal(),
+            )
+        )
+        return {"model": model}
+
+    @router.post("/models/{model_ref}/verify", status_code=202)
+    def verify_model(
+        model_ref: str,
+        request: VerifyModelRequest,
+    ) -> dict[str, Any]:
+        model = _normalize_model(
+            _translate(
+                service.verify_model,
                 model_ref,
                 request,
                 get_principal(),
@@ -1466,10 +1558,38 @@ def _resources_projection(
                 ),
             }
         )
+    cpu = resources.get("cpu")
+    memory = resources.get("memory")
+    disks = resources.get("disks", [])
     return {
         "server": _server_projection(server),
         "sampled_at": sampled_at,
         "stale": bool(resources.get("stale", False)),
+        "cpu": {
+            "logical_cores": int(cpu.get("logical_cores", 0)),
+            "load_1m": (
+                float(cpu["load_1m"])
+                if cpu.get("load_1m") is not None
+                else None
+            ),
+        }
+        if isinstance(cpu, dict)
+        else None,
+        "memory": {
+            "total_bytes": int(memory.get("total_bytes", 0)),
+            "available_bytes": int(memory.get("available_bytes", 0)),
+        }
+        if isinstance(memory, dict)
+        else None,
+        "disks": [
+            {
+                "mount": str(disk.get("mount", "")),
+                "total_bytes": int(disk.get("total_bytes", 0)),
+                "available_bytes": int(disk.get("available_bytes", 0)),
+            }
+            for disk in disks
+            if isinstance(disk, dict) and disk.get("mount")
+        ],
         "gpus": gpus,
     }
 
@@ -1525,6 +1645,19 @@ def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
         "created_at": model.get("created_at"),
         "updated_at": model.get("updated_at"),
     }
+    verification = model.get("verification")
+    if isinstance(verification, dict):
+        result["verification"] = {
+            "verification_ref": verification.get("verification_ref"),
+            "status": verification.get("status"),
+            "requested_at": verification.get("requested_at"),
+            "finished_at": verification.get("finished_at"),
+            **(
+                {"checks": verification["checks"]}
+                if isinstance(verification.get("checks"), list)
+                else {}
+            ),
+        }
     configuration = model.get("configuration")
     if isinstance(configuration, dict):
         definitions = configuration.get("parameter_definitions")
@@ -1714,6 +1847,17 @@ def _model_projection(
     if principal.can("training:manage_models"):
         return model
     projected = dict(model)
+    verification = projected.get("verification")
+    if isinstance(verification, dict):
+        projected["verification"] = {
+            key: verification.get(key)
+            for key in (
+                "verification_ref",
+                "status",
+                "requested_at",
+                "finished_at",
+            )
+        }
     configuration = projected.get("configuration")
     if isinstance(configuration, dict):
         safe_configuration = dict(configuration)

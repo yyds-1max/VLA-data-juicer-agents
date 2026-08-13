@@ -6,6 +6,8 @@ import {
   ChevronDown,
   CircleHelp,
   FileText,
+  Cpu,
+  HardDrive,
   Play,
   Plus,
   RefreshCw,
@@ -25,7 +27,6 @@ import {
   getTrainingRun,
   getTrainingRunLogs,
   getTrainingRunMetrics,
-  getTrainingNodeResources,
   getTrainingServerResources,
   listTrainingModels,
   listTrainingNodes,
@@ -35,8 +36,9 @@ import {
   previewTrainingRun,
   stopTrainingRun,
   updateTrainingModel,
+  verifyTrainingModel,
 } from "../../api/client";
-import type { TrainingCapabilities, TrainingGpuResource, TrainingMetricSample, TrainingModel, TrainingNode, TrainingNodeResourceSnapshot, TrainingParameterDefinition, TrainingRun, TrainingRunLog, TrainingRunPreview, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingGpuResource, TrainingMetricSample, TrainingModel, TrainingNode, TrainingParameterDefinition, TrainingRun, TrainingRunLog, TrainingRunPreview, TrainingServer, TrainingServerResources } from "../../api/types";
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
 import { ProgressBar } from "../../components/console/ProgressBar";
@@ -88,6 +90,15 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : "请求失败，请稍后重试。";
 }
 function formatNumber(value: number | undefined, digits = 4) { return value === undefined ? "--" : value.toLocaleString("en-US", { maximumFractionDigits: digits }); }
+function formatResourceBytes(value: number | undefined) {
+  if (value == null || !Number.isFinite(value)) return "--";
+  const gib = value / 1024 / 1024 / 1024;
+  return `${gib >= 10 ? gib.toFixed(0) : gib.toFixed(1)} GiB`;
+}
+function availablePercent(available: number, total: number) {
+  if (!Number.isFinite(available) || !Number.isFinite(total) || total <= 0) return 0;
+  return Math.min(100, Math.max(0, available / total * 100));
+}
 function can(capabilities: TrainingCapabilities | null, permission: TrainingCapabilities["permissions"][number]) { return capabilities?.permissions.includes(permission) ?? false; }
 function modelDisplayName(model: TrainingModel) { return `${model.family_name} v${model.version_number}`; }
 function runModelDisplayName(run: TrainingRun) { return run.model_display_name || `${run.family_name} v${run.model_version_number}`; }
@@ -437,6 +448,28 @@ function RunsPanel({ runs, selectedRun, canStop, onSelect, onRunChange }: { runs
   );
 }
 
+function ModelVersionCard({ model, servers, canManage, verifying, onEdit, onVerify }: { model: TrainingModel; servers: TrainingServer[]; canManage: boolean; verifying: boolean; onEdit: () => void; onVerify: () => void }) {
+  const serverRef = model.configuration?.launch_template?.server_ref;
+  const server = servers.find((item) => item.server_ref === serverRef);
+  const usesRealWorker = server?.kind === "training_node";
+  const nodeOnline = usesRealWorker && server?.status === "online" && server.available !== false;
+  const verification = model.verification;
+  const verificationActive = verification?.status === "queued" || verification?.status === "running";
+  const verificationLabel = verification?.status === "queued" ? "等待 Worker" : verification?.status === "running" ? "正在验证" : verification?.status === "succeeded" ? "验证通过" : verification?.status === "failed" ? "验证未通过" : null;
+  return <div className="rounded border border-console-line bg-console-panel p-2.5">
+    <div className="flex items-center justify-between gap-2"><p className="font-medium text-console-text">v{model.version_number}</p><StatusTag tone={modelStatusMeta[model.status].tone}>{modelStatusMeta[model.status].label}</StatusTag></div>
+    <p className="mt-1 text-sm text-console-muted">{model.version_description || "无版本说明"}</p>
+    <p className="mt-2 line-clamp-2 text-xs text-console-muted">参数：{model.configuration?.parameter_definitions.map((parameter) => parameter.key).join("、") || "加载详情后显示"}</p>
+    {verificationLabel ? <div className={cn("mt-2 rounded-md border px-2.5 py-2 text-xs", verification?.status === "succeeded" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : verification?.status === "failed" ? "border-rose-200 bg-rose-50 text-rose-800" : "border-sky-200 bg-sky-50 text-sky-800")}><p className="font-medium">{verificationLabel}</p>{verification?.checks?.length ? <ul className="mt-1 space-y-1">{verification.checks.map((check) => <li key={check.code}><span className="font-medium">{check.label}：</span>{check.detail}</li>)}</ul> : null}</div> : null}
+    <div className="mt-2 flex flex-wrap gap-2">
+      {model.configuration_editable && canManage ? <ConsoleButton variant="ghost" onClick={onEdit}>编辑 v{model.version_number}</ConsoleButton> : <p className="self-center text-xs text-console-muted">配置已冻结</p>}
+      {canManage ? <ConsoleButton variant="ghost" disabled={!nodeOnline || verifying || verificationActive} onClick={onVerify}>{verifying || verificationActive ? "验证中" : "验证配置"}</ConsoleButton> : null}
+    </div>
+    {canManage && !usesRealWorker ? <p className="mt-1 text-xs text-console-muted">只有绑定已部署 Worker 的真实训练节点后才能验证。</p> : null}
+    {canManage && usesRealWorker && !nodeOnline ? <p className="mt-1 text-xs text-console-muted">训练节点在线后才能验证。</p> : null}
+  </div>;
+}
+
 function ModelsPanel({ models, servers, canManage, onSaved }: { models: TrainingModel[]; servers: TrainingServer[]; canManage: boolean; onSaved: (model: TrainingModel) => void }) {
   const [editingModelRef, setEditingModelRef] = useState<string | null>(null);
   const [versionFamilyRef, setVersionFamilyRef] = useState<string | null>(null);
@@ -444,7 +477,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
   const [familyName, setFamilyName] = useState("");
   const [versionDescription, setVersionDescription] = useState("");
   const [formDirty, setFormDirty] = useState(false);
-  const [domain, setDomain] = useState("vla"); const [serverRef, setServerRef] = useState("fake-local");
+  const [domain, setDomain] = useState("vla"); const [serverRef, setServerRef] = useState(servers[0]?.server_ref ?? "");
   const [workingDirectory, setWorkingDirectory] = useState(emptyLaunchTemplate.working_directory); const [executable, setExecutable] = useState(emptyLaunchTemplate.executable);
   const [launcherKind, setLauncherKind] = useState<"torchrun" | "direct">(emptyLaunchTemplate.launcher_kind);
   const [entrypoint, setEntrypoint] = useState(emptyLaunchTemplate.entrypoint); const [fixedArgv, setFixedArgv] = useState(""); const [outputRoot, setOutputRoot] = useState(emptyLaunchTemplate.output_root); const [outputFlag, setOutputFlag] = useState(emptyLaunchTemplate.output_flag);
@@ -453,10 +486,16 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
   const [monitoringFormat, setMonitoringFormat] = useState<"plain" | "transformers" | "jsonl">(emptyLaunchTemplate.monitoring.format);
   const [parameterDefinitions, setParameterDefinitions] = useState<TrainingParameterDefinition[]>([]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
+  const [verifyingModelRef, setVerifyingModelRef] = useState<string | null>(null);
   const textInput = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text";
+  useEffect(() => {
+    if (!editingModelRef && !versionFamilyRef && servers.length && !servers.some((server) => server.server_ref === serverRef)) {
+      setServerRef(servers[0].server_ref);
+    }
+  }, [editingModelRef, serverRef, servers, versionFamilyRef]);
   const resetCreateMode = () => {
     setEditingModelRef(null); setVersionFamilyRef(null); setBasedOnModelRef(""); setFamilyName(""); setVersionDescription(""); setFormDirty(false);
-    setDomain(emptyLaunchTemplate.domain); setServerRef(emptyLaunchTemplate.server_ref); setWorkingDirectory(emptyLaunchTemplate.working_directory); setLauncherKind(emptyLaunchTemplate.launcher_kind); setExecutable(emptyLaunchTemplate.executable);
+    setDomain(emptyLaunchTemplate.domain); setServerRef(servers[0]?.server_ref ?? ""); setWorkingDirectory(emptyLaunchTemplate.working_directory); setLauncherKind(emptyLaunchTemplate.launcher_kind); setExecutable(emptyLaunchTemplate.executable);
     setEntrypoint(emptyLaunchTemplate.entrypoint); setFixedArgv(""); setOutputRoot(emptyLaunchTemplate.output_root); setOutputFlag(emptyLaunchTemplate.output_flag);
     setRuntimeKind(emptyLaunchTemplate.runtime_environment.kind); setCondaEnvironment(""); setMonitoringFormat(emptyLaunchTemplate.monitoring.format); setParameterDefinitions([]); setError(null);
   };
@@ -522,11 +561,17 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
   };
   const loadNavilaPreset = () => {
     setFamilyName("NaVILA 轨迹训练"); setVersionDescription("NaVILA 轨迹训练模板；所有路径均为待配置占位值，仅用于模拟预览。");
-    setDomain(navilaTrajectoryLaunchTemplate.domain); setServerRef(navilaTrajectoryLaunchTemplate.server_ref); setWorkingDirectory(navilaTrajectoryLaunchTemplate.working_directory);
+    setDomain(navilaTrajectoryLaunchTemplate.domain); setServerRef(servers[0]?.server_ref ?? navilaTrajectoryLaunchTemplate.server_ref); setWorkingDirectory(navilaTrajectoryLaunchTemplate.working_directory);
     setLauncherKind(navilaTrajectoryLaunchTemplate.launcher_kind); setExecutable(navilaTrajectoryLaunchTemplate.executable); setEntrypoint(navilaTrajectoryLaunchTemplate.entrypoint); setFixedArgv("");
     setOutputRoot(navilaTrajectoryLaunchTemplate.output_root); setOutputFlag(navilaTrajectoryLaunchTemplate.output_flag);
     setRuntimeKind(navilaTrajectoryLaunchTemplate.runtime_environment.kind); setCondaEnvironment(navilaTrajectoryLaunchTemplate.runtime_environment.conda_environment ?? ""); setMonitoringFormat(navilaTrajectoryLaunchTemplate.monitoring.format);
     setParameterDefinitions(structuredClone(navilaTrajectoryParameters)); setError(null); setFormDirty(true);
+  };
+  const verify = async (model: TrainingModel) => {
+    setVerifyingModelRef(model.model_ref); setError(null);
+    try { onSaved(await verifyTrainingModel(model.model_ref, model.edit_revision)); }
+    catch (caught) { setError(errorText(caught)); }
+    finally { setVerifyingModelRef(null); }
   };
   const defaultParameterValues = Object.fromEntries(parameterDefinitions.map((parameter) => [parameter.key, parameter.default]));
   const defaultEnabledParameters = enabledTrainingParameters(parameterDefinitions, defaultParameterValues);
@@ -555,7 +600,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
     <div className="mb-4 rounded-md border border-sky-200 bg-sky-50 p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-medium text-sky-900">不知道从哪里开始？</p><p className="text-xs text-sky-800">载入同事命令对应的完整参数结构，再按部署环境修改占位路径。</p></div><ConsoleButton variant="ghost" disabled={!canManage} onClick={loadNavilaPreset}>一键载入 NaVILA 轨迹训练模板</ConsoleButton></div></div>
     {versionFamilyRef ? <label className="block text-sm text-console-muted">基于版本 <span className="inline-flex align-middle"><TooltipProvider><Tooltip><TooltipTrigger asChild><button type="button" aria-label="基于版本说明" className="inline-flex rounded text-console-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/30"><CircleHelp className="h-4 w-4" /></button></TooltipTrigger><TooltipContent>复制所选版本的训练节点、启动入口和参数定义作为新版本的初始配置。创建后可继续修改，不会影响原版本及其训练记录。</TooltipContent></Tooltip></TooltipProvider></span><select aria-label="基于版本" className={textInput} value={basedOnModelRef} disabled={!canManage} onChange={(event) => changeBaseVersion(event.target.value)}>{versionFamilyModels.map((model) => <option key={model.model_ref} value={model.model_ref}>v{model.version_number}{model.version_description ? ` · ${model.version_description}` : ""}</option>)}</select></label> : <label className="block text-sm text-console-muted">模型族名称<input className={textInput} value={familyName} disabled={!canManage || Boolean(editingModelRef)} onChange={(event) => setFamilyName(event.target.value)} /></label>}<label className="mt-3 block text-sm text-console-muted">版本说明（可选）<textarea aria-label="版本说明（可选）" className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 text-console-text" value={versionDescription} maxLength={500} disabled={!canManage} onChange={(event) => setVersionDescription(event.target.value)} /><span className="mt-1 block text-right text-xs tabular-nums text-console-muted">{versionDescription.length}/500</span></label>
     <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-sm text-console-muted">领域 · Domain<input className={textInput} value={domain} disabled={!canManage} onChange={(e) => setDomain(e.target.value)} /></label><label className="text-sm text-console-muted">训练节点 · Server<select aria-label="训练节点 · Server" className={textInput} value={serverRef} disabled={!canManage} onChange={(e) => setServerRef(e.target.value)}>{!servers.some((server) => server.server_ref === serverRef) ? <option value={serverRef}>未找到：{serverRef}</option> : null}{servers.map((server) => <option key={server.server_ref} value={server.server_ref}>{server.name} · {server.kind === "simulation" ? "仅模拟" : server.status ?? "真实节点"}</option>)}</select></label><label className="text-sm text-console-muted">工作目录 · Working directory<input className={textInput} value={workingDirectory} disabled={!canManage} onChange={(e) => setWorkingDirectory(e.target.value)} /></label><label className="text-sm text-console-muted">启动方式 · Launcher<select className={textInput} value={launcherKind} disabled={!canManage} onChange={(e) => setLauncherKind(e.target.value as "torchrun" | "direct")}><option value="torchrun">PyTorch Torchrun</option><option value="direct">直接执行</option></select></label><label className="text-sm text-console-muted">启动程序 · Executable<input className={textInput} value={executable} disabled={!canManage} onChange={(e) => setExecutable(e.target.value)} /></label><label className="text-sm text-console-muted">训练入口 · Entrypoint<input className={textInput} value={entrypoint} disabled={!canManage} onChange={(e) => setEntrypoint(e.target.value)} /></label><label className="text-sm text-console-muted">输出根目录 · Output root<input className={textInput} value={outputRoot} disabled={!canManage} onChange={(e) => setOutputRoot(e.target.value)} /></label><label className="text-sm text-console-muted">输出参数标志 · Output flag<input className={textInput} value={outputFlag} disabled={!canManage} onChange={(e) => setOutputFlag(e.target.value)} /></label><label className="text-sm text-console-muted">运行环境 · Runtime environment<select className={textInput} value={runtimeKind} disabled={!canManage} onChange={(e) => setRuntimeKind(e.target.value as "system" | "conda")}><option value="system">Worker 系统环境</option><option value="conda">Conda 环境</option></select></label>{runtimeKind === "conda" ? <label className="text-sm text-console-muted">Conda 环境名<input className={textInput} value={condaEnvironment} disabled={!canManage} maxLength={128} placeholder="例如 navila" onChange={(e) => setCondaEnvironment(e.target.value)} /></label> : null}<label className="text-sm text-console-muted">指标日志格式 · Metrics format<select className={textInput} value={monitoringFormat} disabled={!canManage} onChange={(e) => setMonitoringFormat(e.target.value as "plain" | "transformers" | "jsonl")}><option value="plain">普通文本（仅日志）</option><option value="transformers">Transformers Trainer 日志</option><option value="jsonl">JSON Lines 指标</option></select></label></div>
-    <label className="mt-3 block text-sm text-console-muted">额外固定 argv（每行一个 token）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 font-mono text-xs text-console-text" value={fixedArgv} disabled={!canManage} onChange={(e) => setFixedArgv(e.target.value)} /></label><div className="mt-5"><ParameterDefinitionEditor definitions={parameterDefinitions} disabled={!canManage} onChange={(definitions) => { setParameterDefinitions(definitions); setFormDirty(true); }} /></div><p className="mt-3 text-xs text-console-muted">{launcherKind === "torchrun" ? "GPU、nnodes、nproc_per_node、master 地址/端口、node rank 和输出目录由平台管理，不注册为普通参数。" : "GPU 和输出目录由平台管理；直接执行不会注入 Torchrun 分布式参数。"}</p><div className="mt-4 rounded-md border border-console-line bg-slate-950 p-3"><p className="mb-2 text-xs font-semibold text-slate-300">实时结构化命令摘要（默认值）</p><p className="font-mono text-xs leading-6 text-slate-100 break-all">{commandTokens.map((token) => /\s/.test(token) ? JSON.stringify(token) : token).join(" ")}</p></div>{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<ConsoleButton className="mt-4" variant="primary" disabled={!canManage || busy || (!versionFamilyRef && !familyName.trim()) || !serverRef.trim() || !entrypoint.trim()} onClick={() => void save()}><Plus className="h-4 w-4" />{editingModelRef ? "保存修改" : versionFamilyRef ? `创建 v${nextVersionNumber}` : "创建 v1"}</ConsoleButton></ConsoleCard></div><ConsoleCard className="h-fit shadow-none"><div className="mb-4 flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h2 className="font-semibold text-console-text">已登记模型</h2></div><div className="space-y-3">{familyGroups.map((family) => <section key={family.familyRef} className="rounded-md border border-console-line bg-console-panel2 p-3"><div className="flex items-start justify-between gap-2"><div><p className="font-medium text-console-text">{family.familyName}</p><p className="mt-1 text-xs text-console-muted">{family.versions.length} 个版本 · 最新 v{family.versions[0]?.version_number}</p></div>{canManage ? <ConsoleButton variant="ghost" onClick={() => registerVersion(family.familyRef)}>登记新版本</ConsoleButton> : null}</div><div className="mt-3 space-y-2">{family.versions.map((model) => <div key={model.model_ref} className="rounded border border-console-line bg-console-panel p-2.5"><div className="flex items-center justify-between gap-2"><p className="font-medium text-console-text">v{model.version_number}</p><StatusTag tone={modelStatusMeta[model.status].tone}>{modelStatusMeta[model.status].label}</StatusTag></div><p className="mt-1 text-sm text-console-muted">{model.version_description || "无版本说明"}</p><p className="mt-2 line-clamp-2 text-xs text-console-muted">参数：{model.configuration?.parameter_definitions.map((p) => p.key).join("、") || "加载详情后显示"}</p>{model.configuration_editable && canManage ? <ConsoleButton className="mt-2" variant="ghost" onClick={() => edit(model)}>编辑 v{model.version_number}</ConsoleButton> : <p className="mt-2 text-xs text-console-muted">配置已冻结</p>}</div>)}</div></section>)}{!models.length ? <p className="py-8 text-center text-sm text-console-muted">尚未登记模型。</p> : null}</div></ConsoleCard></div></div>;
+    <label className="mt-3 block text-sm text-console-muted">额外固定 argv（每行一个 token）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 font-mono text-xs text-console-text" value={fixedArgv} disabled={!canManage} onChange={(e) => setFixedArgv(e.target.value)} /></label><div className="mt-5"><ParameterDefinitionEditor definitions={parameterDefinitions} disabled={!canManage} onChange={(definitions) => { setParameterDefinitions(definitions); setFormDirty(true); }} /></div><p className="mt-3 text-xs text-console-muted">{launcherKind === "torchrun" ? "GPU、nnodes、nproc_per_node、master 地址/端口、node rank 和输出目录由平台管理，不注册为普通参数。" : "GPU 和输出目录由平台管理；直接执行不会注入 Torchrun 分布式参数。"}</p><div className="mt-4 rounded-md border border-console-line bg-slate-950 p-3"><p className="mb-2 text-xs font-semibold text-slate-300">实时结构化命令摘要（默认值）</p><p className="font-mono text-xs leading-6 text-slate-100 break-all">{commandTokens.map((token) => /\s/.test(token) ? JSON.stringify(token) : token).join(" ")}</p></div>{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<ConsoleButton className="mt-4" variant="primary" disabled={!canManage || busy || (!versionFamilyRef && !familyName.trim()) || !serverRef.trim() || !entrypoint.trim()} onClick={() => void save()}><Plus className="h-4 w-4" />{editingModelRef ? "保存修改" : versionFamilyRef ? `创建 v${nextVersionNumber}` : "创建 v1"}</ConsoleButton></ConsoleCard></div><ConsoleCard className="h-fit shadow-none"><div className="mb-4 flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h2 className="font-semibold text-console-text">已登记模型</h2></div><div className="space-y-3">{familyGroups.map((family) => <section key={family.familyRef} className="rounded-md border border-console-line bg-console-panel2 p-3"><div className="flex items-start justify-between gap-2"><div><p className="font-medium text-console-text">{family.familyName}</p><p className="mt-1 text-xs text-console-muted">{family.versions.length} 个版本 · 最新 v{family.versions[0]?.version_number}</p></div>{canManage ? <ConsoleButton variant="ghost" onClick={() => registerVersion(family.familyRef)}>登记新版本</ConsoleButton> : null}</div><div className="mt-3 space-y-2">{family.versions.map((model) => <ModelVersionCard key={model.model_ref} model={model} servers={servers} canManage={canManage} verifying={verifyingModelRef === model.model_ref} onEdit={() => edit(model)} onVerify={() => void verify(model)} />)}</div></section>)}{!models.length ? <p className="py-8 text-center text-sm text-console-muted">尚未登记模型。</p> : null}</div></ConsoleCard></div></div>;
 }
 
 function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh }: { servers: TrainingServer[]; resourcesByServer: Record<string, TrainingServerResources>; resourceErrors: Record<string, string>; onRefresh: () => void }) {
@@ -568,6 +613,10 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
   const selectedResources = selectedServer ? resourcesByServer[selectedServer.server_ref] : undefined;
   const selectedError = selectedServer ? resourceErrors[selectedServer.server_ref] : undefined;
   const gpus = selectedResources?.gpus ?? [];
+  const cpu = selectedResources?.cpu;
+  const memory = selectedResources?.memory;
+  const disks = selectedResources?.disks ?? [];
+  const memoryAvailablePercent = memory ? availablePercent(memory.available_bytes, memory.total_bytes) : 0;
   // 可用资源与创建训练任务时的 GPU 选择规则保持一致：外部占用或已有租约均不可用。
   const availableCount = gpus.filter((gpu) => !gpu.externally_occupied && !gpu.lease_run_ref).length;
   const averageUtilization = gpus.length ? gpus.reduce((sum, gpu) => sum + gpu.utilization_percent, 0) / gpus.length : 0;
@@ -576,7 +625,7 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
     <section aria-labelledby="training-resources-heading" className="space-y-5">
       <header>
         <h2 id="training-resources-heading" className="text-xl font-semibold text-console-text">服务器资源</h2>
-        <p className="mt-1 text-sm text-console-muted">按服务器查看 GPU 利用率、显存与平台租约；所有已纳管服务器每 2 秒独立刷新。</p>
+        <p className="mt-1 text-sm text-console-muted">集中查看已部署 Worker 的真实 CPU、内存、磁盘和 GPU 快照；所有已纳管服务器每 2 秒独立刷新。</p>
       </header>
 
       {servers.length ? (
@@ -616,6 +665,15 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
 
       {selectedError ? <div className="flex flex-col gap-3 rounded-md border border-rose-200 bg-rose-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><p role="alert" className="text-sm text-rose-700">{selectedServer?.name} 的资源读取失败：{selectedError}</p><ConsoleButton onClick={onRefresh}><RefreshCw className="h-4 w-4" />重新加载</ConsoleButton></div> : null}
 
+      {cpu || memory || disks.length ? <div className="space-y-3">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {cpu ? <div className="rounded-xl border border-console-line bg-console-panel p-4"><Cpu className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">CPU</p><p className="mt-1 font-semibold text-console-text">{cpu.logical_cores} 核 · load {cpu.load_1m?.toFixed(2) ?? "--"}</p></div> : null}
+          {memory ? <div className="rounded-xl border border-console-line bg-console-panel p-4"><div className="flex items-start justify-between gap-3"><div><Activity className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">内存可用 / 总容量</p></div><p className="text-2xl font-semibold leading-none text-console-text" aria-label={`内存可用百分比 ${memoryAvailablePercent.toFixed(0)}%`}>{memoryAvailablePercent.toFixed(0)}<span className="text-sm">%</span></p></div><p className="mt-1 font-semibold text-console-text">{formatResourceBytes(memory.available_bytes)} / {formatResourceBytes(memory.total_bytes)}</p><ProgressBar className="mt-2" value={memoryAvailablePercent} tone="success" label="可用内存" /></div> : null}
+          <div className="rounded-xl border border-console-line bg-console-panel p-4"><Server className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">GPU</p><p className="mt-1 font-semibold text-console-text">{gpus.length} 张 · {Math.round(gpus.reduce((sum, gpu) => sum + gpu.total_memory_mib, 0) / 1024)} GiB</p></div>
+        </div>
+        <section className="rounded-xl border border-console-line bg-console-panel p-4" aria-labelledby="server-disks-title"><div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-console-cyan" /><h3 id="server-disks-title" className="font-medium text-console-text">磁盘空间</h3></div><span className="text-xs text-console-muted">Worker 自动发现 {disks.length} 个存储挂载点</span></div>{disks.length ? <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">{disks.map((disk) => { const percent = availablePercent(disk.available_bytes, disk.total_bytes); return <article key={disk.mount} className="rounded-md bg-console-panel2 p-3"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate font-mono text-sm font-medium text-console-text" title={disk.mount}>{disk.mount}</p><p className="mt-1 text-xs text-console-muted">可用 / 总容量</p></div><p className="shrink-0 text-2xl font-semibold leading-none text-console-text" aria-label={`${disk.mount} 可用 ${percent.toFixed(0)}%`}>{percent.toFixed(0)}<span className="text-sm">%</span></p></div><p className="mt-2 font-semibold text-console-text">{formatResourceBytes(disk.available_bytes)} / {formatResourceBytes(disk.total_bytes)}</p><ProgressBar className="mt-2" value={percent} tone={percent < 10 ? "danger" : percent < 20 ? "warning" : "success"} label="可用空间" /></article>; })}</div> : <p className="mt-3 text-sm text-console-muted">Worker 尚未上报可用存储挂载点。</p>}</section>
+      </div> : null}
+
       {gpus.length ? (
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4" role="region" aria-label={`${selectedServer?.name ?? "当前服务器"} GPU 资源`}>
           {gpus.map((gpu) => {
@@ -623,10 +681,10 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
             const occupied = gpu.externally_occupied || Boolean(gpu.lease_run_ref);
             return (
               <article key={gpu.gpu_uuid} className="rounded-xl border border-console-line bg-console-panel p-4 shadow-[0_6px_20px_rgba(31,42,68,0.04)]">
-                <div className="flex items-start justify-between gap-3"><div><p className="font-medium text-console-text">GPU {gpu.index}</p><p className="mt-1 text-xs text-console-muted">{gpu.name} · {gpu.temperature_c}°C</p></div><StatusTag tone={occupied ? "warning" : "success"}>{gpu.lease_run_ref ? "平台已租用" : gpu.externally_occupied ? "外部占用" : "可用"}</StatusTag></div>
+                <div className="flex items-start justify-between gap-3"><div><p className="font-medium text-console-text">GPU {gpu.index}</p><p className="mt-1 text-xs text-console-muted">{gpu.name} · {gpu.temperature_c}°C</p></div><StatusTag tone={occupied ? "warning" : "success"}>{gpu.lease_run_ref ? "平台已租用" : gpu.externally_occupied ? "外部占用" : selectedServer?.kind === "training_node" ? "平台未租用" : "可用"}</StatusTag></div>
                 <ProgressBar className="mt-4" value={gpu.utilization_percent} tone="purple" label={`利用率 ${gpu.utilization_percent}%`} />
                 <ProgressBar className="mt-4" value={memoryPercent} tone="info" label={`显存 ${Math.round(gpu.used_memory_mib / 1024)} / ${Math.round(gpu.total_memory_mib / 1024)} GiB`} />
-                <div className="mt-4 border-t border-console-line pt-3"><p className="truncate font-mono text-[11px] text-console-muted" title={gpu.gpu_uuid}>{gpu.gpu_uuid}</p><p className="mt-1 truncate text-xs text-console-muted" title={gpu.lease_run_ref ?? undefined}>{gpu.lease_run_ref ? `租约任务：${gpu.lease_run_ref}` : occupied ? "由平台外部进程占用" : "可分配给新的训练任务"}</p></div>
+                <div className="mt-4 border-t border-console-line pt-3"><p className="truncate font-mono text-[11px] text-console-muted" title={gpu.gpu_uuid}>{gpu.gpu_uuid}</p><p className="mt-1 truncate text-xs text-console-muted" title={gpu.lease_run_ref ?? undefined}>{gpu.lease_run_ref ? `租约任务：${gpu.lease_run_ref}` : occupied ? "由平台外部进程占用" : selectedServer?.kind === "training_node" ? "平台未租用；请结合利用率和显存判断" : "可分配给新的训练任务"}</p></div>
               </article>
             );
           })}
@@ -641,7 +699,8 @@ function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh 
 export function TrainingPlatform() {
   const location = useLocation(); const navigate = useNavigate();
   const deepRunRef = useMemo(() => /^\/model\/runs\/([^/]+)\/?$/.exec(location.pathname)?.[1], [location.pathname]);
-  const [tab, setTab] = useState<TrainingTab>("runs"); const [capabilities, setCapabilities] = useState<TrainingCapabilities | null>(null); const [models, setModels] = useState<TrainingModel[]>([]); const [nodes, setNodes] = useState<TrainingNode[]>([]); const [nodeResources, setNodeResources] = useState<Record<string, TrainingNodeResourceSnapshot>>({}); const [servers, setServers] = useState<TrainingServer[]>([]); const [resourcesByServer, setResourcesByServer] = useState<Record<string, TrainingServerResources>>({}); const [resourceErrors, setResourceErrors] = useState<Record<string, string>>({}); const [runs, setRuns] = useState<TrainingRun[]>([]); const [selectedRun, setSelectedRun] = useState<TrainingRun | null>(null); const [error, setError] = useState<string | null>(null); const [eventStreamDisconnected, setEventStreamDisconnected] = useState(false);
+  const [tab, setTab] = useState<TrainingTab>("runs"); const [capabilities, setCapabilities] = useState<TrainingCapabilities | null>(null); const [models, setModels] = useState<TrainingModel[]>([]); const [nodes, setNodes] = useState<TrainingNode[]>([]); const [servers, setServers] = useState<TrainingServer[]>([]); const [resourcesByServer, setResourcesByServer] = useState<Record<string, TrainingServerResources>>({}); const [resourceErrors, setResourceErrors] = useState<Record<string, string>>({}); const [runs, setRuns] = useState<TrainingRun[]>([]); const [selectedRun, setSelectedRun] = useState<TrainingRun | null>(null); const [error, setError] = useState<string | null>(null); const [eventStreamDisconnected, setEventStreamDisconnected] = useState(false);
+  const pendingNavigationTab = useRef<TrainingTab | null>(null);
   const load = useCallback(async () => {
     try {
       const [nextCapabilities, nextModels, nextNodes, nextServers, nextRuns] = await Promise.all([getTrainingCapabilities(), listTrainingModels(), listTrainingNodes(), listTrainingServers(), listTrainingRuns()]);
@@ -654,9 +713,6 @@ export function TrainingPlatform() {
         if (result.status === "fulfilled") nextResources[serverRef] = result.value.resources;
         else nextResourceErrors[serverRef] = errorText(result.reason);
       });
-      const nodeResourceResults = await Promise.allSettled(nextNodes.map(async (node) => ({ nodeRef: node.node_ref, resources: await getTrainingNodeResources(node.node_ref) })));
-      const nextNodeResources: Record<string, TrainingNodeResourceSnapshot> = {};
-      nodeResourceResults.forEach((result) => { if (result.status === "fulfilled") nextNodeResources[result.value.nodeRef] = result.value.resources; });
       setCapabilities(nextCapabilities); setModels((current) => nextModels.map((model) => {
         const local = current.find((item) => item.model_ref === model.model_ref);
         return local?.configuration_editable === false
@@ -665,7 +721,7 @@ export function TrainingPlatform() {
       })); setNodes((current) => nextNodes.map((node) => {
         const local = current.find((item) => item.node_ref === node.node_ref);
         return local && local.state_revision > node.state_revision ? local : node;
-      })); setNodeResources(nextNodeResources); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns);
+      })); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns);
       setSelectedRun((current) => current ? nextRuns.find((item) => item.run_ref === current.run_ref) ?? current : null);
       setError(null);
     } catch (caught) { setError(errorText(caught)); }
@@ -677,7 +733,15 @@ export function TrainingPlatform() {
     return () => source.close();
   }, [load]);
   useEffect(() => {
-    if (!deepRunRef) { setSelectedRun(null); return; }
+    if (!deepRunRef) {
+      setSelectedRun(null);
+      if (pendingNavigationTab.current) {
+        setTab(pendingNavigationTab.current);
+        pendingNavigationTab.current = null;
+      }
+      return;
+    }
+    if (pendingNavigationTab.current) return;
     setTab("runs");
     const listed = runs.find((run) => run.run_ref === deepRunRef);
     if (listed) { setSelectedRun(listed); return; }
@@ -690,6 +754,7 @@ export function TrainingPlatform() {
   const changeTab = useCallback((nextTab: TrainingTab) => {
     setTab(nextTab);
     if (nextTab !== "runs" && deepRunRef) {
+      pendingNavigationTab.current = nextTab;
       setSelectedRun(null);
       navigate("/model");
     }
@@ -721,7 +786,7 @@ export function TrainingPlatform() {
         <ModelsPanel models={models} servers={servers} canManage={can(capabilities, "training:manage_models")} onSaved={(model) => setModels((current) => [model, ...current.filter((item) => item.model_ref !== model.model_ref)])} />
       </div>
       <div id="training-platform-panel-nodes" role="tabpanel" aria-labelledby="training-platform-tab-nodes" hidden={tab !== "nodes"}>
-        <TrainingNodesPanel nodes={nodes} resourcesByNode={nodeResources} canManage={can(capabilities, "training:manage_nodes")} deploymentEnabled={capabilities?.node_deployment_enabled ?? false} deploymentDisabledReason={capabilities?.node_deployment_disabled_reason} onChanged={(node) => setNodes((current) => [node, ...current.filter((item) => item.node_ref !== node.node_ref)])} />
+        <TrainingNodesPanel nodes={nodes} canManage={can(capabilities, "training:manage_nodes")} deploymentEnabled={capabilities?.node_deployment_enabled ?? false} deploymentDisabledReason={capabilities?.node_deployment_disabled_reason} onChanged={(node) => setNodes((current) => [node, ...current.filter((item) => item.node_ref !== node.node_ref)])} />
       </div>
       <div id="training-platform-panel-resources" role="tabpanel" aria-labelledby="training-platform-tab-resources" hidden={tab !== "resources"}>
         <ResourcesPanel servers={servers} resourcesByServer={resourcesByServer} resourceErrors={resourceErrors} onRefresh={() => void load()} />

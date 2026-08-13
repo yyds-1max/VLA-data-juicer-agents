@@ -294,8 +294,27 @@ class TrainingService:
     def heartbeat_node(
         self, node_ref: str, worker_token: str, payload: Any
     ) -> dict[str, Any]:
-        return self.store.record_node_heartbeat(
-            node_ref, worker_token, self._data(payload)
+        data = self._data(payload)
+        node = self.store.record_node_heartbeat(node_ref, worker_token, data)
+        return {
+            "node": node,
+            "command": self.store.claim_model_verification(
+                node_ref, data["worker_instance_id"]
+            ),
+        }
+
+    def finish_model_verification(
+        self,
+        node_ref: str,
+        command_ref: str,
+        worker_token: str,
+        payload: Any,
+    ) -> dict[str, Any]:
+        return self.store.finish_model_verification(
+            node_ref,
+            worker_token,
+            command_ref,
+            self._data(payload),
         )
 
     def get_node_resources(self, node_ref: str) -> dict[str, Any]:
@@ -331,6 +350,19 @@ class TrainingService:
         data = self._adapt_model(self._data(payload)); expected = int(data.pop("expected_revision"))
         self._require_registered_server(data["launch_template"]["server_ref"])
         return self._project_model(self.store.update_model(model_ref, expected, data, principal.subject))
+
+    def verify_model(
+        self, model_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_MANAGE_MODELS)
+        data = self._data(payload)
+        return self._project_model(
+            self.store.request_model_verification(
+                model_ref,
+                int(data["expected_revision"]),
+                principal.subject,
+            )
+        )
 
     def _require_registered_server(self, server_ref: str) -> None:
         if not any(

@@ -1,11 +1,10 @@
-import { Activity, Cpu, Eye, EyeOff, HardDrive, KeyRound, Plus, Server, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Eye, EyeOff, KeyRound, Plus, Server, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
+import { useState } from "react";
 
 import { ApiResponseError, createTrainingNode, deployTrainingNodeWorker, discoverTrainingNodeHostKey, preflightTrainingNodeWorker, removeTrainingNodeWorker } from "../../api/client";
-import type { TrainingNode, TrainingNodeHostKey, TrainingNodePreflightResult, TrainingNodeResourceSnapshot, TrainingNodeStatus } from "../../api/types";
+import type { TrainingNode, TrainingNodeHostKey, TrainingNodePreflightResult, TrainingNodeStatus } from "../../api/types";
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
-import { ProgressBar } from "../../components/console/ProgressBar";
 import { StatusTag } from "../../components/console/StatusTag";
 import {
   AlertDialog,
@@ -58,21 +57,10 @@ function errorText(error: unknown) {
   return "请求失败，请稍后重试。";
 }
 
-function formatBytes(value: number | undefined) {
-  if (value == null || !Number.isFinite(value)) return "--";
-  const gib = value / 1024 / 1024 / 1024;
-  return `${gib >= 10 ? gib.toFixed(0) : gib.toFixed(1)} GiB`;
-}
-
 function formatTime(value: string | null | undefined) {
   if (!value) return "--";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
-}
-
-function availablePercent(available: number, total: number) {
-  if (!Number.isFinite(available) || !Number.isFinite(total) || total <= 0) return 0;
-  return Math.min(100, Math.max(0, available / total * 100));
 }
 
 const inputClass = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none disabled:bg-slate-100";
@@ -109,14 +97,12 @@ function PasswordField({
 
 export function TrainingNodesPanel({
   nodes,
-  resourcesByNode,
   canManage,
   deploymentEnabled,
   deploymentDisabledReason,
   onChanged,
 }: {
   nodes: TrainingNode[];
-  resourcesByNode: Record<string, TrainingNodeResourceSnapshot>;
   canManage: boolean;
   deploymentEnabled: boolean;
   deploymentDisabledReason?: string | null;
@@ -147,19 +133,8 @@ export function TrainingNodesPanel({
   const [removalSudoPassword, setRemovalSudoPassword] = useState("");
   const [removalSudoPasswordVisible, setRemovalSudoPasswordVisible] = useState(false);
   const selected = nodes.find((node) => node.node_ref === selectedRef) ?? nodes[0] ?? null;
-  const snapshot = selected ? resourcesByNode[selected.node_ref] : undefined;
-  const resources = snapshot?.resources ?? selected?.resources ?? null;
-  const memoryAvailablePercent = resources ? availablePercent(resources.memory.available_bytes, resources.memory.total_bytes) : 0;
   const port = Number(sshPort);
   const valid = Boolean(name.trim() && address.trim() && sshUsername.trim() && Number.isInteger(port) && port >= 1 && port <= 65535);
-  const gpuSummary = useMemo(() => {
-    const gpus = resources?.gpus ?? [];
-    return {
-      count: gpus.length,
-      memory: gpus.reduce((sum, gpu) => sum + gpu.memory_total_bytes, 0),
-      utilization: gpus.length ? gpus.reduce((sum, gpu) => sum + gpu.utilization_percent, 0) / gpus.length : 0,
-    };
-  }, [resources]);
   const hasInstalledWorker = Boolean(selected && (
     selected.deployment_status === "succeeded"
     || selected.installed_worker_version
@@ -261,7 +236,7 @@ export function TrainingNodesPanel({
     <section className="space-y-5" aria-labelledby="training-nodes-title">
       <header className="border-b border-console-line pb-5">
         <h2 id="training-nodes-title" className="text-xl font-semibold text-console-text">训练节点</h2>
-        <p className="mt-1 text-sm text-console-muted">登记训练机器、部署独立 Worker，并通过心跳安全查看资源与运行状态。</p>
+        <p className="mt-1 text-sm text-console-muted">登记训练机器并管理独立 Worker。CPU、内存、磁盘和 GPU 统一在“服务器资源”查看。</p>
       </header>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(340px,.72fr)_minmax(0,1.28fr)]">
@@ -316,14 +291,6 @@ export function TrainingNodesPanel({
               {message ? <p role="status" className="mt-3 text-sm text-console-muted">{message}</p> : null}
             </ConsoleCard>
 
-            <ConsoleCard className="shadow-none">
-              <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><Activity className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">节点资源</h3></div><span className="text-xs text-console-muted">{snapshot?.stale ? "快照已过期" : `采样 ${formatTime(snapshot?.captured_at)}`}</span></div>
-              {resources ? <><div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                <div className="rounded-md bg-console-panel2 p-3"><Cpu className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">CPU</p><p className="mt-1 font-semibold text-console-text">{resources.cpu.logical_cores} 核 · load {resources.cpu.load_1m?.toFixed(2) ?? "--"}</p></div>
-                <div className="rounded-md bg-console-panel2 p-3"><div className="flex items-start justify-between gap-3"><div><Activity className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">内存可用 / 总容量</p></div><p className="text-2xl font-semibold leading-none text-console-text" aria-label={`内存可用百分比 ${memoryAvailablePercent.toFixed(0)}%`}>{memoryAvailablePercent.toFixed(0)}<span className="text-sm">%</span></p></div><p className="mt-1 font-semibold text-console-text">{formatBytes(resources.memory.available_bytes)} / {formatBytes(resources.memory.total_bytes)}</p><ProgressBar className="mt-2" value={memoryAvailablePercent} tone="success" label="可用内存" /></div>
-                <div className="rounded-md bg-console-panel2 p-3"><Server className="h-4 w-4 text-console-muted" /><p className="mt-2 text-xs text-console-muted">GPU</p><p className="mt-1 font-semibold text-console-text">{gpuSummary.count} 张 · {formatBytes(gpuSummary.memory)}</p></div>
-              </div><section className="mt-4 rounded-lg border border-console-line bg-console-panel p-4" aria-labelledby="node-disks-title"><div className="flex flex-wrap items-center justify-between gap-2"><div className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-console-cyan" /><h4 id="node-disks-title" className="font-medium text-console-text">磁盘空间</h4></div><span className="text-xs text-console-muted">自动发现 {resources.disks.length} 个存储挂载点</span></div>{resources.disks.length ? <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">{resources.disks.map((disk) => { const percent = availablePercent(disk.available_bytes, disk.total_bytes); return <article key={disk.mount} className="rounded-md bg-console-panel2 p-3"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate font-mono text-sm font-medium text-console-text" title={disk.mount}>{disk.mount}</p><p className="mt-1 text-xs text-console-muted">可用 / 总容量</p></div><p className="shrink-0 text-2xl font-semibold leading-none text-console-text" aria-label={`${disk.mount} 可用 ${percent.toFixed(0)}%`}>{percent.toFixed(0)}<span className="text-sm">%</span></p></div><p className="mt-2 font-semibold text-console-text">{formatBytes(disk.available_bytes)} / {formatBytes(disk.total_bytes)}</p><ProgressBar className="mt-2" value={percent} tone={percent < 10 ? "danger" : percent < 20 ? "warning" : "success"} label="可用空间" /></article>; })}</div> : <p className="mt-3 text-sm text-console-muted">Worker 尚未上报可用存储挂载点。</p>}</section><div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">{resources.gpus.map((gpu) => <article key={gpu.uuid} className="rounded-md border border-console-line p-3"><div className="flex justify-between gap-2"><p className="font-medium text-console-text">GPU {gpu.index}</p><span className="text-xs text-console-muted">{gpu.temperature_celsius == null ? "--" : `${gpu.temperature_celsius}°C`}</span></div><p className="mt-1 truncate text-xs text-console-muted">{gpu.name}</p><ProgressBar className="mt-3" value={gpu.utilization_percent} tone="purple" label={`利用率 ${gpu.utilization_percent}%`} /><ProgressBar className="mt-3" value={gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : 0} tone="info" label={`显存 ${formatBytes(gpu.memory_used_bytes)} / ${formatBytes(gpu.memory_total_bytes)}`} /></article>)}</div></> : <div className="py-10 text-center text-sm text-console-muted">Worker 上报心跳后显示 CPU、内存、磁盘和 GPU 资源。</div>}
-            </ConsoleCard>
           </> : null}
         </div>
       </div>

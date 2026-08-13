@@ -293,7 +293,8 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         (1, "training_platform_m1"),
         (2, "training_nodes_m2"),
         (3, "training_node_deployment_m3"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "model_families_m4"),
+        (4, "model_families_m4"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "model_worker_verification_m5"),
     ]
 
 

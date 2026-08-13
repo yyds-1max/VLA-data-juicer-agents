@@ -120,15 +120,15 @@ def _heartbeat(
     )
 
 
-def test_catalog_always_retains_fake_simulation_server(
+def test_catalog_replaces_fake_server_after_first_node_registration(
     store: TrainingStore, provider: TrainingResourceProvider
 ) -> None:
+    assert provider.list_servers() == FakeResourceProvider(store).list_servers()
     node = _create_node(store)
 
     servers = provider.list_servers()
 
-    assert servers[0] == FakeResourceProvider(store).list_servers()[0]
-    assert servers[1] == {
+    assert servers == [{
         "server_ref": node["node_ref"],
         "name": "Training 12",
         "kind": "training_node",
@@ -137,7 +137,7 @@ def test_catalog_always_retains_fake_simulation_server(
         "available": False,
         "stale": True,
         "gpu_count": 0,
-    }
+    }]
 
 
 def test_pending_or_online_without_snapshot_is_honestly_empty_and_stale(
@@ -170,6 +170,18 @@ def test_worker_snapshot_is_converted_to_existing_server_gpu_contract(
     assert resources["stale"] is False
     assert resources["server"]["kind"] == "training_node"
     assert resources["server"]["gpu_count"] == 2
+    assert resources["cpu"] == {"logical_cores": 64, "load_1m": 4.5}
+    assert resources["memory"] == {
+        "total_bytes": 256 * 1024**3,
+        "available_bytes": 128 * 1024**3,
+    }
+    assert resources["disks"] == [
+        {
+            "mount": "/data",
+            "total_bytes": 8 * 1024**4,
+            "available_bytes": 3 * 1024**4,
+        }
+    ]
     assert resources["gpus"][0] == {
         "gpu_uuid": "GPU-real-0",
         "index": 0,

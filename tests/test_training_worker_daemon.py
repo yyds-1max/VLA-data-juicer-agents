@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import ssl
 import stat
+import sys
 from urllib.error import HTTPError
 
 import pytest
@@ -30,6 +31,9 @@ from vla_data_juicer_agents.training_worker.resources import (
     CommandResult,
     NVIDIA_SMI_COMMAND,
     ResourceCollector,
+)
+from vla_data_juicer_agents.training_worker.model_verification import (
+    verify_model_configuration,
 )
 import vla_data_juicer_agents.training_worker.resources as worker_resources
 from vla_data_juicer_agents.training_worker.cli import (
@@ -262,6 +266,98 @@ def test_daemon_health_payload_has_no_secret_and_no_execution(tmp_path: Path) ->
     assert identity.credential not in serialized
 
 
+def test_model_configuration_verification_is_read_only_and_reports_failures(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print('not executed')\n", encoding="utf-8")
+    output_root = tmp_path / "outputs" / "future-run"
+
+    result = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": sys.executable,
+            "entrypoint": "train.py",
+            "output_root": str(output_root),
+            "runtime_environment": {"kind": "system"},
+        }
+    )
+
+    assert result["status"] == "succeeded"
+    assert not output_root.exists()
+    assert {check["code"] for check in result["checks"]} == {  # type: ignore[index]
+        "working_directory",
+        "entrypoint",
+        "executable",
+        "runtime_environment",
+        "output_root",
+        "disk_space",
+    }
+
+    failed = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": "definitely-missing-launcher",
+            "entrypoint": "missing.py",
+            "output_root": "relative-output",
+            "runtime_environment": {"kind": "system"},
+        }
+    )
+    assert failed["status"] == "failed"
+    failed_codes = {
+        check["code"]
+        for check in failed["checks"]  # type: ignore[index]
+        if check["status"] == "failed"
+    }
+    assert {"entrypoint", "executable", "output_root"} <= failed_codes
+
+
+def test_daemon_processes_only_the_fixed_model_verification_command(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("raise RuntimeError('must not run')\n", encoding="utf-8")
+
+    class CommandCenter(OfflineCenterClient):
+        result: tuple[str, dict[str, object]] | None = None
+
+        def publish_heartbeat(self, identity, payload):  # type: ignore[no-untyped-def]
+            return {
+                "command": {
+                    "command_ref": "verify_123",
+                    "kind": "verify_model_configuration",
+                    "payload": {
+                        "working_directory": str(project),
+                        "executable": sys.executable,
+                        "entrypoint": "train.py",
+                        "output_root": str(tmp_path / "outputs"),
+                        "runtime_environment": {"kind": "system"},
+                    },
+                }
+            }
+
+        def publish_command_result(self, identity, command_ref, payload):  # type: ignore[no-untyped-def]
+            self.result = (command_ref, dict(payload))
+            return {"accepted": True}
+
+    center = CommandCenter()
+    daemon = TrainingWorkerDaemon(
+        identity=load_or_create_identity(tmp_path / "state"),
+        ledger=WorkerLedger(tmp_path / "state" / "worker-ledger.sqlite"),
+        resource_collector=ResourceCollector(
+            disk_paths=[tmp_path],
+            gpu_command_runner=lambda _command, _timeout: CommandResult(1, "", "unavailable"),
+        ),
+        center_client=center,
+    )
+    daemon.run_once()
+
+    assert center.result is not None
+    assert center.result[0] == "verify_123"
+    assert center.result[1]["status"] == "succeeded"
+    assert not (tmp_path / "outputs").exists()
+
+
 def test_enrollment_token_is_read_from_stdin_and_never_needs_argv() -> None:
     token = "enroll_" + "x" * 48
 
@@ -392,6 +488,36 @@ def test_http_center_protocol_enrolls_then_sends_bearer_heartbeat(tmp_path: Path
 
     EnrollTrainingNodeRequest.model_validate(json.loads(enroll_request.data))
     TrainingNodeHeartbeatRequest.model_validate(heartbeat_body)
+
+
+def test_http_center_client_posts_worker_command_result_to_fixed_origin(tmp_path: Path) -> None:
+    identity = load_or_create_identity(tmp_path / "state")
+    token = "worker_" + "z" * 48
+    client = HttpCenterClient(
+        center_base_url="https://center.example/base",
+        worker_token=token,
+        node_ref="node_123",
+        timeout_seconds=4,
+    )
+    opener = _RecordingOpener([{"command_ref": "verify_123", "status": "succeeded"}])
+    client._opener = opener  # type: ignore[assignment]
+
+    response = client.publish_command_result(
+        identity,
+        "verify_123",
+        {
+            "status": "succeeded",
+            "checks": [{"code": "entrypoint", "label": "入口", "status": "passed", "detail": "可读"}],
+        },
+    )
+
+    assert response["status"] == "succeeded"
+    request = opener.requests[0][0]
+    assert request.full_url.endswith("/api/training/nodes/node_123/commands/verify_123/result")
+    assert request.get_header("Authorization") == f"Bearer {token}"
+    body = json.loads(request.data)
+    assert body["worker_instance_id"] == identity.worker_id
+    assert "worker_token" not in body
 
 
 def test_http_center_client_rejects_redirect_without_leaking_token(tmp_path: Path) -> None:

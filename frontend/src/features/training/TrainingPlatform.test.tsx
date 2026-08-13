@@ -17,7 +17,7 @@ vi.mock("../../api/client", () => ({
   getTrainingCapabilities: vi.fn(), listTrainingModels: vi.fn(), listTrainingServers: vi.fn(),
   getTrainingServerResources: vi.fn(), listTrainingNodes: vi.fn(), getTrainingNodeResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(), createTrainingModelVersion: vi.fn(),
   createTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), preflightTrainingNodeWorker: vi.fn(), deployTrainingNodeWorker: vi.fn(), removeTrainingNodeWorker: vi.fn(),
-  updateTrainingModel: vi.fn(),
+  updateTrainingModel: vi.fn(), verifyTrainingModel: vi.fn(),
   previewTrainingRun: vi.fn(), createTrainingRun: vi.fn(), getTrainingRun: vi.fn(),
   getTrainingRunLogs: vi.fn(), getTrainingRunMetrics: vi.fn(), stopTrainingRun: vi.fn(),
   openTrainingEvents: vi.fn(),
@@ -115,30 +115,32 @@ describe("TrainingPlatform", () => {
   it("shows available memory percentage and reported disk capacity for a real node", async () => {
     const gib = 1024 ** 3;
     const onlineNode: TrainingNode = { ...pendingNode, status: "online", enrolled_at: "2026-08-12T00:00:00Z", last_heartbeat_at: "2026-08-12T00:01:00Z" };
+    const realServer: TrainingServer = { server_ref: onlineNode.node_ref, name: onlineNode.name, kind: "training_node", gpu_count: 0, status: "online", online: true, available: true, stale: false };
     mockApi(adminCapabilities);
     vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([onlineNode]);
-    vi.mocked(trainingApi.getTrainingNodeResources).mockResolvedValue({
-      node_ref: onlineNode.node_ref,
-      captured_at: "2026-08-12T00:01:00Z",
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([realServer]);
+    vi.mocked(trainingApi.getTrainingServerResources).mockResolvedValue({
+      server: realServer,
+      sampled_at: "2026-08-12T00:01:00Z",
       stale: false,
-      resources: {
-        cpu: { logical_cores: 112, load_1m: 10.88 },
-        memory: { available_bytes: 88 * gib, total_bytes: 100 * gib },
-        disks: [
-          { mount: "/", available_bytes: 400 * gib, total_bytes: 1000 * gib },
-          { mount: "/data", available_bytes: 1200 * gib, total_bytes: 2000 * gib },
-        ],
-        gpus: [],
-      },
+      cpu: { logical_cores: 112, load_1m: 10.88 },
+      memory: { available_bytes: 88 * gib, total_bytes: 100 * gib },
+      disks: [
+        { mount: "/", available_bytes: 400 * gib, total_bytes: 1000 * gib },
+        { mount: "/data", available_bytes: 1200 * gib, total_bytes: 2000 * gib },
+      ],
+      gpus: [],
     });
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+    expect(screen.getByText("内存可用 / 总容量")).not.toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "服务器资源" }));
 
     expect(await screen.findByText("内存可用 / 总容量")).toBeVisible();
     expect(screen.getByLabelText("内存可用百分比 88%")).toBeVisible();
     expect(screen.getByText("88 GiB / 100 GiB")).toBeVisible();
     expect(screen.getByRole("heading", { name: "磁盘空间" })).toBeVisible();
-    expect(screen.getByText("自动发现 2 个存储挂载点")).toBeVisible();
+    expect(screen.getByText("Worker 自动发现 2 个存储挂载点")).toBeVisible();
     expect(screen.getByText("400 GiB / 1000 GiB")).toBeVisible();
     expect(screen.getByText("1200 GiB / 2000 GiB")).toBeVisible();
     expect(screen.getByLabelText("/ 可用 40%")).toBeVisible();
@@ -336,6 +338,26 @@ describe("TrainingPlatform", () => {
     expect(trainingApi.previewTrainingRun).not.toHaveBeenCalled();
   });
 
+  it("requests Worker verification for a real model version and shows its checks", async () => {
+    const realServer: TrainingServer = { server_ref: "node-real", name: "NaVILA 训练节点", kind: "training_node", gpu_count: 1, status: "online", online: true, available: true, stale: false };
+    const realModel: TrainingModel = { ...model, model_ref: "navila-real", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
+    const queued: TrainingModel = { ...realModel, verification: { verification_ref: "verify-1", status: "queued", requested_at: "2026-08-13T08:00:00Z" } };
+    mockApi(adminCapabilities, [realModel]);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([realServer]);
+    vi.mocked(trainingApi.verifyTrainingModel).mockResolvedValue(queued);
+    renderPlatform();
+
+    fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
+    fireEvent.click(await screen.findByRole("button", { name: "验证配置" }));
+    await waitFor(() => expect(trainingApi.verifyTrainingModel).toHaveBeenCalledWith(realModel.model_ref, realModel.edit_revision));
+    expect(await screen.findByText("等待 Worker")).toBeVisible();
+
+    vi.mocked(trainingApi.listTrainingModels).mockResolvedValue([{ ...queued, status: "verified", verification: { ...queued.verification!, status: "succeeded", finished_at: "2026-08-13T08:00:02Z", checks: [{ code: "entrypoint", label: "训练入口", status: "passed", detail: "训练入口存在且 Worker 可以读取。" }] } }]);
+    await waitFor(() => expect(screen.getByText("验证通过")).toBeVisible(), { timeout: 3_000 });
+    expect(screen.getByText("训练入口：")).toBeVisible();
+    expect(screen.getByText("训练入口存在且 Worker 可以读取。")).toBeVisible();
+  });
+
   it("infers direct launch when editing a legacy model without launcher_kind", async () => {
     const legacyLaunchTemplate: Partial<typeof launchTemplate> = { ...launchTemplate };
     delete legacyLaunchTemplate.launcher_kind;
@@ -459,8 +481,10 @@ describe("TrainingPlatform", () => {
     await waitFor(() => expect(trainingApi.createTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ parameters: { num_video_frames: 8 }, execution_mode: "simulation" })));
     expect(vi.mocked(trainingApi.createTrainingRun).mock.calls[0][0]).not.toHaveProperty("model_revision");
     await screen.findByText("任务 run-1");
-    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
-    expect(await screen.findByText("配置已冻结")).toBeVisible();
+    const modelsTab = screen.getByRole("tab", { name: "模型注册" });
+    fireEvent.click(modelsTab);
+    await waitFor(() => expect(modelsTab).toHaveAttribute("aria-selected", "true"));
+    expect(screen.getAllByText("配置已冻结").find((element) => !element.closest("[hidden]"))).toBeVisible();
     expect(screen.queryByRole("button", { name: "编辑 v1" })).not.toBeInTheDocument();
   });
 

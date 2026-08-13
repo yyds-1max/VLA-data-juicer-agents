@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 4
+LATEST_TRAINING_SCHEMA_VERSION = 5
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -47,6 +47,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(4,?,?)",
             ("model_families_m4", applied_at),
+        )
+        connection.commit()
+        versions.append(4)
+    if 5 not in versions:
+        connection.executescript(_MIGRATION_005)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(5,?,?)",
+            ("model_worker_verification_m5", applied_at),
         )
         connection.commit()
 
@@ -275,5 +283,34 @@ CREATE UNIQUE INDEX uq_registered_models_family_version
   ON registered_models(family_id,version_number);
 CREATE INDEX idx_registered_models_family
   ON registered_models(family_id,version_number DESC);
+COMMIT;
+"""
+
+
+_MIGRATION_005 = """
+BEGIN IMMEDIATE;
+CREATE TABLE model_verification_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  verification_ref TEXT NOT NULL UNIQUE,
+  model_id INTEGER NOT NULL,
+  model_revision_id INTEGER NOT NULL,
+  node_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')),
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  worker_instance_id TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(model_id) REFERENCES registered_models(id),
+  FOREIGN KEY(model_revision_id) REFERENCES model_revisions(id),
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id)
+);
+CREATE INDEX idx_model_verification_node_status
+  ON model_verification_requests(node_id,status,id);
+CREATE INDEX idx_model_verification_model
+  ON model_verification_requests(model_id,id DESC);
 COMMIT;
 """

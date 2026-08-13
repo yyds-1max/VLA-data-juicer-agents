@@ -36,6 +36,13 @@ class WorkerCenterClient(Protocol):
         payload: Mapping[str, object],
     ) -> Mapping[str, object]: ...
 
+    def publish_command_result(
+        self,
+        identity: WorkerIdentity,
+        command_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
 
 class NoRedirectHandler(HTTPRedirectHandler):
     """Reject every redirect so credentials cannot move to another origin."""
@@ -127,6 +134,22 @@ class HttpCenterClient:
             bearer_token=self.worker_token,
         )
 
+    def publish_command_result(
+        self,
+        identity: WorkerIdentity,
+        command_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        if not command_ref or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-" for character in command_ref):
+            raise CenterClientError("worker command reference is invalid")
+        return self._post_json(
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/commands/{quote(command_ref, safe='')}/result",
+            {"worker_instance_id": identity.worker_id, **dict(payload)},
+            bearer_token=self.worker_token,
+        )
+
     def _post_json(
         self,
         path: str,
@@ -185,6 +208,14 @@ class OfflineCenterClient:
     ) -> Mapping[str, object]:
         return {}
 
+    def publish_command_result(
+        self,
+        identity: WorkerIdentity,
+        command_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return {}
+
 
 def capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
     return _capability_payload(resources)
@@ -205,7 +236,11 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
         "nvidia_driver_version": None,
         "cuda_version": None,
         "conda_environments": [],
-        "worker_features": ["resource_inventory", "restart_reconciliation"],
+        "worker_features": [
+            "resource_inventory",
+            "restart_reconciliation",
+            "model_configuration_verification",
+        ],
     }
 
 

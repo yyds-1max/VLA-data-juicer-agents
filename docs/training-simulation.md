@@ -2,7 +2,7 @@
 
 模型训练任务的首个里程碑只运行模拟链路，不读取 NaVILA 目录，也不创建真实训练
 进程。训练节点页可以在显式配置中心 HTTPS 地址后，通过一次 SSH 授权自动部署只读
-Worker；该 Worker 仍不能执行训练命令。
+Worker；该 Worker 仍不能执行训练命令，只能处理中心签发的固定类型只读验证任务。
 
 ## 本地启用管理操作
 
@@ -30,7 +30,7 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 
 1. 打开“模型训练”，确认页面标明真实训练未启用。
 2. 登记一个模型族及其 `v1` 训练配置；`num_video_frames` 的实际字段值决定帧数。
-3. 选择 Fake A100 资源并生成 RunSpec 预览。
+3. 在尚未登记真实节点的本地环境中，选择 Fake A100 资源并生成 RunSpec 预览。
 4. 点击“启动模拟训练”，观察日志、Loss、学习率和 GPU 指标更新。
 5. 停止运行中的模拟任务，确认状态变为已取消且 GPU 可再次选择。
 
@@ -70,6 +70,14 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 训练任务成功持久化后，该版本的训练定义立即冻结。任务之后失败、取消或变为
 `lost` 都不解冻；需要修改项目目录、入口、固定 argv、参数定义或依赖关系时，
 应基于当前版本登记一个新版本。
+
+绑定在线 Training Worker 节点的模型版本可执行“验证配置”。中心把当前配置保存为
+不可变验证请求，Worker 在下一次心跳中领取，并只检查工程目录是否可读、训练入口是否
+存在、启动程序是否可找到、声明的运行环境是否可用、输出目录或最近父目录是否可写，
+以及输出位置的剩余磁盘空间。验证不会运行 launcher、entrypoint 或固定 argv，不创建
+目录和探测文件，也不会修改工程。验证通过后版本标为 `verified`；在首次训练任务创建前
+仍可编辑，编辑会回到 `draft` 并要求重新验证。普通只读用户只能看到验证状态和时间，
+不能看到包含路径语义的详细检查结果。
 
 启动方式是显式契约，不再根据任意 executable 猜测。`torchrun` 会由平台加入单机
 `nnodes=1`、按所选 GPU 数计算的 `nproc_per_node`、master 地址/端口和 node rank；
@@ -126,7 +134,10 @@ export VLA_TRAINING_DB_PATH=/tmp/datapilot-training.sqlite
 ## 真实训练边界
 
 本里程碑已经建立训练节点、只读 Worker 和 SSH preflight，并把真实节点资源接入模型
-注册与新建训练。Fake Server 只用于模拟模式；绑定真实节点的模型可以查看节点快照和
+注册与新建训练。没有登记节点的开发环境仍提供 Fake Server 作为模拟链路入口；一旦
+登记任意真实节点，服务器目录与“服务器资源”页面只展示 Worker 上报的真实节点，不再
+混入 Fake GPU。资源详情集中在“服务器资源”，训练节点页只负责登记、部署、修复、删除
+Worker 和查看节点状态。绑定真实节点的模型可以查看节点快照和
 填写参数，但页面不会开放模拟预览、GPU 选择或启动按钮，后端同样拒绝在真实节点上
 创建 Fake Run。真实 Runner
 仍保持关闭。在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用
@@ -145,14 +156,15 @@ repair_required / disabled`，在线状态由中心根据最近心跳计算，�
 token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换取的 bearer token
 同样只在中心保存摘要；节点停用时立即吊销。
 
-`datapilot-training-worker` 是独立进程。v1 只采集 CPU、内存、磁盘和 GPU 状态并上报
-心跳，不轮询可执行任务，也不能启动、停止、占用或检查同事的训练命令。GPU fallback
+`datapilot-training-worker` 是独立进程。v1 采集 CPU、内存、磁盘和 GPU 状态并上报
+心跳，并可在心跳响应中领取上述固定类型的模型配置只读验证；它不能领取任意命令，
+也不能启动、停止、占用或检查同事的训练进程。GPU fallback
 只使用固定 `nvidia-smi` argv、五秒超时和 `shell=False`。节点本地保存私有 identity、
 权限为 `0600` 的 Worker token，以及用于重启后保守对账的 SQLite ledger；PID 必须与
 进程启动标记和 argv digest 同时匹配，无法确认时标为 unknown，绝不发送信号。
 
-Worker HTTP 客户端只允许固定中心 origin 上的 enroll 和 heartbeat 两类 POST，拒绝
-重定向并限制超时和响应大小。部署模板位于 `deployment/systemd/`，使用独立的
+Worker HTTP 客户端只允许固定中心 origin 上的 enroll、heartbeat 和验证结果回传端点，
+拒绝重定向并限制超时和响应大小。部署模板位于 `deployment/systemd/`，使用独立的
 `datapilot-worker` 系统账号、系统级 systemd、`NoNewPrivileges` 和只读文件系统保护。
 
 ## Training Worker 一次性 SSH 部署
@@ -215,5 +227,6 @@ Python 3、安装磁盘、NVIDIA 工具及 root/sudo 能力；未安装 NVIDIA �
 恢复为“待部署 Worker”，以后可以重新一键部署；卸载失败时节点保持“需要修复”，不会
 继续被当作可用训练节点。
 
-即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。当前部署和 Worker
-都不会读取或修改模型工程、权重、checkpoint 或训练输出；真实 Runner 仍保持禁用。
+即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。除管理员主动发起的
+模型配置只读验证外，当前部署和 Worker 不读取模型工程；任何情况下都不会修改模型工程、
+权重、checkpoint 或训练输出。真实 Runner 仍保持禁用。

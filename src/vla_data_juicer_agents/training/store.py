@@ -722,6 +722,240 @@ class TrainingStore:
             )
         return self.get_node(node_ref)
 
+    def claim_model_verification(
+        self, node_ref: str, worker_instance_id: str
+    ) -> dict[str, Any] | None:
+        """Claim one bounded, read-only model verification command for a Worker."""
+        timestamp = now_iso()
+        lease_expires_at = (
+            datetime.now(UTC) + timedelta(seconds=90)
+        ).isoformat(timespec="milliseconds")
+        with self.transaction() as db:
+            node = db.execute(
+                "SELECT id,worker_instance_id,status FROM training_nodes WHERE node_ref=?",
+                (node_ref,),
+            ).fetchone()
+            if (
+                node is None
+                or node["worker_instance_id"] != worker_instance_id
+                or node["status"] not in {
+                    TrainingNodeStatus.ONLINE.value,
+                    TrainingNodeStatus.DEGRADED.value,
+                }
+            ):
+                return None
+            db.execute(
+                """UPDATE model_verification_requests
+                SET status='queued',worker_instance_id=NULL,lease_expires_at=NULL,
+                    started_at=NULL,updated_at=?
+                WHERE node_id=? AND status='running' AND lease_expires_at<?""",
+                (timestamp, node["id"], timestamp),
+            )
+            command = db.execute(
+                """SELECT id,verification_ref,request_json
+                FROM model_verification_requests
+                WHERE node_id=? AND status='queued' ORDER BY id LIMIT 1""",
+                (node["id"],),
+            ).fetchone()
+            if command is None:
+                return None
+            changed = db.execute(
+                """UPDATE model_verification_requests
+                SET status='running',worker_instance_id=?,lease_expires_at=?,
+                    started_at=?,updated_at=?
+                WHERE id=? AND status='queued'""",
+                (
+                    worker_instance_id,
+                    lease_expires_at,
+                    timestamp,
+                    timestamp,
+                    command["id"],
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+            return {
+                "command_ref": command["verification_ref"],
+                "kind": "verify_model_configuration",
+                "payload": json.loads(command["request_json"]),
+            }
+
+    def request_model_verification(
+        self, model_ref: str, expected_revision: int, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        verification_ref = new_ref("verify")
+        with self.transaction() as db:
+            model = db.execute(
+                "SELECT * FROM registered_models WHERE model_ref=?", (model_ref,)
+            ).fetchone()
+            if model is None:
+                raise TrainingNotFoundError(
+                    "model_not_found", "Training model was not found."
+                )
+            if int(model["current_revision"]) != expected_revision:
+                raise TrainingConflictError(
+                    "model_configuration_edit_conflict",
+                    "The model configuration was edited by another request.",
+                    current={"edit_revision": model["current_revision"]},
+                )
+            if model["status"] == "disabled":
+                raise TrainingConflictError(
+                    "model_version_disabled",
+                    "Disabled model versions cannot be verified.",
+                )
+            existing = db.execute(
+                """SELECT verification_ref FROM model_verification_requests
+                WHERE model_id=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1""",
+                (model["id"],),
+            ).fetchone()
+            if existing is not None:
+                raise TrainingConflictError(
+                    "model_verification_in_progress",
+                    "A verification request is already in progress for this model version.",
+                    current={"verification_ref": existing["verification_ref"]},
+                )
+            revision = db.execute(
+                """SELECT * FROM model_revisions
+                WHERE model_id=? AND revision_number=?""",
+                (model["id"], expected_revision),
+            ).fetchone()
+            template = json.loads(revision["launch_template_json"])
+            node = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?",
+                (template["server_ref"],),
+            ).fetchone()
+            if node is None:
+                raise TrainingConflictError(
+                    "model_verification_requires_training_node",
+                    "Model verification requires a registered Training Worker node.",
+                )
+            if self._effective_node_status(node, offline_after_seconds=45.0) != TrainingNodeStatus.ONLINE.value:
+                raise TrainingConflictError(
+                    "model_verification_node_unavailable",
+                    "The selected Training Worker node must be online before verification.",
+                )
+            request = {
+                "model_ref": model_ref,
+                "working_directory": template["working_directory"],
+                "executable": template["executable"],
+                "entrypoint": template["entrypoint"],
+                "output_root": template["output_root"],
+                "runtime_environment": template.get(
+                    "runtime_environment", {"kind": "system"}
+                ),
+            }
+            db.execute(
+                """INSERT INTO model_verification_requests(
+                verification_ref,model_id,model_revision_id,node_id,status,
+                request_json,created_at,updated_at)
+                VALUES(?,?,?,?,'queued',?,?,?)""",
+                (
+                    verification_ref,
+                    model["id"],
+                    revision["id"],
+                    node["id"],
+                    canonical_json(request),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._audit(
+                db,
+                actor,
+                "model.verification_requested",
+                model_ref,
+                {"verification_ref": verification_ref, "node_ref": node["node_ref"]},
+                timestamp,
+            )
+        return self.get_model(model_ref, include_private=True)
+
+    def finish_model_verification(
+        self,
+        node_ref: str,
+        worker_token: str,
+        command_ref: str,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        digest = self._token_digest(worker_token)
+        with self.transaction() as db:
+            node = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+            if (
+                node is None
+                or node["worker_token_sha256"] is None
+                or not secrets.compare_digest(str(node["worker_token_sha256"]), digest)
+                or node["worker_instance_id"] != data["worker_instance_id"]
+            ):
+                raise TrainingForbiddenError(
+                    "worker_authentication_failed",
+                    "The Training Worker credential is invalid.",
+                )
+            command = db.execute(
+                """SELECT verification.*,model.current_revision,model.status AS model_status
+                FROM model_verification_requests AS verification
+                JOIN registered_models AS model ON model.id=verification.model_id
+                WHERE verification.verification_ref=? AND verification.node_id=?""",
+                (command_ref, node["id"]),
+            ).fetchone()
+            if command is None:
+                raise TrainingNotFoundError(
+                    "model_verification_not_found",
+                    "Model verification command was not found.",
+                )
+            if command["status"] != "running" or command["worker_instance_id"] != data["worker_instance_id"]:
+                raise TrainingConflictError(
+                    "model_verification_not_claimed",
+                    "The model verification command is not claimed by this Worker.",
+                )
+            final_status = data["status"]
+            result = {"checks": data["checks"]}
+            db.execute(
+                """UPDATE model_verification_requests SET
+                status=?,result_json=?,lease_expires_at=NULL,finished_at=?,updated_at=?
+                WHERE id=?""",
+                (
+                    final_status,
+                    canonical_json(result),
+                    timestamp,
+                    timestamp,
+                    command["id"],
+                ),
+            )
+            current_revision_id = db.execute(
+                """SELECT id FROM model_revisions
+                WHERE model_id=? AND revision_number=?""",
+                (command["model_id"], command["current_revision"]),
+            ).fetchone()
+            configuration_is_current = (
+                current_revision_id is not None
+                and int(current_revision_id["id"]) == int(command["model_revision_id"])
+            )
+            if configuration_is_current and command["model_status"] != "disabled":
+                db.execute(
+                    "UPDATE registered_models SET status=?,updated_at=? WHERE id=?",
+                    (
+                        "verified" if final_status == "succeeded" else "draft",
+                        timestamp,
+                        command["model_id"],
+                    ),
+                )
+            self._audit(
+                db,
+                f"worker:{data['worker_instance_id']}",
+                f"model.verification_{final_status}",
+                command_ref,
+                {"check_count": len(data["checks"])},
+                timestamp,
+            )
+        return {
+            "command_ref": command_ref,
+            "status": final_status,
+            "accepted_at": timestamp,
+        }
+
     def get_node_resources(self, node_ref: str) -> dict[str, Any]:
         node = self.get_node(node_ref)
         with self.connection() as db:
@@ -856,8 +1090,8 @@ class TrainingStore:
             row = db.execute("SELECT * FROM registered_models WHERE model_ref=?", (model_ref,)).fetchone()
             if row is None:
                 raise TrainingNotFoundError("model_not_found", "Training model was not found.")
-            if row["status"] != "draft":
-                raise TrainingConflictError("model_not_editable", "Only draft models can be edited.")
+            if row["status"] == "disabled":
+                raise TrainingConflictError("model_not_editable", "Disabled models cannot be edited.")
             if row["configuration_locked_at"] is not None:
                 raise TrainingConflictError(
                     "model_version_configuration_locked",
@@ -869,7 +1103,7 @@ class TrainingStore:
             revision_ref = new_ref("mrev")
             db.execute(
                 """UPDATE registered_models SET description=?,version_description=?,
-                current_revision=?,updated_at=? WHERE id=?""",
+                status='draft',current_revision=?,updated_at=? WHERE id=?""",
                 (
                     data.get("version_description") or "",
                     data.get("version_description"),
@@ -932,15 +1166,29 @@ class TrainingStore:
 
     _MODEL_SELECT = """SELECT model.*,family.family_ref,family.name AS family_name,
       source.model_ref AS based_on_model_ref,
-      EXISTS(SELECT 1 FROM training_runs AS run WHERE run.model_id=model.id) AS has_runs
+      EXISTS(SELECT 1 FROM training_runs AS run WHERE run.model_id=model.id) AS has_runs,
+      verification.verification_ref AS verification_ref,
+      verification.status AS verification_status,
+      verification.result_json AS verification_result_json,
+      verification.created_at AS verification_created_at,
+      verification.finished_at AS verification_finished_at
       FROM registered_models AS model
       JOIN model_families AS family ON family.id=model.family_id
-      LEFT JOIN registered_models AS source ON source.id=model.based_on_model_id"""
+      LEFT JOIN registered_models AS source ON source.id=model.based_on_model_id
+      LEFT JOIN model_verification_requests AS verification ON verification.id=(
+        SELECT latest_verification.id
+        FROM model_verification_requests AS latest_verification
+        JOIN model_revisions AS latest_revision
+          ON latest_revision.id=latest_verification.model_revision_id
+        WHERE latest_verification.model_id=model.id
+          AND latest_revision.revision_number=model.current_revision
+        ORDER BY latest_verification.id DESC LIMIT 1
+      )"""
 
     @staticmethod
     def _safe_model(row: sqlite3.Row) -> dict[str, Any]:
         has_runs = bool(row["has_runs"])
-        return {
+        result = {
             "model_ref": row["model_ref"],
             "family_ref": row["family_ref"],
             "family_name": row["family_name"],
@@ -951,13 +1199,24 @@ class TrainingStore:
             "edit_revision": int(row["current_revision"]),
             "has_runs": has_runs,
             "configuration_editable": (
-                row["status"] == "draft"
+                row["status"] != "disabled"
                 and row["configuration_locked_at"] is None
                 and not has_runs
             ),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        if row["verification_ref"] is not None:
+            verification: dict[str, Any] = {
+                "verification_ref": row["verification_ref"],
+                "status": row["verification_status"],
+                "requested_at": row["verification_created_at"],
+                "finished_at": row["verification_finished_at"],
+            }
+            if row["verification_result_json"] is not None:
+                verification.update(json.loads(row["verification_result_json"]))
+            result["verification"] = verification
+        return result
 
     def find_available_port(self, server_ref: str, start: int = 29500, end: int = 29600, db: sqlite3.Connection | None = None) -> int:
         def find(connection: sqlite3.Connection) -> int:

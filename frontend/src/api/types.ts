@@ -406,6 +406,18 @@ export interface TrainingModel {
   created_at: string;
   updated_at: string;
   configuration?: TrainingModelConfiguration;
+  verification?: {
+    verification_ref: string;
+    status: "queued" | "running" | "succeeded" | "failed";
+    requested_at: string;
+    finished_at?: string | null;
+    checks?: Array<{
+      code: string;
+      label: string;
+      status: "passed" | "warning" | "failed";
+      detail: string;
+    }>;
+  };
 }
 
 export interface TrainingGpuResource {
@@ -435,6 +447,9 @@ export interface TrainingServerResources {
   server: TrainingServer;
   sampled_at: string | null;
   stale?: boolean;
+  cpu?: { logical_cores: number; load_1m?: number | null } | null;
+  memory?: { total_bytes: number; available_bytes: number } | null;
+  disks?: Array<{ mount: string; total_bytes: number; available_bytes: number }>;
   gpus: TrainingGpuResource[];
 }
 

@@ -329,6 +329,11 @@ export async function updateTrainingModel(modelRef: string, payload: { expected_
   return data.model;
 }
 
+export async function verifyTrainingModel(modelRef: string, expectedRevision: number): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}/verify`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) });
+  return data.model;
+}
+
 type TrainingRunRequest = { model_ref: string; server_ref: string; gpu_uuids: string[]; parameters: Record<string, string | number | boolean>; execution_mode: "simulation" };
 
 export async function previewTrainingRun(payload: TrainingRunRequest): Promise<TrainingRunPreview> {

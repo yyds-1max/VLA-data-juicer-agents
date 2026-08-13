@@ -221,7 +221,7 @@ def test_v3_migration_preserves_models_revisions_and_runs_and_locks_used_model(
     assert revisions == [(first_id, 1), (first_id, 2), (second_id, 1)]
     assert run[0:3] == ("run_legacy", first_id, revision_ids[0])
     assert json.loads(run[3])["model_revision"] == 1
-    assert ledger[-1] == (4, "model_families_m4")
+    assert ledger[-1] == (5, "model_worker_verification_m5")
 
 
 @pytest.mark.parametrize("version_description", [None, "", "x" * 500])
