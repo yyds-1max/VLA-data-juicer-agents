@@ -157,6 +157,34 @@ def test_root_ssh_identity_is_allowed_with_an_explicit_warning() -> None:
     assert "root 身份" in identity["detail"]
 
 
+def test_preflight_reports_runtime_identity_probe_failure_with_stable_code() -> None:
+    class FailingIdentityBackend(_DeploymentBackend):
+        def inspect_runtime_identity(self) -> RuntimeIdentity:
+            raise ValueError("remote argv rejected")
+
+    @contextmanager
+    def factory(**_kwargs: object):
+        yield FailingIdentityBackend()
+
+    manager = AutomatedNodeDeploymentManager(
+        center_base_url="https://center.example.internal",
+        backend_factory=factory,
+        preflight_service=_PassingPreflightService(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TrainingValidationError) as captured:
+        manager.preflight_worker(
+            node=_node(),
+            confirmed_host_key=_host_key(),
+            ssh_password="one-use-password",
+            sudo_password_mode="same_as_ssh",
+            sudo_password=None,
+        )
+
+    assert captured.value.code == "training_node_runtime_identity_failed"
+    assert "运行身份" in captured.value.message
+
+
 def test_deployment_manager_scopes_backend_to_one_context() -> None:
     lifecycle: list[str] = []
     seen: dict[str, object] = {}

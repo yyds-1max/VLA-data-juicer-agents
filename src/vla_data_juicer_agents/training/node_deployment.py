@@ -123,11 +123,23 @@ class AutomatedNodeDeploymentManager:
                 host_key=pin,
                 ssh_password=ssh_password,
             ) as backend:
-                runtime_identity = backend.inspect_runtime_identity()
-                privilege = backend.inspect_privilege(
-                    sudo_password_mode=SudoPasswordMode(sudo_password_mode),
-                    sudo_password=sudo_password,
-                )
+                try:
+                    runtime_identity = backend.inspect_runtime_identity()
+                except (TrainingNodeDeploymentError, RuntimeError, ValueError) as exc:
+                    raise TrainingValidationError(
+                        "training_node_runtime_identity_failed",
+                        "无法确认 SSH 登录账号对应的运行身份。",
+                    ) from exc
+                try:
+                    privilege = backend.inspect_privilege(
+                        sudo_password_mode=SudoPasswordMode(sudo_password_mode),
+                        sudo_password=sudo_password,
+                    )
+                except (TrainingNodeDeploymentError, RuntimeError, ValueError) as exc:
+                    raise TrainingValidationError(
+                        "training_node_privilege_probe_failed",
+                        "无法确认该 SSH 登录账号的安装权限。",
+                    ) from exc
         except SshTransportError as exc:
             raise TrainingValidationError(
                 "training_node_ssh_authentication_failed",
@@ -138,10 +150,12 @@ class AutomatedNodeDeploymentManager:
                 "training_node_preflight_failed",
                 "Training node preflight could not be completed.",
             ) from exc
+        except TrainingValidationError:
+            raise
         except (TrainingNodeDeploymentError, RuntimeError, ValueError) as exc:
             raise TrainingValidationError(
                 "training_node_preflight_failed",
-                "Training node identity or privilege could not be verified.",
+                "无法完成训练节点部署条件检查。",
             ) from exc
         checks = _product_preflight_checks(report, privilege, runtime_identity)
         return {

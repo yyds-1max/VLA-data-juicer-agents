@@ -65,6 +65,24 @@ class _FakeFixedSshSession:
         return RemoteExecution(0, b'{"changed":true,"value":null}\n')
 
 
+def test_runtime_identity_probe_uses_transport_safe_single_line_argv() -> None:
+    assert _RUNTIME_IDENTITY_ARGV[:2] == ("/usr/bin/python3", "-c")
+    assert len(_RUNTIME_IDENTITY_ARGV) == 4
+    assert all(
+        "\n" not in value and "\r" not in value
+        for value in _RUNTIME_IDENTITY_ARGV
+    )
+    completed = subprocess.run(
+        _RUNTIME_IDENTITY_ARGV,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    identity = json.loads(completed.stdout)
+    assert identity["username"]
+    assert identity["uid"] >= 0
+
+
 def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets() -> None:
     session = _FakeFixedSshSession()
     backend = OpenSshWorkerDeploymentBackend(

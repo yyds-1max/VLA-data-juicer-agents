@@ -95,6 +95,8 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
     const sshPasswordInput = screen.getByLabelText("SSH 登录密码");
     expect(sshPasswordInput).toHaveAttribute("type", "password");
+    expect(sshPasswordInput).toHaveClass("training-password-input");
+    expect(screen.getAllByRole("button", { name: "显示 SSH 登录密码" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "显示 SSH 登录密码" }));
     expect(sshPasswordInput).toHaveAttribute("type", "text");
     fireEvent.click(document.body);
@@ -105,12 +107,10 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
     expect(screen.queryByLabelText("Worker 部署提权方式")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
-    expect(await screen.findByText("部署条件已满足")).toBeVisible();
-    expect(screen.getByText("将以 SSH 登录账号 trainer 运行 Worker 和训练任务。")).toBeVisible();
-    expect(screen.getByText("已验证 sudo 权限。")).toBeVisible();
+    expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeEnabled();
+    expect(screen.getByText(/系统会先只读确认 SSH 登录/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
+    await waitFor(() => expect(trainingApi.preflightTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ ssh_username: "trainer", ssh_password: "one-time-password" })));
     await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, ssh_username: "trainer", confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
     expect(await screen.findByText("Worker 已自动部署并完成注册，正在等待稳定心跳。")).toBeVisible();
     expect(screen.queryByLabelText("SSH 登录密码")).not.toBeInTheDocument();
@@ -285,10 +285,10 @@ describe("TrainingPlatform", () => {
     expect(screen.getByLabelText("SSH 登录用户名")).toBeDisabled();
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-update-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
-    expect(await screen.findByText("部署条件已满足")).toBeVisible();
+    expect(screen.getByText(/点击“确认更新 Worker”后，系统会先只读确认 SSH 登录/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "确认更新 Worker" }));
 
+    await waitFor(() => expect(trainingApi.preflightTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ ssh_password: "one-time-update-password" })));
     await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({
       expected_revision: 7,
       ssh_username: "trainer",
@@ -321,6 +321,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.preflightTrainingNodeWorker)
       .mockResolvedValueOnce({ ready: false, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "failed", detail: "部署账号权限不足" }] })
       .mockResolvedValueOnce({ ready: true, checked_at: "2026-08-13T08:01:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "passed", detail: "独立 sudo 密码有效。" }] });
+    vi.mocked(trainingApi.deployTrainingNodeWorker).mockResolvedValue({ node: { ...pendingNode, state_revision: 2, deployment_status: "succeeded", installed_worker_version: "0.1.0" }, deployment: { status: "succeeded", worker_version: "0.1.0", message: "Worker deployed." } });
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
     fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
@@ -328,19 +329,20 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
 
     expect(await screen.findByText("存在阻止部署的问题")).toBeVisible();
     expect(screen.getAllByText(/部署账号权限不足/).length).toBeGreaterThan(0);
-    expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeDisabled();
+    expect(screen.getByText("部分条件未满足，请根据检查结果调整后重试。")).toBeVisible();
+    expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeEnabled();
     expect(trainingApi.deployTrainingNodeWorker).not.toHaveBeenCalled();
     expect(screen.queryByText(/手工创建账号/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "sudo 密码与登录密码不同？" }));
     fireEvent.change(screen.getByLabelText("独立 sudo 密码"), { target: { value: "separate-sudo-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
     await waitFor(() => expect(trainingApi.preflightTrainingNodeWorker).toHaveBeenLastCalledWith("node-test", expect.objectContaining({ sudo_password_mode: "separate", sudo_password: "separate-sudo-password" })));
-    expect(await screen.findByText("部署条件已满足")).toBeVisible();
+    await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledTimes(1));
   });
 
   it("surfaces a registered dataset parameter separately from hyperparameters", async () => {

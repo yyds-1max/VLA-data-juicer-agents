@@ -565,3 +565,13 @@ textarea {
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
 }
+
+/* Keep a single product-owned reveal control across password managers/browsers. */
+.training-password-input::-ms-reveal,
+.training-password-input::-ms-clear,
+.training-password-input::-webkit-credentials-auto-fill-button,
+.training-password-input::-webkit-contacts-auto-fill-button {
+  display: none !important;
+  visibility: hidden;
+  pointer-events: none;
+}

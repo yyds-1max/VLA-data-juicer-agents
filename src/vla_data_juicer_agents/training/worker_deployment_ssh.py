@@ -72,6 +72,13 @@ class _Operation(StrEnum):
     REMOVE_LEGACY_ACCOUNT = "remove_legacy_account"
 
 
+_REMOTE_SOURCE_LOADER = "import base64;exec(base64.b64decode(__import__('sys').argv.pop(1)))"
+
+
+def _encoded_remote_source(source: str) -> str:
+    return base64.b64encode(source.encode("utf-8")).decode("ascii")
+
+
 _RUNTIME_IDENTITY_SOURCE = r'''import grp
 import json
 import os
@@ -107,7 +114,12 @@ print(json.dumps({
 }, separators=(",", ":")))
 '''
 
-_RUNTIME_IDENTITY_ARGV = ("/usr/bin/python3", "-c", _RUNTIME_IDENTITY_SOURCE)
+_RUNTIME_IDENTITY_ARGV = (
+    "/usr/bin/python3",
+    "-c",
+    _REMOTE_SOURCE_LOADER,
+    _encoded_remote_source(_RUNTIME_IDENTITY_SOURCE),
+)
 
 
 _REMOTE_INSTALLER = r'''import grp
@@ -408,13 +420,6 @@ finally:
         password[index] = 0
     shutil.rmtree(temporary, ignore_errors=True)
 '''
-
-
-_REMOTE_SOURCE_LOADER = "import base64;exec(base64.b64decode(__import__('sys').argv.pop(1)))"
-
-
-def _encoded_remote_source(source: str) -> str:
-    return base64.b64encode(source.encode("utf-8")).decode("ascii")
 
 
 @dataclass(slots=True)

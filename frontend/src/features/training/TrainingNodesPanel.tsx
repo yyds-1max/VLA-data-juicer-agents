@@ -68,6 +68,9 @@ function errorText(error: unknown) {
     if (code === "training_node_deployment_account_insufficient") return "部署账号权限不足。请改用具有 root 或 sudo 权限的 SSH 账号重新部署。";
     if (code === "training_node_ssh_authentication_failed") return "SSH 登录失败，请检查部署账号和密码。";
     if (code === "training_node_host_key_mismatch") return "服务器主机指纹已经变化，已停止部署。请先向节点管理员确认。";
+    if (code === "training_node_runtime_identity_failed") return "无法确认 SSH 登录账号对应的运行身份，请重新检查 SSH 登录信息。";
+    if (code === "training_node_privilege_probe_failed") return "无法确认该 SSH 登录账号的安装权限，请检查 root 或 sudo 权限。";
+    if (code === "training_node_preflight_failed") return "无法完成 Worker 条件检查，请稍后重试。";
     const message = detail && typeof detail === "object" && "message" in detail ? (detail as { message?: unknown }).message : null;
     if (typeof message === "string") return message;
   }
@@ -105,8 +108,8 @@ function PasswordField({
   return <div className="text-sm text-console-muted">
     <label htmlFor={id}>{label}</label>
     <div className="relative">
-      <input id={id} aria-label={label} className={`${inputClass} pr-10`} type={visible ? "text" : "password"} autoComplete={autoComplete} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
-      <button type="button" className="absolute inset-y-1 right-1 mt-1 flex w-8 items-center justify-center rounded text-console-muted hover:bg-slate-100 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan disabled:cursor-not-allowed disabled:opacity-50" aria-label={`${visible ? "隐藏" : "显示"} ${label}`} aria-pressed={visible} disabled={disabled} onClick={onToggle}>
+      <input id={id} aria-label={label} className={`${inputClass} training-password-input pr-14`} type={visible ? "text" : "password"} autoComplete={autoComplete} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+      <button type="button" className="absolute inset-y-1 right-px mt-1 flex w-14 items-center justify-end rounded-r-md bg-console-panel pr-3 text-console-muted hover:bg-slate-100 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan disabled:cursor-not-allowed disabled:opacity-50" aria-label={`${visible ? "隐藏" : "显示"} ${label}`} aria-pressed={visible} disabled={disabled} onClick={onToggle}>
         {visible ? <EyeOff className="h-4 w-4" aria-hidden="true" /> : <Eye className="h-4 w-4" aria-hidden="true" />}
       </button>
     </div>
@@ -167,6 +170,13 @@ export function TrainingNodesPanel({
   const hasInstalledWorker = nodeHasInstalledWorker(selected);
   const showRegistrationForm = nodes.length === 0 || registrationOpen;
   const privilegeCheck = preflight?.checks.find((check) => check.code === "deployment_privilege");
+  const deploymentConfirmationLabel = deploymentMode === "update"
+    ? "确认更新 Worker"
+    : deploymentMode === "repair"
+      ? "确认修复 Worker"
+      : deploymentMode === "change_account"
+        ? "确认更换账号"
+        : "自动部署 Worker";
 
   const openDeploymentFor = async (node: TrainingNode, mode: "deploy" | "repair" | "update" | "change_account") => {
     setBusy(true); setMessage(null); setSelectedRef(node.node_ref); setDeployingRef(node.node_ref); setDeploymentMode(mode); setSshUsername(node.ssh_username ?? ""); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSshPasswordVisible(false); setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); setMoreActionsOpen(false);
@@ -186,11 +196,11 @@ export function TrainingNodesPanel({
     } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
   };
 
-  const checkPreflight = async () => {
+  const confirmDeployment = async () => {
     if (!selected || !sshUsername.trim() || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
     setBusy(true); setMessage(null); setPreflight(null);
     try {
-      setPreflight(await preflightTrainingNodeWorker(selected.node_ref, {
+      const checked = await preflightTrainingNodeWorker(selected.node_ref, {
         expected_revision: selected.state_revision,
         ssh_username: sshUsername.trim(),
         confirmed_host_key: hostKey,
@@ -198,14 +208,12 @@ export function TrainingNodesPanel({
         ssh_password: sshPassword,
         sudo_password_mode: sudoPasswordMode,
         ...(sudoPasswordMode === "separate" ? { sudo_password: sudoPassword } : {}),
-      }));
-    } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
-  };
-
-  const deploy = async () => {
-    if (!selected || !sshUsername.trim() || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
-    setBusy(true); setMessage(null);
-    try {
+      });
+      setPreflight(checked);
+      if (!checked.ready) {
+        setMessage("部分条件未满足，请根据检查结果调整后重试。");
+        return;
+      }
       const result = await deployTrainingNodeWorker(selected.node_ref, {
         expected_revision: selected.state_revision,
         ssh_username: sshUsername.trim(),
@@ -378,10 +386,10 @@ export function TrainingNodesPanel({
                 <label className="block text-sm text-console-muted">SSH 登录用户名<input aria-label="SSH 登录用户名" className={inputClass} autoComplete="username" value={sshUsername} disabled={busy || ((deploymentMode === "repair" || deploymentMode === "update") && Boolean(selected.ssh_username))} onChange={(event) => { setSshUsername(event.target.value); setPreflight(null); }} /><span className="mt-1 block text-xs leading-5">{deploymentMode === "repair" ? "修复会继续使用当前运行账号，不会更换账号。" : deploymentMode === "update" ? "更新会继续使用当前运行账号，并部署中心服务提供的 Worker 版本。" : "部署成功后，Worker 和之后的训练任务都使用该账号运行。"}</span></label>
                 <PasswordField id="training-node-ssh-password" label="SSH 登录密码" value={sshPassword} visible={sshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={(value) => { setSshPassword(value); setPreflight(null); }} onToggle={() => setSshPasswordVisible((current) => !current)} />
                 {sudoPasswordMode === "separate" ? <div className="space-y-2"><PasswordField id="training-node-sudo-password" label="独立 sudo 密码" value={sudoPassword} visible={sudoPasswordVisible} disabled={busy} autoComplete="off" onChange={(value) => { setSudoPassword(value); setPreflight(null); }} onToggle={() => setSudoPasswordVisible((current) => !current)} /><button type="button" className="text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => { setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setPreflight(null); }}>改用 SSH 登录密码检查权限</button></div> : <button type="button" className="text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => { setSudoPasswordMode("separate"); setPreflight(null); }}>sudo 密码与登录密码不同？</button>}
-                <p className="text-xs leading-5 text-sky-800">系统会自动检查该账号是否为 root、是否具有免密 sudo，或登录密码能否用于 sudo。无需提前判断提权方式。检查过程不会修改训练节点，密码也不会保存。</p>
+                <p className="text-xs leading-5 text-sky-800">点击“{deploymentConfirmationLabel}”后，系统会先只读确认 SSH 登录、Linux、Python、systemd 和 root/sudo 安装权限；检查通过后自动继续。密码仅用于本次操作，不会保存。</p>
                 {privilegeCheck?.status === "failed" ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">部署账号权限不足。若该账号使用独立 sudo 密码，请填写后重新检查；否则请更换具有安装权限的 SSH 账号。</p> : null}
                 {preflight ? <section aria-label="Worker 部署条件检查" className={`rounded-md border p-3 ${preflight.ready ? "border-emerald-200 bg-emerald-50" : "border-red-200 bg-red-50"}`}><div className="flex items-center justify-between gap-2"><p className="text-sm font-medium text-console-text">{preflight.ready ? "部署条件已满足" : "存在阻止部署的问题"}</p><span className="text-xs text-console-muted">{formatTime(preflight.checked_at)}</span></div><ul className="mt-2 grid gap-2 sm:grid-cols-2">{preflight.checks.map((check) => <li key={check.code} className="rounded bg-white/80 p-2 text-xs"><div className="flex items-center gap-2"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${check.status === "passed" ? "bg-emerald-500" : check.status === "warning" ? "bg-amber-500" : "bg-red-500"}`} /><span className="font-medium text-console-text">{check.label}</span></div><p className="mt-1 leading-5 text-console-muted">{check.detail}</p></li>)}</ul></section> : null}
-                <div className="flex flex-wrap gap-2"><ConsoleButton disabled={busy || !sshUsername.trim() || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void checkPreflight()}>检查部署条件</ConsoleButton><ConsoleButton variant="primary" disabled={busy || !preflight?.ready} onClick={() => void deploy()}>{deploymentMode === "update" ? "确认更新 Worker" : "自动部署 Worker"}</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); }}>取消</ConsoleButton></div>
+                <div className="flex flex-wrap gap-2"><ConsoleButton variant="primary" disabled={busy || !sshUsername.trim() || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void confirmDeployment()}>{deploymentConfirmationLabel}</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); }}>取消</ConsoleButton></div>
               </div> : null}
               {message ? <p role="status" className="mt-3 text-sm text-console-muted">{message}</p> : null}
               <details className="mt-4 border-t border-console-line pt-4 text-xs text-console-muted">
