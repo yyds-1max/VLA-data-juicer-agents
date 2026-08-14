@@ -54,7 +54,6 @@ def _node_payload() -> dict[str, object]:
         "description": "Metadata only; SSH credentials are never persisted.",
         "address": "192.0.2.10",
         "ssh_port": 2222,
-        "ssh_username": "trainer",
     }
 
 
@@ -111,6 +110,7 @@ class _FakeDeploymentManager:
         self.seen_ssh_password: str | None = None
         self.seen_sudo_password: str | None = None
         self.seen_enrollment_token: str | None = None
+        self.seen_ssh_username: str | None = None
         self.removed = False
         self.preflight_calls = 0
 
@@ -123,6 +123,7 @@ class _FakeDeploymentManager:
         }
 
     def deploy_worker(self, **kwargs: object) -> dict[str, str]:
+        self.seen_ssh_username = str(kwargs["node"]["ssh_username"])  # type: ignore[index]
         self.seen_ssh_password = str(kwargs["ssh_password"])
         self.seen_sudo_password = str(kwargs["sudo_password"])
         self.seen_enrollment_token = str(kwargs["enrollment_token"])
@@ -135,6 +136,7 @@ class _FakeDeploymentManager:
 
     def preflight_worker(self, **kwargs: object) -> dict[str, object]:
         self.preflight_calls += 1
+        self.seen_ssh_username = str(kwargs["node"]["ssh_username"])  # type: ignore[index]
         self.seen_ssh_password = str(kwargs["ssh_password"])
         return {
             "ready": not self.insufficient,
@@ -150,6 +152,7 @@ class _FakeDeploymentManager:
         }
 
     def remove_worker(self, **kwargs: object) -> dict[str, str]:
+        self.seen_ssh_username = str(kwargs["node"]["ssh_username"])  # type: ignore[index]
         self.seen_ssh_password = str(kwargs["ssh_password"])
         self.seen_sudo_password = str(kwargs["sudo_password"])
         self.removed = True
@@ -311,6 +314,20 @@ def test_default_principal_reads_redacted_node_but_cannot_create(
     assert denied.json()["detail"]["code"] == "training_write_forbidden"
 
 
+def test_node_registration_does_not_accept_or_persist_an_ssh_account(
+    service: TrainingService,
+) -> None:
+    client = _client(service, admin=True)
+    node = _create_node(client)
+    assert node["ssh_username"] is None
+
+    coupled = client.post(
+        "/api/training/nodes",
+        json={**_node_payload(), "ssh_username": "trainer"},
+    )
+    assert coupled.status_code == 422
+
+
 def test_one_click_deployment_uses_ephemeral_credentials_and_persists_only_host_pin(
     store: TrainingStore,
 ) -> None:
@@ -327,6 +344,7 @@ def test_one_click_deployment_uses_ephemeral_credentials_and_persists_only_host_
         f"/api/training/nodes/{node['node_ref']}/deploy-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
             "confirmed_host_key": host_key,
             "host_key_confirmed": True,
             "ssh_password": "ephemeral-ssh-password",
@@ -338,8 +356,10 @@ def test_one_click_deployment_uses_ephemeral_credentials_and_persists_only_host_
     result = response.json()
     assert result["node"]["deployment_status"] == "succeeded"
     assert result["node"]["installed_worker_version"] == "0.1.0"
+    assert result["node"]["ssh_username"] == "trainer"
     assert result["node"]["host_key_fingerprint"] == host_key["sha256_fingerprint"]
     assert manager.seen_ssh_password == "ephemeral-ssh-password"
+    assert manager.seen_ssh_username == "trainer"
     assert manager.seen_sudo_password == "None"
     assert manager.seen_enrollment_token is not None
     with store.connection() as db:
@@ -365,6 +385,7 @@ def test_worker_preflight_is_read_only_and_never_persists_credentials(
         f"/api/training/nodes/{node['node_ref']}/preflight-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "preflight-user",
             "confirmed_host_key": host_key,
             "host_key_confirmed": True,
             "ssh_password": "preflight-only-secret",
@@ -376,9 +397,11 @@ def test_worker_preflight_is_read_only_and_never_persists_credentials(
     assert response.headers["cache-control"] == "no-store"
     assert response.json()["ready"] is True
     assert manager.preflight_calls == 1
+    assert manager.seen_ssh_username == "preflight-user"
     unchanged = client.get(f"/api/training/nodes/{node['node_ref']}").json()["node"]
     assert unchanged["state_revision"] == node["state_revision"]
     assert unchanged["deployment_status"] == "not_started"
+    assert unchanged["ssh_username"] is None
     with store.connection() as db:
         database_dump = "\n".join(db.iterdump())
     assert "preflight-only-secret" not in database_dump
@@ -395,6 +418,7 @@ def test_worker_removal_revokes_access_and_returns_node_to_pending(
         f"/api/training/nodes/{node['node_ref']}/deploy-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
             "confirmed_host_key": host_key,
             "host_key_confirmed": True,
             "ssh_password": "deployment-secret",
@@ -406,6 +430,7 @@ def test_worker_removal_revokes_access_and_returns_node_to_pending(
         f"/api/training/nodes/{node['node_ref']}/remove-worker",
         json={
             "expected_revision": deployed["state_revision"],
+            "ssh_username": "replacement-operator",
             "ssh_password": "removal-secret",
             "sudo_password_mode": "same_as_ssh",
         },
@@ -416,6 +441,8 @@ def test_worker_removal_revokes_access_and_returns_node_to_pending(
     removed = response.json()["node"]
     assert manager.removed is True
     assert manager.seen_ssh_password == "removal-secret"
+    assert manager.seen_ssh_username == "replacement-operator"
+    assert removed["ssh_username"] == "trainer"
     assert removed["status"] == "pending_enrollment"
     assert removed["deployment_status"] == "not_started"
     assert removed["installed_worker_version"] is None
@@ -432,6 +459,13 @@ def test_worker_removal_revokes_access_and_returns_node_to_pending(
         ).fetchone()[0]
     assert worker_digest is None
     assert "removal-secret" not in database_dump
+
+    deleted = client.delete(
+        f"/api/training/nodes/{node['node_ref']}",
+        params={"expected_revision": removed["state_revision"]},
+    )
+    assert deleted.status_code == 204
+    assert client.get(f"/api/training/nodes/{node['node_ref']}").status_code == 404
 
 
 def test_heartbeat_does_not_change_management_revision(
@@ -484,6 +518,7 @@ def test_deployment_account_without_root_or_sudo_returns_explicit_error(
         f"/api/training/nodes/{node['node_ref']}/deploy-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "insufficient-user",
             "confirmed_host_key": host_key,
             "host_key_confirmed": True,
             "ssh_password": "ephemeral-ssh-password",
@@ -498,6 +533,7 @@ def test_deployment_account_without_root_or_sudo_returns_explicit_error(
     }
     failed = client.get(f"/api/training/nodes/{node['node_ref']}").json()["node"]
     assert failed["deployment_status"] == "failed"
+    assert failed["ssh_username"] is None
     with store.connection() as db:
         active_tokens = db.execute(
             "SELECT COUNT(*) FROM training_node_enrollment_tokens WHERE consumed_at IS NULL"
@@ -521,6 +557,7 @@ def test_readonly_principal_cannot_discover_deploy_or_remove_node_worker(
         f"/api/training/nodes/{node['node_ref']}/deploy-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
             "confirmed_host_key": manager.discover_host_key(node),
             "host_key_confirmed": True,
             "ssh_password": "must-not-be-used",
@@ -533,6 +570,7 @@ def test_readonly_principal_cannot_discover_deploy_or_remove_node_worker(
         f"/api/training/nodes/{node['node_ref']}/preflight-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
             "confirmed_host_key": manager.discover_host_key(node),
             "host_key_confirmed": True,
             "ssh_password": "must-not-be-used",
@@ -545,6 +583,7 @@ def test_readonly_principal_cannot_discover_deploy_or_remove_node_worker(
         f"/api/training/nodes/{node['node_ref']}/remove-worker",
         json={
             "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
             "ssh_password": "must-not-be-used",
             "sudo_password_mode": "same_as_ssh",
         },

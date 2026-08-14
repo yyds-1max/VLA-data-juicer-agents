@@ -14,9 +14,6 @@ from vla_data_juicer_agents.training.worker_deployment import (
     PASSWORDLESS_SUDO_PROBE_ARGV,
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
-    SYSTEM_DIRECTORIES,
-    SYSTEMD_UNIT,
-    WORKER_ACCOUNT,
     WORKER_CENTER_CA_PATH,
     WORKER_CONFIG_ROOT,
     WORKER_CURRENT_LINK,
@@ -26,6 +23,7 @@ from vla_data_juicer_agents.training.worker_deployment import (
     WORKER_SYSTEMD_UNIT_PATH,
     DeploymentPrivilege,
     FixedCommandResult,
+    RuntimeIdentity,
     SudoPasswordMode,
     TrainingNodeDeploymentError,
     TrainingWorkerSystemDeployer,
@@ -33,7 +31,9 @@ from vla_data_juicer_agents.training.worker_deployment import (
     WorkerDeploymentRequest,
     WorkerRemovalRequest,
     WorkerRelease,
+    build_systemd_unit,
     inspect_deployment_privilege,
+    system_directories,
 )
 from vla_data_juicer_agents.training.worker_deployment_ssh import (
     _REMOTE_INSTALLER,
@@ -66,6 +66,18 @@ class _FakeDeploymentBackend:
         self.enrolled = False
         self.active = False
         self.observed_sudo_password: str | None = None
+        self.runtime_identity = RuntimeIdentity(
+            username="trainer",
+            primary_group="research",
+            uid=1000,
+            home_directory="/home/trainer",
+            conda_executable="/home/trainer/miniconda3/bin/conda",
+        )
+        self.legacy_account = True
+
+    def inspect_runtime_identity(self):
+        self.calls.append(("inspect_runtime_identity", None))
+        return self.runtime_identity
 
     def inspect_privilege(
         self,
@@ -81,10 +93,6 @@ class _FakeDeploymentBackend:
         changed = key not in self.created
         self.created.add(key)
         return changed
-
-    def ensure_service_account(self, spec, *, privilege):
-        self.calls.append(("ensure_service_account", spec))
-        return self._ensure("account")
 
     def ensure_directory(self, spec, *, privilege):
         self.calls.append(("ensure_directory", spec))
@@ -131,6 +139,12 @@ class _FakeDeploymentBackend:
         self.active = False
         return changed
 
+    def remove_legacy_service_account(self, *, privilege):
+        self.calls.append(("remove_legacy_service_account", privilege))
+        changed = self.legacy_account
+        self.legacy_account = False
+        return changed
+
 
 def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     backend = _FakeDeploymentBackend(DeploymentPrivilege.PASSWORDLESS_SUDO)
@@ -140,28 +154,35 @@ def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     first_call_count = len(backend.calls)
     second = deployer.deploy(backend, _request(enrollment_token=None))
 
-    assert first.service_account == WORKER_ACCOUNT
+    assert first.runtime_account == "trainer"
     assert first.artifact_path.startswith(WORKER_OPT_ROOT + "/releases/0.2.0-")
     assert DIGEST[:12] in first.artifact_path
     assert first.systemd_unit == WORKER_SYSTEMD_UNIT_PATH
     assert first.service_active is True
-    assert "service_account" in first.changed_steps
-    assert "service_account" in second.unchanged_steps
+    assert "legacy_service_account" in first.changed_steps
+    assert "legacy_service_account" in second.unchanged_steps
     assert "enrollment" in second.unchanged_steps
     assert len(backend.calls) > first_call_count
 
     directory_specs = [call[1] for call in backend.calls if call[0] == "ensure_directory"]
-    assert directory_specs[: len(SYSTEM_DIRECTORIES)] == list(SYSTEM_DIRECTORIES)
+    directories = system_directories(backend.runtime_identity)
+    assert directory_specs[: len(directories)] == list(directories)
     files = [call[1] for call in backend.calls if call[0] == "write_managed_file"]
     first_file_specs = {spec.path: (spec, content) for spec, content in files[:2]}
     assert first_file_specs[WORKER_ENVIRONMENT_PATH][0].owner == "root"
     assert first_file_specs[WORKER_ENVIRONMENT_PATH][0].mode == 0o640
     assert ENROLLMENT_TOKEN.encode() not in first_file_specs[WORKER_ENVIRONMENT_PATH][1]
-    assert first_file_specs[WORKER_SYSTEMD_UNIT_PATH][1] == SYSTEMD_UNIT.encode()
-    assert f"User={WORKER_ACCOUNT}" in SYSTEMD_UNIT
-    assert WORKER_STATE_ROOT in SYSTEMD_UNIT
+    unit = build_systemd_unit(backend.runtime_identity)
+    assert first_file_specs[WORKER_SYSTEMD_UNIT_PATH][1] == unit.encode()
+    assert "User=trainer" in unit
+    assert "Group=research" in unit
+    assert "ProtectSystem=strict" not in unit
+    assert "ProtectHome=true" not in unit
+    assert WORKER_STATE_ROOT in unit
     assert WORKER_CONFIG_ROOT in WORKER_ENVIRONMENT_PATH
-    assert WORKER_CURRENT_LINK in SYSTEMD_UNIT
+    assert WORKER_CURRENT_LINK in unit
+    environment = first_file_specs[WORKER_ENVIRONMENT_PATH][1]
+    assert b'DATAPILOT_CONDA_EXECUTABLE="/home/trainer/miniconda3/bin/conda"' in environment
 
 
 def test_remote_installer_restarts_an_already_active_worker(
@@ -231,6 +252,7 @@ def test_insufficient_deployment_account_fails_before_any_write() -> None:
 
     assert raised.value.code == DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE
     assert backend.calls == [
+        ("inspect_runtime_identity", None),
         ("inspect_privilege", SudoPasswordMode.SAME_AS_SSH)
     ]
     assert "manual" not in raised.value.message.lower()
@@ -249,7 +271,7 @@ def test_privilege_probe_internal_failure_is_sanitized() -> None:
 
     assert raised.value.code == "training_node_deployment_failed"
     assert "raw transport" not in raised.value.message
-    assert backend.calls == []
+    assert backend.calls == [("inspect_runtime_identity", None)]
 
 
 def test_custom_center_ca_is_installed_and_used_for_enrollment() -> None:

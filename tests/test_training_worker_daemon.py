@@ -314,6 +314,66 @@ def test_model_configuration_verification_is_read_only_and_reports_failures(
     assert {"entrypoint", "executable", "output_root"} <= failed_codes
 
 
+def test_model_verification_resolves_launcher_inside_selected_conda_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("raise SystemExit('must not run')\n", encoding="utf-8")
+    environment_prefix = tmp_path / "envs" / "navila"
+    environment_prefix.mkdir(parents=True)
+    launcher = environment_prefix / "bin" / "torchrun"
+    launcher.parent.mkdir()
+    launcher.write_text("must not execute\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    fake_conda = tmp_path / "conda"
+    fake_conda.write_text(
+        f"""#!/usr/bin/env python3
+import json
+print(json.dumps({{"root_prefix": "/opt/conda", "envs": [{str(environment_prefix)!r}]}}))
+""",
+        encoding="utf-8",
+    )
+    fake_conda.chmod(0o700)
+    monkeypatch.setenv("DATAPILOT_CONDA_EXECUTABLE", str(fake_conda))
+
+    result = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": "torchrun",
+            "entrypoint": "train.py",
+            "output_root": str(tmp_path / "outputs"),
+            "runtime_environment": {
+                "kind": "conda",
+                "conda_environment": "navila",
+            },
+        }
+    )
+
+    checks = {check["code"]: check for check in result["checks"]}  # type: ignore[index]
+    assert result["status"] == "succeeded"
+    assert checks["runtime_environment"]["status"] == "passed"
+    assert checks["executable"]["status"] == "passed"
+
+    missing = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": "torchrun",
+            "entrypoint": "train.py",
+            "output_root": str(tmp_path / "outputs"),
+            "runtime_environment": {
+                "kind": "conda",
+                "conda_environment": "missing",
+            },
+        }
+    )
+    missing_checks = {
+        check["code"]: check for check in missing["checks"]  # type: ignore[index]
+    }
+    assert missing["status"] == "failed"
+    assert missing_checks["runtime_environment"]["status"] == "failed"
+
+
 def test_daemon_processes_only_the_fixed_model_verification_command(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

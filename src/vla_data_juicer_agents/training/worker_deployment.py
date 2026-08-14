@@ -26,8 +26,8 @@ DEPLOYMENT_FAILED_CODE = "training_node_deployment_failed"
 DEPLOYMENT_ENROLLMENT_REQUIRED_CODE = "training_node_deployment_enrollment_required"
 WORKER_REMOVAL_FAILED_CODE = "training_node_worker_removal_failed"
 
-WORKER_ACCOUNT = "datapilot-worker"
-WORKER_GROUP = "datapilot-worker"
+LEGACY_WORKER_ACCOUNT = "datapilot-worker"
+LEGACY_WORKER_GROUP = "datapilot-worker"
 WORKER_OPT_ROOT = "/opt/datapilot-training-worker"
 WORKER_RELEASES_ROOT = f"{WORKER_OPT_ROOT}/releases"
 WORKER_CURRENT_LINK = f"{WORKER_OPT_ROOT}/current"
@@ -52,31 +52,28 @@ PASSWORD_SUDO_PROBE_ARGV = (
     "/usr/bin/true",
 )
 
-SYSTEMD_UNIT = """[Unit]
+SYSTEMD_UNIT_TEMPLATE = """[Unit]
 Description=DataPilot Training Worker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=datapilot-worker
-Group=datapilot-worker
+User={runtime_account}
+Group={runtime_group}
 EnvironmentFile=/etc/datapilot-training-worker/worker.env
-ExecStart=/usr/bin/python3 /opt/datapilot-training-worker/current/datapilot-training-worker.pyz --state-dir /var/lib/datapilot-training-worker --center-base-url ${DATAPILOT_CENTER_BASE_URL} --node-ref ${DATAPILOT_NODE_REF}
+ExecStart=/usr/bin/python3 /opt/datapilot-training-worker/current/datapilot-training-worker.pyz --state-dir /var/lib/datapilot-training-worker --center-base-url ${{DATAPILOT_CENTER_BASE_URL}} --node-ref ${{DATAPILOT_NODE_REF}}
 WorkingDirectory=/var/lib/datapilot-training-worker
 Restart=on-failure
 RestartSec=5s
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/datapilot-training-worker
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -167,12 +164,29 @@ def inspect_deployment_privilege(
 
 
 @dataclass(frozen=True, slots=True)
-class ServiceAccountSpec:
-    username: str = WORKER_ACCOUNT
-    group: str = WORKER_GROUP
-    home_directory: str = WORKER_STATE_ROOT
-    login_shell: str = "/usr/sbin/nologin"
-    system_account: bool = True
+class RuntimeIdentity:
+    """Authenticated SSH identity reused by Worker and future training."""
+
+    username: str
+    primary_group: str
+    uid: int
+    home_directory: str
+    conda_executable: str | None = None
+
+    def validate(self) -> None:
+        account_pattern = r"[A-Za-z_][A-Za-z0-9_.-]{0,63}"
+        if not re.fullmatch(account_pattern, self.username):
+            _invalid("SSH runtime account has an unsupported name")
+        if not re.fullmatch(account_pattern, self.primary_group):
+            _invalid("SSH runtime account has an unsupported primary group")
+        if not isinstance(self.uid, int) or self.uid < 0:
+            _invalid("SSH runtime account has an unsupported uid")
+        if not _valid_absolute_path(self.home_directory):
+            _invalid("SSH runtime account has an unsupported home directory")
+        if self.conda_executable is not None and not _valid_absolute_path(
+            self.conda_executable
+        ):
+            _invalid("Discovered Conda executable has an unsupported path")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,14 +195,32 @@ class DirectorySpec:
     owner: str
     group: str
     mode: int
+    recursive_ownership: bool = False
 
 
-SYSTEM_DIRECTORIES = (
-    DirectorySpec(WORKER_OPT_ROOT, "root", "root", 0o755),
-    DirectorySpec(WORKER_RELEASES_ROOT, "root", "root", 0o755),
-    DirectorySpec(WORKER_STATE_ROOT, WORKER_ACCOUNT, WORKER_GROUP, 0o700),
-    DirectorySpec(WORKER_CONFIG_ROOT, "root", WORKER_GROUP, 0o750),
-)
+def system_directories(identity: RuntimeIdentity) -> tuple[DirectorySpec, ...]:
+    return (
+        DirectorySpec(WORKER_OPT_ROOT, "root", "root", 0o755),
+        DirectorySpec(WORKER_RELEASES_ROOT, "root", "root", 0o755),
+        DirectorySpec(
+            WORKER_STATE_ROOT,
+            identity.username,
+            identity.primary_group,
+            0o700,
+            recursive_ownership=True,
+        ),
+        DirectorySpec(
+            WORKER_CONFIG_ROOT, "root", identity.primary_group, 0o750
+        ),
+    )
+
+
+def build_systemd_unit(identity: RuntimeIdentity) -> str:
+    identity.validate()
+    return SYSTEMD_UNIT_TEMPLATE.format(
+        runtime_account=identity.username,
+        runtime_group=identity.primary_group,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +291,7 @@ class WorkerDeploymentResult:
     node_ref: str
     worker_version: str
     privilege: DeploymentPrivilege
-    service_account: str
+    runtime_account: str
     artifact_path: str
     systemd_unit: str
     service_active: bool
@@ -299,19 +331,14 @@ class SystemWorkerDeploymentBackend(Protocol):
     deployment transport.
     """
 
+    def inspect_runtime_identity(self) -> RuntimeIdentity: ...
+
     def inspect_privilege(
         self,
         *,
         sudo_password_mode: SudoPasswordMode,
         sudo_password: str | None,
     ) -> DeploymentPrivilege: ...
-
-    def ensure_service_account(
-        self,
-        spec: ServiceAccountSpec,
-        *,
-        privilege: DeploymentPrivilege,
-    ) -> bool: ...
 
     def ensure_directory(
         self,
@@ -381,6 +408,12 @@ class SystemWorkerDeploymentBackend(Protocol):
         privilege: DeploymentPrivilege,
     ) -> bool: ...
 
+    def remove_legacy_service_account(
+        self,
+        *,
+        privilege: DeploymentPrivilege,
+    ) -> bool: ...
+
 
 class TrainingWorkerSystemDeployer:
     """Apply the fixed system Worker layout through an idempotent backend."""
@@ -392,6 +425,8 @@ class TrainingWorkerSystemDeployer:
     ) -> WorkerDeploymentResult:
         request.validate()
         try:
+            runtime_identity = backend.inspect_runtime_identity()
+            runtime_identity.validate()
             privilege = backend.inspect_privilege(
                 sudo_password_mode=request.sudo_password_mode,
                 sudo_password=request.sudo_password,
@@ -401,7 +436,7 @@ class TrainingWorkerSystemDeployer:
         except Exception as exc:
             raise TrainingNodeDeploymentError(
                 DEPLOYMENT_FAILED_CODE,
-                "Training Worker deployment privilege check failed",
+                "Training Worker deployment identity or privilege check failed",
             ) from exc
         if privilege is DeploymentPrivilege.INSUFFICIENT:
             raise TrainingNodeDeploymentError(
@@ -424,14 +459,7 @@ class TrainingWorkerSystemDeployer:
             (changed if did_change else unchanged).append(step)
 
         try:
-            record(
-                "service_account",
-                backend.ensure_service_account(
-                    ServiceAccountSpec(),
-                    privilege=privilege,
-                ),
-            )
-            for directory in SYSTEM_DIRECTORIES:
+            for directory in system_directories(runtime_identity):
                 record(
                     f"directory:{directory.path}",
                     backend.ensure_directory(directory, privilege=privilege),
@@ -453,21 +481,21 @@ class TrainingWorkerSystemDeployer:
                         ManagedFileSpec(
                             WORKER_CENTER_CA_PATH,
                             "root",
-                            WORKER_GROUP,
+                            runtime_identity.primary_group,
                             0o640,
                         ),
                         request.center_ca_certificate,
                         privilege=privilege,
                     ),
                 )
-            environment = _environment_content(request)
+            environment = _environment_content(request, runtime_identity)
             record(
                 "configuration",
                 backend.write_managed_file(
                     ManagedFileSpec(
                         WORKER_ENVIRONMENT_PATH,
                         "root",
-                        WORKER_GROUP,
+                        runtime_identity.primary_group,
                         0o640,
                     ),
                     environment,
@@ -483,7 +511,7 @@ class TrainingWorkerSystemDeployer:
                         "root",
                         0o644,
                     ),
-                    SYSTEMD_UNIT.encode("utf-8"),
+                    build_systemd_unit(runtime_identity).encode("utf-8"),
                     privilege=privilege,
                 ),
             )
@@ -516,7 +544,7 @@ class TrainingWorkerSystemDeployer:
                             if request.center_ca_certificate is not None
                             else None
                         ),
-                        run_as=WORKER_ACCOUNT,
+                        run_as=runtime_identity.username,
                         privilege=privilege,
                     ),
                 )
@@ -545,11 +573,23 @@ class TrainingWorkerSystemDeployer:
                 DEPLOYMENT_FAILED_CODE,
                 "Training Worker system service did not become active",
             )
+        if runtime_identity.username == LEGACY_WORKER_ACCOUNT:
+            unchanged.append("legacy_service_account")
+        else:
+            try:
+                record(
+                    "legacy_service_account",
+                    backend.remove_legacy_service_account(privilege=privilege),
+                )
+            except Exception:
+                # Once the active service has switched identities, conservative
+                # cleanup refusal must not turn a healthy repair into a failure.
+                unchanged.append("legacy_service_account")
         return WorkerDeploymentResult(
             node_ref=request.node_ref,
             worker_version=request.release.version,
             privilege=privilege,
-            service_account=WORKER_ACCOUNT,
+            runtime_account=runtime_identity.username,
             artifact_path=request.release.artifact_path,
             systemd_unit=WORKER_SYSTEMD_UNIT_PATH,
             service_active=True,
@@ -600,7 +640,9 @@ class TrainingWorkerSystemRemover:
         )
 
 
-def _environment_content(request: WorkerDeploymentRequest) -> bytes:
+def _environment_content(
+    request: WorkerDeploymentRequest, identity: RuntimeIdentity
+) -> bytes:
     # Validation restricts values to single-line, EnvironmentFile-safe tokens.
     content = (
         f"DATAPILOT_CENTER_BASE_URL={request.center_base_url}\n"
@@ -608,7 +650,25 @@ def _environment_content(request: WorkerDeploymentRequest) -> bytes:
     )
     if request.center_ca_certificate is not None:
         content += f"DATAPILOT_CENTER_CA_CERT_PATH={WORKER_CENTER_CA_PATH}\n"
+    if identity.conda_executable is not None:
+        content += (
+            "DATAPILOT_CONDA_EXECUTABLE="
+            f'"{_escape_environment_value(identity.conda_executable)}"\n'
+        )
     return content.encode("utf-8")
+
+
+def _escape_environment_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _valid_absolute_path(value: str) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.startswith("/")
+        and len(value) <= 4096
+        and not any(character in value for character in ("\x00", "\r", "\n"))
+    )
 
 
 def _validate_center_base_url(value: str) -> None:
@@ -663,7 +723,7 @@ __all__ = [
     "FixedCommandResult",
     "FixedPrivilegeProbeRunner",
     "ManagedFileSpec",
-    "ServiceAccountSpec",
+    "RuntimeIdentity",
     "SudoPasswordMode",
     "SystemWorkerDeploymentBackend",
     "TrainingNodeDeploymentError",
@@ -676,5 +736,7 @@ __all__ = [
     "WorkerRemovalResult",
     "WorkerRelease",
     "WORKER_REMOVAL_FAILED_CODE",
+    "build_systemd_unit",
     "inspect_deployment_privilege",
+    "system_directories",
 ]

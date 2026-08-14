@@ -23,6 +23,7 @@ from vla_data_juicer_agents.training.worker_deployment_ssh import (
     OpenSshWorkerDeploymentBackend,
     _REMOTE_INSTALLER,
     _REMOTE_SUDO_BRIDGE,
+    _RUNTIME_IDENTITY_ARGV,
 )
 
 
@@ -48,6 +49,11 @@ class _FakeFixedSshSession:
         operation_name: str,
     ) -> RemoteExecution:
         self.calls.append((remote_argv, stdin_payload, operation_name))
+        if remote_argv == _RUNTIME_IDENTITY_ARGV:
+            return RemoteExecution(
+                0,
+                b'{"username":"trainer","primary_group":"research","uid":1000,"home_directory":"/home/trainer","conda_executable":"/home/trainer/miniconda3/bin/conda"}\n',
+            )
         if remote_argv == ROOT_IDENTITY_PROBE_ARGV:
             return RemoteExecution(0, b"1000\n")
         if remote_argv == PASSWORD_SUDO_PROBE_ARGV:
@@ -84,16 +90,18 @@ def test_openssh_deployment_adapter_uses_only_fixed_installer_and_stdin_secrets(
     )
 
     assert result.service_active is True
+    assert result.runtime_account == "trainer"
     assert result.privilege.value == "sudo"
     assert SSH_PASSWORD not in repr(backend)
     assert ENROLLMENT_TOKEN not in repr(backend)
-    assert session.calls[0] == (ROOT_IDENTITY_PROBE_ARGV, b"", "privilege_probe")
-    assert session.calls[1] == (
+    assert session.calls[0] == (_RUNTIME_IDENTITY_ARGV, b"", "runtime_identity_probe")
+    assert session.calls[1] == (ROOT_IDENTITY_PROBE_ARGV, b"", "privilege_probe")
+    assert session.calls[2] == (
         PASSWORD_SUDO_PROBE_ARGV,
         (SSH_PASSWORD + "\n").encode(),
         "privilege_probe",
     )
-    deployment_calls = session.calls[2:]
+    deployment_calls = session.calls[3:]
     assert deployment_calls
     for argv, _stdin, operation_name in deployment_calls:
         assert argv[:2] == ("/usr/bin/python3", "-c")
@@ -149,6 +157,7 @@ def test_openssh_worker_removal_uses_the_fixed_remote_operation() -> None:
         "/var/lib/datapilot-training-worker",
         "/opt/datapilot-training-worker",
     ]
+    assert arguments["legacy_account"] == "datapilot-worker"
 
 
 def test_openssh_backend_rejects_non_catalogue_privilege_command() -> None:
@@ -268,7 +277,7 @@ raise SystemExit(completed.returncode)
                     "center_base_url": "https://127.0.0.1:8777",
                     "node_ref": "node_test1234",
                     "center_ca_path": None,
-                    "run_as": "datapilot-worker",
+                    "run_as": os.environ.get("USER") or "root",
                 }
             ),
         ],

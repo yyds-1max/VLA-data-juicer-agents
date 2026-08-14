@@ -24,6 +24,7 @@ from .worker_deployment import (
     DEPLOYMENT_ACCOUNT_INSUFFICIENT_CODE,
     DEPLOYMENT_INVALID_REQUEST_CODE,
     DeploymentPrivilege,
+    RuntimeIdentity,
     SudoPasswordMode,
     SystemWorkerDeploymentBackend,
     TrainingNodeDeploymentError,
@@ -67,7 +68,10 @@ class AutomatedNodeDeploymentManager:
         self._remover = TrainingWorkerSystemRemover()
 
     def discover_host_key(self, node: dict[str, Any]) -> dict[str, str]:
-        endpoint = _endpoint(node)
+        # SSH host keys identify the host, not a login account.  A placeholder
+        # username lets a freshly registered node be observed before the user
+        # chooses the account that will own the Worker and training processes.
+        endpoint = _endpoint(node, username_override="datapilot-host-key-observer")
         try:
             observations = self._host_key_observer.observe(endpoint)
         except SshTransportError as exc:
@@ -119,6 +123,7 @@ class AutomatedNodeDeploymentManager:
                 host_key=pin,
                 ssh_password=ssh_password,
             ) as backend:
+                runtime_identity = backend.inspect_runtime_identity()
                 privilege = backend.inspect_privilege(
                     sudo_password_mode=SudoPasswordMode(sudo_password_mode),
                     sudo_password=sudo_password,
@@ -133,7 +138,12 @@ class AutomatedNodeDeploymentManager:
                 "training_node_preflight_failed",
                 "Training node preflight could not be completed.",
             ) from exc
-        checks = _product_preflight_checks(report, privilege)
+        except (TrainingNodeDeploymentError, RuntimeError, ValueError) as exc:
+            raise TrainingValidationError(
+                "training_node_preflight_failed",
+                "Training node identity or privilege could not be verified.",
+            ) from exc
+        checks = _product_preflight_checks(report, privilege, runtime_identity)
         return {
             "ready": all(check["status"] != "failed" for check in checks),
             "checked_at": report.completed_at.isoformat(),
@@ -277,11 +287,19 @@ class AutomatedNodeDeploymentManager:
         return {"message": "Training Worker removed from the node."}
 
 
-def _endpoint(node: dict[str, Any]) -> SshEndpoint:
+def _endpoint(
+    node: dict[str, Any], *, username_override: str | None = None
+) -> SshEndpoint:
+    username = username_override or node.get("ssh_username")
+    if not username:
+        raise TrainingValidationError(
+            "training_node_ssh_username_required",
+            "An SSH login account is required for this Worker operation.",
+        )
     return SshEndpoint(
         host=str(node["address"]),
         port=int(node.get("ssh_port", 22)),
-        username=str(node["ssh_username"]),
+        username=str(username),
     )
 
 
@@ -304,7 +322,9 @@ def _confirmed_pin(
 
 
 def _product_preflight_checks(
-    report: PreflightReport, privilege: DeploymentPrivilege
+    report: PreflightReport,
+    privilege: DeploymentPrivilege,
+    runtime_identity: RuntimeIdentity,
 ) -> list[dict[str, str]]:
     by_probe = {result.probe: result for result in report.probes}
 
@@ -316,6 +336,16 @@ def _product_preflight_checks(
         operating_system.stdout.strip().casefold() == "linux"
     )
     checks: list[dict[str, str]] = [
+        {
+            "code": "runtime_identity",
+            "label": "Worker 与训练运行身份",
+            "status": "warning" if runtime_identity.uid == 0 else "passed",
+            "detail": (
+                "将以 root 身份运行 Worker 和训练任务，拥有该节点的完整权限。"
+                if runtime_identity.uid == 0
+                else f"将以 SSH 登录账号 {runtime_identity.username} 运行 Worker 和训练任务。"
+            ),
+        },
         {
             "code": "operating_system",
             "label": "Linux 操作系统",

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import re
 import shutil
+import subprocess
 from typing import Any, Mapping
 
 
@@ -61,49 +64,47 @@ def verify_model_configuration(payload: Mapping[str, object]) -> dict[str, objec
         )
     )
 
-    executable_path: str | None
-    executable_candidate = Path(executable)
-    if executable_candidate.is_absolute() or "/" in executable:
-        if not executable_candidate.is_absolute():
-            executable_candidate = workdir / executable_candidate
-        executable_path = str(executable_candidate) if executable_candidate.is_file() and os.access(executable_candidate, os.X_OK) else None
+    runtime_kind = runtime.get("kind", "system")
+    runtime_ok = runtime_kind == "system"
+    runtime_detail = "使用 Worker 当前系统运行环境。"
+    executable_path: str | None = None
+    if runtime_kind == "conda":
+        environment = runtime.get("conda_environment")
+        conda_executable = _find_conda_executable()
+        runtime_ok, executable_path = _probe_conda_environment(
+            conda_executable,
+            environment,
+            executable,
+            workdir,
+        )
+        if conda_executable is None:
+            runtime_detail = "SSH 运行账号下未找到 Conda。"
+        elif runtime_ok:
+            runtime_detail = f"Conda 环境 {environment} 可用。"
+        else:
+            runtime_detail = f"Conda 环境 {environment or ''} 不存在或无法启动。"
+    elif runtime_kind != "system":
+        runtime_detail = "运行环境类型不受支持。"
     else:
-        executable_path = shutil.which(executable)
+        executable_path = _find_system_executable(executable, workdir)
+    checks.append(
+        {
+            "code": "runtime_environment",
+            "label": "运行环境",
+            "status": "passed" if runtime_ok else "failed",
+            "detail": runtime_detail,
+        }
+    )
     executable_ok = executable_path is not None
     checks.append(
         _check(
             "executable",
             "启动程序",
             executable_ok,
-            "启动程序可由 Worker 当前运行环境找到。"
+            "启动程序可由所选运行环境找到。"
             if executable_ok
-            else "Worker 当前运行环境找不到可执行的启动程序。",
+            else "所选运行环境找不到可执行的启动程序。",
         )
-    )
-
-    runtime_kind = runtime.get("kind", "system")
-    runtime_ok = runtime_kind == "system"
-    runtime_detail = "使用 Worker 当前系统运行环境。"
-    runtime_status = "passed"
-    if runtime_kind == "conda":
-        environment = runtime.get("conda_environment")
-        conda_available = shutil.which("conda") is not None
-        runtime_ok = isinstance(environment, str) and bool(environment) and conda_available
-        runtime_detail = (
-            "已找到 Conda；具体环境将在真实执行接入时再次确认。"
-            if runtime_ok
-            else "未填写 Conda 环境，或 Worker 当前环境找不到 conda。"
-        )
-        runtime_status = "warning" if runtime_ok else "failed"
-    elif runtime_kind != "system":
-        runtime_detail = "运行环境类型不受支持。"
-    checks.append(
-        {
-            "code": "runtime_environment",
-            "label": "运行环境",
-            "status": runtime_status if runtime_ok else "failed",
-            "detail": runtime_detail,
-        }
     )
 
     output_path = Path(output_root)
@@ -163,6 +164,118 @@ def _nearest_existing_parent(path: Path) -> Path | None:
             return None
         candidate = parent
     return candidate
+
+
+def _find_system_executable(executable: str, workdir: Path) -> str | None:
+    candidate = Path(executable)
+    if candidate.is_absolute() or "/" in executable:
+        if not candidate.is_absolute():
+            candidate = workdir / candidate
+        return (
+            str(candidate)
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+            else None
+        )
+    return shutil.which(executable)
+
+
+def _find_conda_executable() -> str | None:
+    home = Path.home()
+    candidates = (
+        os.environ.get("DATAPILOT_CONDA_EXECUTABLE"),
+        os.environ.get("CONDA_EXE"),
+        shutil.which("conda"),
+        *(str(home / name / "bin" / "conda") for name in (
+            "miniconda3",
+            "anaconda3",
+            "miniforge3",
+            "mambaforge",
+        )),
+        "/opt/conda/bin/conda",
+    )
+    for raw_candidate in candidates:
+        if not raw_candidate:
+            continue
+        candidate = Path(raw_candidate).expanduser()
+        if (
+            candidate.is_absolute()
+            and candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ):
+            return str(candidate.resolve())
+    return None
+
+
+def _probe_conda_environment(
+    conda_executable: str | None,
+    environment: object,
+    executable: str,
+    workdir: Path,
+) -> tuple[bool, str | None]:
+    if (
+        conda_executable is None
+        or not isinstance(environment, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", environment)
+        or not workdir.is_dir()
+    ):
+        return False, None
+    try:
+        completed = subprocess.run(
+            [
+                conda_executable,
+                "info",
+                "--json",
+            ],
+            cwd=workdir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if completed.returncode != 0 or len(completed.stdout) > 1024 * 1024:
+        return False, None
+    try:
+        response = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, None
+    if not isinstance(response, dict):
+        return False, None
+    root_prefix = response.get("root_prefix")
+    raw_environments = response.get("envs")
+    prefixes = [
+        value
+        for value in (
+            root_prefix,
+            *(raw_environments if isinstance(raw_environments, list) else []),
+        )
+        if isinstance(value, str) and Path(value).is_absolute()
+    ]
+    selected_prefix = next(
+        (
+            prefix
+            for prefix in prefixes
+            if (environment == "base" and prefix == root_prefix)
+            or Path(prefix).name == environment
+        ),
+        None,
+    )
+    if selected_prefix is None:
+        return False, None
+    candidate = Path(executable)
+    if candidate.is_absolute() or "/" in executable:
+        if not candidate.is_absolute():
+            candidate = workdir / candidate
+    else:
+        candidate = Path(selected_prefix) / "bin" / executable
+    resolved = (
+        str(candidate)
+        if candidate.is_file() and os.access(candidate, os.X_OK)
+        else None
+    )
+    return True, resolved
 
 
 def _check(code: str, label: str, passed: bool, detail: str) -> dict[str, str]:

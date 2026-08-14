@@ -233,9 +233,13 @@ export async function listTrainingNodes(): Promise<TrainingNode[]> {
   return data.nodes;
 }
 
-export async function createTrainingNode(payload: { name: string; description?: string; address: string; ssh_port: number; ssh_username: string }): Promise<TrainingNode> {
+export async function createTrainingNode(payload: { name: string; description?: string; address: string; ssh_port: number }): Promise<TrainingNode> {
   const data = await requestJson<{ node: TrainingNode }>(`${trainingPath}/nodes`, { method: "POST", body: JSON.stringify(payload) });
   return data.node;
+}
+
+export async function deleteTrainingNode(nodeRef: string, expectedRevision: number): Promise<void> {
+  await requestJson<void>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}?expected_revision=${expectedRevision}`, { method: "DELETE" });
 }
 
 export async function createTrainingNodeEnrollmentToken(nodeRef: string, expectedRevision: number): Promise<{ enrollment_token: string; expires_at: string; node: TrainingNode }> {
@@ -252,6 +256,7 @@ export async function discoverTrainingNodeHostKey(nodeRef: string): Promise<Trai
 
 export async function deployTrainingNodeWorker(nodeRef: string, payload: {
   expected_revision: number;
+  ssh_username: string;
   confirmed_host_key: TrainingNodeHostKey;
   host_key_confirmed: true;
   ssh_password: string;
@@ -266,6 +271,7 @@ export async function deployTrainingNodeWorker(nodeRef: string, payload: {
 
 export async function preflightTrainingNodeWorker(nodeRef: string, payload: {
   expected_revision: number;
+  ssh_username: string;
   confirmed_host_key: TrainingNodeHostKey;
   host_key_confirmed: true;
   ssh_password: string;
@@ -280,6 +286,7 @@ export async function preflightTrainingNodeWorker(nodeRef: string, payload: {
 
 export async function removeTrainingNodeWorker(nodeRef: string, payload: {
   expected_revision: number;
+  ssh_username: string;
   ssh_password: string;
   sudo_password_mode: "same_as_ssh" | "separate" | "not_required";
   sudo_password?: string;

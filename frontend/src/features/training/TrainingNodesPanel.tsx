@@ -1,7 +1,7 @@
-import { Eye, EyeOff, KeyRound, Plus, Server, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
+import { ChevronDown, CircleHelp, Eye, EyeOff, KeyRound, Plus, Server, ShieldCheck, Trash2, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 
-import { ApiResponseError, createTrainingNode, deployTrainingNodeWorker, discoverTrainingNodeHostKey, preflightTrainingNodeWorker, removeTrainingNodeWorker } from "../../api/client";
+import { ApiResponseError, createTrainingNode, deleteTrainingNode, deployTrainingNodeWorker, discoverTrainingNodeHostKey, preflightTrainingNodeWorker, removeTrainingNodeWorker } from "../../api/client";
 import type { TrainingNode, TrainingNodeHostKey, TrainingNodePreflightResult, TrainingNodeStatus } from "../../api/types";
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
@@ -37,11 +37,29 @@ const statusMeta: Record<TrainingNodeStatus, { label: string; tone: StatusTone }
 };
 
 const deploymentStatusLabel = {
-  not_started: "尚未部署",
-  deploying: "正在部署",
-  succeeded: "部署成功",
-  failed: "部署失败",
+  not_started: "未安装",
+  deploying: "安装中",
+  succeeded: "已安装",
+  failed: "安装失败",
 } as const;
+
+function nodeHasInstalledWorker(node: TrainingNode | null) {
+  return Boolean(node && (
+    node.deployment_status === "succeeded"
+    || node.installed_worker_version
+    || node.worker_version
+    || node.enrolled_at
+  ));
+}
+
+function connectionSummary(node: TrainingNode, hasInstalledWorker: boolean) {
+  if (!hasInstalledWorker) return "Worker 尚未安装，当前不能用于创建训练。";
+  if (node.status === "online") return "Worker 已连接中心服务，节点可以用于创建训练。";
+  if (node.status === "degraded") return "Worker 已连接，但节点状态异常，暂时不能用于创建训练。";
+  if (node.status === "repair_required") return "Worker 需要修复，修复完成前不能用于创建训练。";
+  if (node.status === "disabled") return "节点已停用，当前不能用于创建训练。";
+  return "Worker 已安装，但当前未连接中心服务。";
+}
 
 function errorText(error: unknown) {
   if (error instanceof ApiResponseError) {
@@ -101,22 +119,30 @@ export function TrainingNodesPanel({
   deploymentEnabled,
   deploymentDisabledReason,
   onChanged,
+  onDeleted,
+  onViewResources,
 }: {
   nodes: TrainingNode[];
   canManage: boolean;
   deploymentEnabled: boolean;
   deploymentDisabledReason?: string | null;
   onChanged: (node: TrainingNode) => void;
+  onDeleted: (nodeRef: string) => void;
+  onViewResources: () => void;
 }) {
   const [selectedRef, setSelectedRef] = useState<string>(nodes[0]?.node_ref ?? "");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [address, setAddress] = useState("");
   const [sshPort, setSshPort] = useState("22");
+  const [registrationOpen, setRegistrationOpen] = useState(nodes.length === 0);
+  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
+  const [dangerActionsOpen, setDangerActionsOpen] = useState(false);
   const [sshUsername, setSshUsername] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [deployingRef, setDeployingRef] = useState<string | null>(null);
+  const [deploymentMode, setDeploymentMode] = useState<"deploy" | "repair" | "change_account">("deploy");
   const [hostKey, setHostKey] = useState<TrainingNodeHostKey | null>(null);
   const [hostKeyConfirmed, setHostKeyConfirmed] = useState(false);
   const [sshPassword, setSshPassword] = useState("");
@@ -127,6 +153,8 @@ export function TrainingNodesPanel({
   const [preflight, setPreflight] = useState<TrainingNodePreflightResult | null>(null);
   const [removalOpen, setRemovalOpen] = useState(false);
   const [removalConfirmOpen, setRemovalConfirmOpen] = useState(false);
+  const [removalPurpose, setRemovalPurpose] = useState<"worker" | "node">("worker");
+  const [removalSshUsername, setRemovalSshUsername] = useState("");
   const [removalSshPassword, setRemovalSshPassword] = useState("");
   const [removalSshPasswordVisible, setRemovalSshPasswordVisible] = useState(false);
   const [removalSudoPasswordMode, setRemovalSudoPasswordMode] = useState<"same_as_ssh" | "separate" | "not_required">("same_as_ssh");
@@ -134,38 +162,36 @@ export function TrainingNodesPanel({
   const [removalSudoPasswordVisible, setRemovalSudoPasswordVisible] = useState(false);
   const selected = nodes.find((node) => node.node_ref === selectedRef) ?? nodes[0] ?? null;
   const port = Number(sshPort);
-  const valid = Boolean(name.trim() && address.trim() && sshUsername.trim() && Number.isInteger(port) && port >= 1 && port <= 65535);
-  const hasInstalledWorker = Boolean(selected && (
-    selected.deployment_status === "succeeded"
-    || selected.installed_worker_version
-    || selected.worker_version
-    || selected.enrolled_at
-  ));
+  const valid = Boolean(name.trim() && address.trim() && Number.isInteger(port) && port >= 1 && port <= 65535);
+  const hasInstalledWorker = nodeHasInstalledWorker(selected);
+  const showRegistrationForm = nodes.length === 0 || registrationOpen;
+  const privilegeCheck = preflight?.checks.find((check) => check.code === "deployment_privilege");
+
+  const openDeploymentFor = async (node: TrainingNode, mode: "deploy" | "repair" | "change_account") => {
+    setBusy(true); setMessage(null); setSelectedRef(node.node_ref); setDeployingRef(node.node_ref); setDeploymentMode(mode); setSshUsername(node.ssh_username ?? ""); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSshPasswordVisible(false); setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); setMoreActionsOpen(false);
+    try {
+      setHostKey(await discoverTrainingNodeHostKey(node.node_ref));
+    } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
+  };
 
   const create = async () => {
     if (!valid) return;
     setBusy(true); setMessage(null); setDeployingRef(null); setHostKey(null);
     try {
-      const node = await createTrainingNode({ name: name.trim(), description: description.trim() || undefined, address: address.trim(), ssh_port: port, ssh_username: sshUsername.trim() });
-      onChanged(node); setSelectedRef(node.node_ref); setName(""); setDescription(""); setAddress(""); setSshPort("22"); setSshUsername("");
-      setMessage("节点已登记。点击“部署 Worker”，系统会自动完成账号、服务和注册配置。");
-    } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
-  };
-
-  const openDeployment = async () => {
-    if (!selected) return;
-    setBusy(true); setMessage(null); setDeployingRef(selected.node_ref); setHostKey(null); setHostKeyConfirmed(false); setSshPassword(""); setSshPasswordVisible(false); setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null);
-    try {
-      setHostKey(await discoverTrainingNodeHostKey(selected.node_ref));
+      const node = await createTrainingNode({ name: name.trim(), description: description.trim() || undefined, address: address.trim(), ssh_port: port });
+      onChanged(node); setName(""); setDescription(""); setAddress(""); setSshPort("22");
+      setRegistrationOpen(false);
+      await openDeploymentFor(node, "deploy");
     } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
   };
 
   const checkPreflight = async () => {
-    if (!selected || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
+    if (!selected || !sshUsername.trim() || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
     setBusy(true); setMessage(null); setPreflight(null);
     try {
       setPreflight(await preflightTrainingNodeWorker(selected.node_ref, {
         expected_revision: selected.state_revision,
+        ssh_username: sshUsername.trim(),
         confirmed_host_key: hostKey,
         host_key_confirmed: true,
         ssh_password: sshPassword,
@@ -176,11 +202,12 @@ export function TrainingNodesPanel({
   };
 
   const deploy = async () => {
-    if (!selected || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
+    if (!selected || !sshUsername.trim() || !hostKey || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)) return;
     setBusy(true); setMessage(null);
     try {
       const result = await deployTrainingNodeWorker(selected.node_ref, {
         expected_revision: selected.state_revision,
+        ssh_username: sshUsername.trim(),
         confirmed_host_key: hostKey,
         host_key_confirmed: true,
         ssh_password: sshPassword,
@@ -198,30 +225,45 @@ export function TrainingNodesPanel({
     setRemovalSudoPasswordMode("same_as_ssh");
     setRemovalSudoPassword("");
     setRemovalSudoPasswordVisible(false);
+    setRemovalSshUsername(selected?.ssh_username ?? "");
   };
 
-  const openRemoval = () => {
+  const openRemoval = (purpose: "worker" | "node") => {
     setMessage(null);
+    setRemovalPurpose(purpose);
     resetRemoval();
-    setRemovalConfirmOpen(false);
-    setRemovalOpen(true);
+    const needsSshRemoval = Boolean(hasInstalledWorker);
+    setRemovalConfirmOpen(!needsSshRemoval);
+    setRemovalOpen(needsSshRemoval);
   };
 
-  const removeWorker = async () => {
-    if (!selected || !removalSshPassword || (removalSudoPasswordMode === "separate" && !removalSudoPassword)) return;
+  const completeRemoval = async () => {
+    if (!selected) return;
+    if (hasInstalledWorker && (!removalSshUsername.trim() || !removalSshPassword || (removalSudoPasswordMode === "separate" && !removalSudoPassword))) return;
     setBusy(true); setMessage(null);
     try {
-      const result = await removeTrainingNodeWorker(selected.node_ref, {
-        expected_revision: selected.state_revision,
-        ssh_password: removalSshPassword,
-        sudo_password_mode: removalSudoPasswordMode,
-        ...(removalSudoPasswordMode === "separate" ? { sudo_password: removalSudoPassword } : {}),
-      });
-      onChanged(result.node);
+      let currentNode = selected;
+      if (hasInstalledWorker) {
+        const result = await removeTrainingNodeWorker(selected.node_ref, {
+          expected_revision: selected.state_revision,
+          ssh_username: removalSshUsername.trim(),
+          ssh_password: removalSshPassword,
+          sudo_password_mode: removalSudoPasswordMode,
+          ...(removalSudoPasswordMode === "separate" ? { sudo_password: removalSudoPassword } : {}),
+        });
+        currentNode = result.node;
+        onChanged(currentNode);
+      }
+      if (removalPurpose === "node") {
+        await deleteTrainingNode(currentNode.node_ref, currentNode.state_revision);
+        onDeleted(currentNode.node_ref);
+        setMessage("训练节点已删除。模型工程、数据集、训练产物和 SSH 登录账号均未改动。");
+      } else {
+        setMessage("Worker 已卸载。节点记录仍然保留，在重新部署 Worker 前不能用于训练。");
+      }
       setRemovalConfirmOpen(false);
       setRemovalOpen(false);
       resetRemoval();
-      setMessage("Worker 已删除。该节点已恢复为待部署状态，在重新部署 Worker 前不可用于训练。");
     } catch (error) {
       setMessage(errorText(error));
       setRemovalConfirmOpen(false);
@@ -236,81 +278,127 @@ export function TrainingNodesPanel({
     <section className="space-y-5" aria-labelledby="training-nodes-title">
       <header className="border-b border-console-line pb-5">
         <h2 id="training-nodes-title" className="text-xl font-semibold text-console-text">训练节点</h2>
-        <p className="mt-1 text-sm text-console-muted">登记训练机器并管理独立 Worker。CPU、内存、磁盘和 GPU 统一在“服务器资源”查看。</p>
+        <p className="mt-1 text-sm text-console-muted">登记训练服务器、部署 Worker 并处理连接状态。CPU、内存、磁盘和 GPU 统一在“服务器资源”查看。</p>
       </header>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(340px,.72fr)_minmax(0,1.28fr)]">
-        <ConsoleCard className="h-fit shadow-none">
-          <div className="flex items-center gap-2"><Plus className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">登记训练节点</h3></div>
-          <p className="mt-1 text-xs leading-5 text-console-muted">这里只保存地址、端口和用户名。SSH 密码不会写入节点记录。</p>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-            <label className="text-sm text-console-muted">节点名称<input className={inputClass} value={name} disabled={!canManage || busy} onChange={(event) => setName(event.target.value)} /></label>
-            <label className="text-sm text-console-muted">SSH 用户名<input className={inputClass} autoComplete="username" value={sshUsername} disabled={!canManage || busy} onChange={(event) => setSshUsername(event.target.value)} /></label>
-            <label className="text-sm text-console-muted">主机地址<input className={inputClass} placeholder="例如 10.0.0.12" value={address} disabled={!canManage || busy} onChange={(event) => setAddress(event.target.value)} /></label>
-            <label className="text-sm text-console-muted">SSH 端口<input className={inputClass} inputMode="numeric" value={sshPort} disabled={!canManage || busy} onChange={(event) => setSshPort(event.target.value)} /></label>
-          </div>
-          <label className="mt-3 block text-sm text-console-muted">说明（可选）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 text-sm text-console-text" value={description} disabled={!canManage || busy} onChange={(event) => setDescription(event.target.value)} /></label>
-          <ConsoleButton className="mt-4" variant="primary" disabled={!canManage || busy || !valid} onClick={() => void create()}><Plus className="h-4 w-4" />登记节点</ConsoleButton>
-          {!canManage ? <p className="mt-3 text-xs text-console-muted">当前身份仅可查看节点，不能登记或部署 Worker。</p> : null}
-        </ConsoleCard>
-
+      <div className={nodes.length ? "grid gap-4 xl:grid-cols-[minmax(320px,.72fr)_minmax(0,1.28fr)]" : "max-w-3xl"}>
         <div className="space-y-4">
+          <ConsoleCard className="h-fit shadow-none">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2"><Plus className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">登记训练节点</h3></div>
+                <p className="mt-1 text-xs leading-5 text-console-muted">登记服务器地址后，系统将继续检查连接并部署 Worker。SSH 凭据只用于本次操作，不会保存。</p>
+              </div>
+              {!showRegistrationForm ? <ConsoleButton disabled={!canManage || !deploymentEnabled || busy} onClick={() => setRegistrationOpen(true)}><Plus className="h-4 w-4" />登记新节点</ConsoleButton> : null}
+            </div>
+            {showRegistrationForm ? <>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                <label className="text-sm text-console-muted">节点名称<input className={inputClass} value={name} disabled={!canManage || busy} onChange={(event) => setName(event.target.value)} /></label>
+                <label className="text-sm text-console-muted">主机地址<input className={inputClass} placeholder="例如 10.0.0.12" value={address} disabled={!canManage || busy} onChange={(event) => setAddress(event.target.value)} /></label>
+                <label className="text-sm text-console-muted">SSH 端口<input className={inputClass} inputMode="numeric" value={sshPort} disabled={!canManage || busy} onChange={(event) => setSshPort(event.target.value)} /></label>
+              </div>
+              <label className="mt-3 block text-sm text-console-muted">说明（可选）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 text-sm text-console-text" value={description} disabled={!canManage || busy} onChange={(event) => setDescription(event.target.value)} /></label>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <ConsoleButton variant="primary" disabled={!canManage || !deploymentEnabled || busy || !valid} onClick={() => void create()}><Plus className="h-4 w-4" />登记并部署 Worker</ConsoleButton>
+                {nodes.length ? <ConsoleButton disabled={busy} onClick={() => setRegistrationOpen(false)}>取消</ConsoleButton> : null}
+              </div>
+            </> : null}
+            {!canManage ? <p className="mt-3 text-xs text-console-muted">当前身份仅可查看节点，不能登记或部署 Worker。</p> : null}
+            {canManage && !deploymentEnabled ? <p className="mt-3 text-xs leading-5 text-amber-700">{deploymentDisabledReason || "系统尚未配置可供训练节点访问的中心 HTTPS 地址，暂不能部署 Worker。"}</p> : null}
+          </ConsoleCard>
+
           <ConsoleCard className="shadow-none">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div><h3 className="font-semibold text-console-text">已登记节点</h3><p className="mt-1 text-xs text-console-muted">在线状态由中心服务根据最近心跳计算。</p></div>
               <span className="text-xs text-console-muted">共 {nodes.length} 台</span>
             </div>
-            <div className="mt-4 grid gap-2 sm:grid-cols-2">
-              {nodes.map((node) => <button key={node.node_ref} type="button" onClick={() => { setSelectedRef(node.node_ref); setDeployingRef(null); setHostKey(null); setPreflight(null); setMessage(null); }} className={`rounded-lg border p-3 text-left ${selected?.node_ref === node.node_ref ? "border-console-cyan bg-sky-50" : "border-console-line bg-console-panel2 hover:border-console-cyan/40"}`}>
+            <div className="mt-4 grid gap-2">
+              {nodes.map((node) => <button key={node.node_ref} type="button" onClick={() => { setSelectedRef(node.node_ref); setDeployingRef(null); setHostKey(null); setPreflight(null); setMessage(null); setMoreActionsOpen(false); setDangerActionsOpen(false); }} className={`rounded-lg border p-3 text-left ${selected?.node_ref === node.node_ref ? "border-console-cyan bg-sky-50" : "border-console-line bg-console-panel2 hover:border-console-cyan/40"}`}>
                 <span className="flex items-center justify-between gap-2"><span className="font-medium text-console-text">{node.name}</span><StatusTag tone={statusMeta[node.status].tone}>{statusMeta[node.status].label}</StatusTag></span>
-                <span className="mt-2 block truncate font-mono text-xs text-console-muted">{node.address && node.ssh_username ? `${node.ssh_username}@${node.address}:${node.ssh_port ?? 22}` : "连接信息仅管理员可见"}</span>
+                <span className="mt-2 block truncate font-mono text-xs text-console-muted">{node.address ? `${node.address}:${node.ssh_port ?? 22}` : "连接信息仅管理员可见"}</span>
+                {nodeHasInstalledWorker(node) && node.ssh_username ? <span className="mt-1 block truncate text-xs text-console-muted">Worker/训练运行账号：{node.ssh_username}</span> : null}
                 <span className="mt-1 block text-xs text-console-muted">最近心跳 {formatTime(node.last_heartbeat_at)}</span>
               </button>)}
             </div>
             {!nodes.length ? <div className="py-10 text-center"><Server className="mx-auto h-8 w-8 text-console-muted" /><p className="mt-3 text-sm text-console-muted">尚未登记训练节点。</p></div> : null}
           </ConsoleCard>
+        </div>
 
-          {selected ? <>
-            <ConsoleCard className="shadow-none">
+        {selected ? <div className="space-y-4">
+          <ConsoleCard className="shadow-none">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div><div className="flex items-center gap-2"><ShieldCheck className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">{selected.name}</h3></div><p className="mt-1 font-mono text-xs text-console-muted">{selected.node_ref}</p></div>
+                <div><div className="flex items-center gap-2"><ShieldCheck className="h-5 w-5 text-console-cyan" /><h3 className="font-semibold text-console-text">{selected.name}</h3></div><p className="mt-1 text-xs text-console-muted">{selected.address ? `${selected.address}:${selected.ssh_port ?? 22}` : "连接信息仅管理员可见"}</p></div>
                 <StatusTag tone={statusMeta[selected.status].tone}>{statusMeta[selected.status].label}</StatusTag>
               </div>
-              <dl className="mt-4 grid gap-x-6 gap-y-3 border-y border-console-line py-4 text-sm sm:grid-cols-2 xl:grid-cols-5">
-                <div><dt className="text-xs text-console-muted">部署状态</dt><dd className="mt-1 text-console-text">{deploymentStatusLabel[selected.deployment_status ?? "not_started"]}</dd></div>
-                <div><dt className="text-xs text-console-muted">Worker 版本</dt><dd className="mt-1 text-console-text">{selected.worker_version ?? selected.installed_worker_version ?? "尚未部署"}</dd></div>
-                <div><dt className="text-xs text-console-muted">协议版本</dt><dd className="mt-1 text-console-text">{selected.protocol_version ?? "--"}</dd></div>
-                <div><dt className="text-xs text-console-muted">首次接入</dt><dd className="mt-1 text-console-text">{formatTime(selected.enrolled_at)}</dd></div>
-                <div><dt className="text-xs text-console-muted">最近在线</dt><dd className="mt-1 text-console-text">{formatTime(selected.last_seen_at)}</dd></div>
+              <dl className="mt-4 grid gap-x-6 gap-y-4 border-y border-console-line py-4 text-sm sm:grid-cols-2 xl:grid-cols-4">
+                <div><dt className="text-xs text-console-muted">Worker</dt><dd className="mt-1 text-console-text">{deploymentStatusLabel[selected.deployment_status ?? "not_started"]}</dd>{hasInstalledWorker ? <span className="mt-1 block text-xs text-console-muted">版本 {selected.worker_version ?? selected.installed_worker_version ?? "--"}</span> : null}</div>
+                <div><dt className="text-xs text-console-muted">节点连接</dt><dd className="mt-1 text-console-text">{statusMeta[selected.status].label}</dd></div>
+                <div><dt className="text-xs text-console-muted">Worker/训练运行账号</dt><dd className="mt-1 text-console-text">{hasInstalledWorker ? selected.ssh_username ?? "未记录" : "尚未部署"}</dd></div>
+                <div><dt className="text-xs text-console-muted">最近心跳</dt><dd className="mt-1 text-console-text">{formatTime(selected.last_heartbeat_at)}</dd></div>
               </dl>
+              <p className={`mt-3 rounded-md px-3 py-2 text-sm ${selected.status === "online" ? "bg-emerald-50 text-emerald-800" : selected.status === "pending_enrollment" ? "bg-slate-50 text-console-muted" : "bg-amber-50 text-amber-800"}`}>{connectionSummary(selected, hasInstalledWorker)}</p>
               {selected.deployment_status === "failed" && selected.deployment_message ? <p className="mt-3 text-sm text-red-700">{selected.deployment_message}</p> : null}
               {selected.health_message ? <p className="mt-3 text-sm text-amber-700">{selected.health_message}</p> : null}
-              <div className="mt-4 flex flex-wrap items-center gap-3"><ConsoleButton disabled={!canManage || !deploymentEnabled || busy || selected.status === "disabled" || selected.deployment_status === "deploying"} onClick={() => void openDeployment()}><KeyRound className="h-4 w-4" />{hasInstalledWorker ? "修复 Worker" : "部署 Worker"}</ConsoleButton>{hasInstalledWorker ? <ConsoleButton className="border-red-200 text-red-700 hover:border-red-300 hover:bg-red-50" disabled={!canManage || !deploymentEnabled || busy || selected.deployment_status === "deploying"} onClick={openRemoval}><Trash2 className="h-4 w-4" />删除 Worker</ConsoleButton> : null}<span className="text-xs text-console-muted">系统自动创建低权限运行账号、安装系统服务并完成注册，不需要手工操作服务器。</span></div>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                {!hasInstalledWorker ? <ConsoleButton variant="primary" disabled={!canManage || !deploymentEnabled || busy || selected.status === "disabled" || selected.deployment_status === "deploying"} onClick={() => void openDeploymentFor(selected, "deploy")}><KeyRound className="h-4 w-4" />部署 Worker</ConsoleButton> : selected.status === "online" ? <ConsoleButton variant="primary" onClick={onViewResources}><Server className="h-4 w-4" />查看服务器资源</ConsoleButton> : selected.status !== "disabled" ? <ConsoleButton variant="primary" disabled={!canManage || !deploymentEnabled || busy || selected.deployment_status === "deploying"} onClick={() => void openDeploymentFor(selected, "repair")}><KeyRound className="h-4 w-4" />修复 Worker</ConsoleButton> : null}
+                {hasInstalledWorker ? <ConsoleButton aria-expanded={moreActionsOpen} aria-controls="training-node-more-actions" disabled={!canManage || busy} onClick={() => { setMoreActionsOpen((current) => !current); setDangerActionsOpen(false); }}><ChevronDown className={`h-4 w-4 transition-transform ${moreActionsOpen ? "rotate-180" : ""}`} />更多操作</ConsoleButton> : null}
+              </div>
+              {moreActionsOpen && hasInstalledWorker ? <section id="training-node-more-actions" aria-label="更多节点操作" className="mt-3 rounded-md border border-console-line bg-console-panel2 p-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div><p className="text-sm font-medium text-console-text">更换运行账号</p><p className="mt-1 text-xs leading-5 text-console-muted">改用另一个 SSH 账号重新部署。之后的 Worker 和训练任务都由新账号运行。</p></div>
+                  <ConsoleButton className="shrink-0" disabled={!deploymentEnabled || busy || selected.status === "disabled" || selected.deployment_status === "deploying"} onClick={() => void openDeploymentFor(selected, "change_account")}><KeyRound className="h-4 w-4" />更换Worker和训练所属账号</ConsoleButton>
+                </div>
+              </section> : null}
               {!deploymentEnabled ? <p className="mt-2 text-xs text-amber-700">{deploymentDisabledReason || "系统尚未配置可供训练节点访问的中心 HTTPS 地址，暂不能部署 Worker。"}</p> : null}
-              {deployingRef === selected.node_ref && hostKey ? <div className="mt-4 space-y-3 rounded-md border border-sky-200 bg-sky-50 p-4"><div><p className="text-sm font-medium text-sky-950">确认服务器身份</p><p className="mt-1 text-xs text-sky-800">请核对管理员提供的主机指纹，确认后先检查部署条件，再执行安装。</p><code className="mt-2 block break-all rounded bg-white p-2 text-xs text-sky-950">{hostKey.sha256_fingerprint}</code></div><label className="flex items-start gap-2 text-sm text-sky-950"><input className="mt-0.5" type="checkbox" checked={hostKeyConfirmed} disabled={busy} onChange={(event) => { setHostKeyConfirmed(event.target.checked); setPreflight(null); }} /><span>我已确认该主机指纹正确</span></label><PasswordField id="training-node-ssh-password" label="SSH 部署密码" value={sshPassword} visible={sshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={(value) => { setSshPassword(value); setPreflight(null); }} onToggle={() => setSshPasswordVisible((current) => !current)} /><label className="block text-sm text-console-muted">提权方式<select aria-label="Worker 部署提权方式" className={inputClass} value={sudoPasswordMode} disabled={busy} onChange={(event) => { setSudoPasswordMode(event.target.value as typeof sudoPasswordMode); setPreflight(null); }}><option value="same_as_ssh">SSH 密码同时用于 sudo</option><option value="not_required">root 或免密 sudo</option><option value="separate">使用不同的 sudo 密码</option></select></label>{sudoPasswordMode === "separate" ? <PasswordField id="training-node-sudo-password" label="sudo 部署密码" value={sudoPassword} visible={sudoPasswordVisible} disabled={busy} autoComplete="off" onChange={(value) => { setSudoPassword(value); setPreflight(null); }} onToggle={() => setSudoPasswordVisible((current) => !current)} /> : null}<p className="text-xs leading-5 text-sky-800">检查过程只读取系统、磁盘、GPU 工具和 root/sudo 能力，不修改训练节点。密码不保存。</p>{preflight ? <section aria-label="Worker 部署条件检查" className={`rounded-md border p-3 ${preflight.ready ? "border-emerald-200 bg-emerald-50" : "border-red-200 bg-red-50"}`}><div className="flex items-center justify-between gap-2"><p className="text-sm font-medium text-console-text">{preflight.ready ? "部署条件已满足" : "存在阻止部署的问题"}</p><span className="text-xs text-console-muted">{formatTime(preflight.checked_at)}</span></div><ul className="mt-2 grid gap-2 sm:grid-cols-2">{preflight.checks.map((check) => <li key={check.code} className="rounded bg-white/80 p-2 text-xs"><div className="flex items-center gap-2"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${check.status === "passed" ? "bg-emerald-500" : check.status === "warning" ? "bg-amber-500" : "bg-red-500"}`} /><span className="font-medium text-console-text">{check.label}</span></div><p className="mt-1 leading-5 text-console-muted">{check.detail}</p></li>)}</ul></section> : null}<div className="flex flex-wrap gap-2"><ConsoleButton disabled={busy || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void checkPreflight()}>检查部署条件</ConsoleButton><ConsoleButton variant="primary" disabled={busy || !preflight?.ready} onClick={() => void deploy()}>自动部署 Worker</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); }}>取消</ConsoleButton></div></div> : null}
+              {deployingRef === selected.node_ref && hostKey ? <div className="mt-4 space-y-3 rounded-md border border-sky-200 bg-sky-50 p-4">
+                <div>
+                  <p className="text-sm font-medium text-sky-950">{deploymentMode === "change_account" ? "更换 Worker 和训练所属账号" : deploymentMode === "repair" ? "修复 Worker" : "部署 Worker"}</p>
+                  <p className="mt-1 text-xs leading-5 text-sky-800">请将下方 SHA256 指纹与训练节点管理员提供的指纹逐字核对。确认一致后再继续。</p>
+                  <code className="mt-2 block break-all rounded bg-white p-2 text-xs text-sky-950">{hostKey.sha256_fingerprint}</code>
+                  <details className="mt-2 text-xs text-sky-900"><summary className="inline-flex cursor-pointer items-center gap-1 font-medium"><CircleHelp className="h-3.5 w-3.5" />如何确认主机指纹？</summary><p className="mt-1 max-w-2xl leading-5">向训练节点管理员索取该服务器的 SSH SHA256 指纹，并与上方内容逐字核对。无法确认时请不要继续部署。</p></details>
+                </div>
+                <label className="flex items-start gap-2 text-sm text-sky-950"><input className="mt-0.5" type="checkbox" checked={hostKeyConfirmed} disabled={busy} onChange={(event) => { setHostKeyConfirmed(event.target.checked); setPreflight(null); }} /><span>我已确认该主机指纹正确</span></label>
+                <label className="block text-sm text-console-muted">SSH 登录账号<input aria-label="SSH 登录账号" className={inputClass} autoComplete="username" value={sshUsername} disabled={busy || (deploymentMode === "repair" && Boolean(selected.ssh_username))} onChange={(event) => { setSshUsername(event.target.value); setPreflight(null); }} /><span className="mt-1 block text-xs leading-5">{deploymentMode === "repair" ? "修复会继续使用当前运行账号，不会更换账号。" : "部署成功后，Worker 和之后的训练任务都使用该账号运行。"}</span></label>
+                <PasswordField id="training-node-ssh-password" label="SSH 登录密码" value={sshPassword} visible={sshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={(value) => { setSshPassword(value); setPreflight(null); }} onToggle={() => setSshPasswordVisible((current) => !current)} />
+                {sudoPasswordMode === "separate" ? <div className="space-y-2"><PasswordField id="training-node-sudo-password" label="独立 sudo 密码" value={sudoPassword} visible={sudoPasswordVisible} disabled={busy} autoComplete="off" onChange={(value) => { setSudoPassword(value); setPreflight(null); }} onToggle={() => setSudoPasswordVisible((current) => !current)} /><button type="button" className="text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => { setSudoPasswordMode("same_as_ssh"); setSudoPassword(""); setPreflight(null); }}>改用 SSH 登录密码检查权限</button></div> : <button type="button" className="text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => { setSudoPasswordMode("separate"); setPreflight(null); }}>sudo 密码与登录密码不同？</button>}
+                <p className="text-xs leading-5 text-sky-800">系统会自动检查该账号是否为 root、是否具有免密 sudo，或登录密码能否用于 sudo。无需提前判断提权方式。检查过程不会修改训练节点，密码也不会保存。</p>
+                {privilegeCheck?.status === "failed" ? <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">部署账号权限不足。若该账号使用独立 sudo 密码，请填写后重新检查；否则请更换具有安装权限的 SSH 账号。</p> : null}
+                {preflight ? <section aria-label="Worker 部署条件检查" className={`rounded-md border p-3 ${preflight.ready ? "border-emerald-200 bg-emerald-50" : "border-red-200 bg-red-50"}`}><div className="flex items-center justify-between gap-2"><p className="text-sm font-medium text-console-text">{preflight.ready ? "部署条件已满足" : "存在阻止部署的问题"}</p><span className="text-xs text-console-muted">{formatTime(preflight.checked_at)}</span></div><ul className="mt-2 grid gap-2 sm:grid-cols-2">{preflight.checks.map((check) => <li key={check.code} className="rounded bg-white/80 p-2 text-xs"><div className="flex items-center gap-2"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${check.status === "passed" ? "bg-emerald-500" : check.status === "warning" ? "bg-amber-500" : "bg-red-500"}`} /><span className="font-medium text-console-text">{check.label}</span></div><p className="mt-1 leading-5 text-console-muted">{check.detail}</p></li>)}</ul></section> : null}
+                <div className="flex flex-wrap gap-2"><ConsoleButton disabled={busy || !sshUsername.trim() || !hostKeyConfirmed || !sshPassword || (sudoPasswordMode === "separate" && !sudoPassword)} onClick={() => void checkPreflight()}>检查部署条件</ConsoleButton><ConsoleButton variant="primary" disabled={busy || !preflight?.ready} onClick={() => void deploy()}>自动部署 Worker</ConsoleButton><ConsoleButton variant="ghost" disabled={busy} onClick={() => { setDeployingRef(null); setHostKey(null); setSshPassword(""); setSshPasswordVisible(false); setSudoPassword(""); setSudoPasswordVisible(false); setPreflight(null); }}>取消</ConsoleButton></div>
+              </div> : null}
               {message ? <p role="status" className="mt-3 text-sm text-console-muted">{message}</p> : null}
-            </ConsoleCard>
-
-          </> : null}
-        </div>
+              <details className="mt-5 border-t border-console-line pt-4" open={dangerActionsOpen} onToggle={(event) => setDangerActionsOpen(event.currentTarget.open)}>
+                <summary className="inline-flex cursor-pointer list-none items-center gap-2 text-sm font-medium text-red-700"><TriangleAlert className="h-4 w-4" />危险操作<ChevronDown className={`h-4 w-4 transition-transform ${dangerActionsOpen ? "rotate-180" : ""}`} /></summary>
+                <div className="mt-3 space-y-3 rounded-md border border-red-100 bg-red-50/50 p-3">
+                  {hasInstalledWorker ? <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm font-medium text-console-text">卸载 Worker，保留节点记录</p><p className="mt-1 text-xs text-console-muted">卸载后节点不可用于训练，以后仍可重新部署。</p></div><ConsoleButton className="shrink-0 border-red-200 text-red-700 hover:border-red-300 hover:bg-red-50" disabled={!canManage || !deploymentEnabled || busy || selected.deployment_status === "deploying"} onClick={() => openRemoval("worker")}><Trash2 className="h-4 w-4" />卸载 Worker（保留节点）</ConsoleButton></div> : null}
+                  <div className="flex flex-col gap-2 border-t border-red-100 pt-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm font-medium text-console-text">删除训练节点</p><p className="mt-1 text-xs text-console-muted">删除平台中的节点记录；已安装 Worker 时会先将其卸载。</p></div><ConsoleButton className="shrink-0 border-red-200 text-red-700 hover:border-red-300 hover:bg-red-50" disabled={!canManage || busy || selected.deployment_status === "deploying" || (hasInstalledWorker && !deploymentEnabled)} onClick={() => openRemoval("node")}><Trash2 className="h-4 w-4" />删除训练节点</ConsoleButton></div>
+                </div>
+              </details>
+              <details className="mt-4 border-t border-console-line pt-4 text-xs text-console-muted">
+                <summary className="cursor-pointer font-medium text-console-text">技术信息</summary>
+                <dl className="mt-3 grid gap-x-5 gap-y-3 sm:grid-cols-2"><div><dt>节点标识</dt><dd className="mt-1 break-all font-mono">{selected.node_ref}</dd></div><div><dt>协议版本</dt><dd className="mt-1 text-console-text">{selected.protocol_version ?? "--"}</dd></div><div><dt>首次接入</dt><dd className="mt-1 text-console-text">{formatTime(selected.enrolled_at)}</dd></div><div><dt>最近在线</dt><dd className="mt-1 text-console-text">{formatTime(selected.last_seen_at)}</dd></div></dl>
+              </details>
+          </ConsoleCard>
+        </div> : null}
       </div>
       <Dialog open={removalOpen} onOpenChange={(open) => { if (!busy) { setRemovalOpen(open); if (!open) resetRemoval(); } }}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>删除 {selected?.name} 的 Worker</DialogTitle>
-            <DialogDescription>需要再次通过临时 SSH 连接卸载系统服务。密码仅用于本次请求，不会保存。</DialogDescription>
+            <DialogTitle>{removalPurpose === "node" ? `删除训练节点 ${selected?.name}` : `卸载 ${selected?.name} 的 Worker`}</DialogTitle>
+            <DialogDescription>该节点已安装 Worker，需要通过一次临时 SSH 连接卸载服务。登录凭据仅用于本次操作，不会保存。</DialogDescription>
           </DialogHeader>
-          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900"><div className="flex items-start gap-2"><TriangleAlert className="mt-1 h-4 w-4 shrink-0" /><p>删除后，该节点会变为“待部署 Worker”，在重新部署前不可用于训练。操作只删除 DataPilot Worker 服务、专用账号和自身文件，不删除模型工程、数据集或训练产物。</p></div></div>
-          <PasswordField id="training-node-removal-ssh-password" label="SSH 部署密码" value={removalSshPassword} visible={removalSshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={setRemovalSshPassword} onToggle={() => setRemovalSshPasswordVisible((current) => !current)} />
-          <label className="block text-sm text-console-muted">提权方式<select aria-label="Worker 删除提权方式" className={inputClass} value={removalSudoPasswordMode} disabled={busy} onChange={(event) => setRemovalSudoPasswordMode(event.target.value as typeof removalSudoPasswordMode)}><option value="same_as_ssh">SSH 密码同时用于 sudo</option><option value="not_required">root 或免密 sudo</option><option value="separate">使用不同的 sudo 密码</option></select></label>
-          {removalSudoPasswordMode === "separate" ? <PasswordField id="training-node-removal-sudo-password" label="sudo 部署密码" value={removalSudoPassword} visible={removalSudoPasswordVisible} disabled={busy} autoComplete="off" onChange={setRemovalSudoPassword} onToggle={() => setRemovalSudoPasswordVisible((current) => !current)} /> : null}
-          <DialogFooter><DialogClose asChild><ConsoleButton disabled={busy}>取消</ConsoleButton></DialogClose><ConsoleButton className="border-red-600 bg-red-600 text-white hover:border-red-700 hover:bg-red-700" disabled={busy || !removalSshPassword || (removalSudoPasswordMode === "separate" && !removalSudoPassword)} onClick={() => setRemovalConfirmOpen(true)}>确认删除</ConsoleButton></DialogFooter>
+          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-900"><div className="flex items-start gap-2"><TriangleAlert className="mt-1 h-4 w-4 shrink-0" /><p>{removalPurpose === "node" ? "系统会先卸载 DataPilot Worker，再删除中心服务中的节点记录。SSH 账号、模型工程、数据集和训练产物不会被删除。" : "系统只卸载 DataPilot Worker 服务和自身文件，并保留节点记录。重新部署 Worker 前，该节点不能用于训练。"}</p></div></div>
+          <label className="block text-sm text-console-muted">SSH 登录账号<input aria-label="删除操作 SSH 登录账号" className={inputClass} autoComplete="username" value={removalSshUsername} disabled={busy} onChange={(event) => setRemovalSshUsername(event.target.value)} /></label>
+          <PasswordField id="training-node-removal-ssh-password" label="SSH 登录密码" value={removalSshPassword} visible={removalSshPasswordVisible} disabled={busy} autoComplete="current-password" onChange={setRemovalSshPassword} onToggle={() => setRemovalSshPasswordVisible((current) => !current)} />
+          {removalSudoPasswordMode === "separate" ? <div className="space-y-2"><PasswordField id="training-node-removal-sudo-password" label="独立 sudo 密码" value={removalSudoPassword} visible={removalSudoPasswordVisible} disabled={busy} autoComplete="off" onChange={setRemovalSudoPassword} onToggle={() => setRemovalSudoPasswordVisible((current) => !current)} /><button type="button" className="text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => { setRemovalSudoPasswordMode("same_as_ssh"); setRemovalSudoPassword(""); }}>改用 SSH 登录密码检查权限</button></div> : <button type="button" className="text-left text-xs font-medium text-console-cyan hover:underline" disabled={busy} onClick={() => setRemovalSudoPasswordMode("separate")}>sudo 密码与登录密码不同？</button>}
+          <p className="text-xs leading-5 text-console-muted">系统会自动检查 root、免密 sudo 或登录密码可用的 sudo 权限，无需提前选择提权方式。</p>
+          <DialogFooter><DialogClose asChild><ConsoleButton disabled={busy}>取消</ConsoleButton></DialogClose><ConsoleButton className="border-red-600 bg-red-600 text-white hover:border-red-700 hover:bg-red-700" disabled={busy || !removalSshUsername.trim() || !removalSshPassword || (removalSudoPasswordMode === "separate" && !removalSudoPassword)} onClick={() => setRemovalConfirmOpen(true)}>{removalPurpose === "node" ? "继续删除" : "继续卸载"}</ConsoleButton></DialogFooter>
         </DialogContent>
       </Dialog>
       <AlertDialog open={removalConfirmOpen} onOpenChange={(open) => !busy && setRemovalConfirmOpen(open)}>
         <AlertDialogContent>
-          <AlertDialogHeader><AlertDialogTitle>再次确认删除 Worker</AlertDialogTitle><AlertDialogDescription>删除后节点将立即撤销 Worker 凭据并退出可训练状态。以后仍可在此节点上重新部署 Worker。</AlertDialogDescription></AlertDialogHeader>
-          <AlertDialogFooter><AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={busy} onClick={(event) => { event.preventDefault(); void removeWorker(); }}>再次确认并删除</AlertDialogAction></AlertDialogFooter>
+          <AlertDialogHeader><AlertDialogTitle>{removalPurpose === "node" ? "再次确认删除训练节点" : "再次确认卸载 Worker"}</AlertDialogTitle><AlertDialogDescription>{removalPurpose === "node" ? "删除后，该节点不会再出现在平台中，也不能用于创建训练。模型工程、数据集、训练产物和 SSH 登录账号不会被删除。" : "卸载后，节点记录仍会保留，但在重新部署 Worker 前不能用于训练。"}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={busy} onClick={(event) => { event.preventDefault(); void completeRemoval(); }}>{removalPurpose === "node" ? "确认删除训练节点" : "确认卸载 Worker"}</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </section>

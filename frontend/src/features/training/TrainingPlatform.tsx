@@ -812,7 +812,7 @@ export function TrainingPlatform() {
         <ModelsPanel models={models} servers={servers} canManage={can(capabilities, "training:manage_models")} onSaved={(model) => setModels((current) => [model, ...current.filter((item) => item.family_ref !== model.family_ref)])} />
       </div>
       <div id="training-platform-panel-nodes" role="tabpanel" aria-labelledby="training-platform-tab-nodes" hidden={tab !== "nodes"}>
-        <TrainingNodesPanel nodes={nodes} canManage={can(capabilities, "training:manage_nodes")} deploymentEnabled={capabilities?.node_deployment_enabled ?? false} deploymentDisabledReason={capabilities?.node_deployment_disabled_reason} onChanged={(node) => setNodes((current) => [node, ...current.filter((item) => item.node_ref !== node.node_ref)])} />
+        <TrainingNodesPanel nodes={nodes} canManage={can(capabilities, "training:manage_nodes")} deploymentEnabled={capabilities?.node_deployment_enabled ?? false} deploymentDisabledReason={capabilities?.node_deployment_disabled_reason} onChanged={(node) => setNodes((current) => [node, ...current.filter((item) => item.node_ref !== node.node_ref)])} onDeleted={(nodeRef) => setNodes((current) => current.filter((item) => item.node_ref !== nodeRef))} onViewResources={() => changeTab("resources")} />
       </div>
       <div id="training-platform-panel-resources" role="tabpanel" aria-labelledby="training-platform-tab-resources" hidden={tab !== "resources"}>
         <ResourcesPanel servers={servers} resourcesByServer={resourcesByServer} resourceErrors={resourceErrors} onRefresh={() => void load()} />

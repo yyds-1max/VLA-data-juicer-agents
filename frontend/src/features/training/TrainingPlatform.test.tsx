@@ -17,7 +17,7 @@ vi.mock("../../api/client", () => ({
   },
   getTrainingCapabilities: vi.fn(), listTrainingModels: vi.fn(), listTrainingServers: vi.fn(),
   getTrainingServerResources: vi.fn(), listTrainingNodes: vi.fn(), getTrainingNodeResources: vi.fn(), listTrainingRuns: vi.fn(), createTrainingModel: vi.fn(),
-  createTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), preflightTrainingNodeWorker: vi.fn(), deployTrainingNodeWorker: vi.fn(), removeTrainingNodeWorker: vi.fn(),
+  createTrainingNode: vi.fn(), deleteTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), preflightTrainingNodeWorker: vi.fn(), deployTrainingNodeWorker: vi.fn(), removeTrainingNodeWorker: vi.fn(),
   updateTrainingModel: vi.fn(), verifyTrainingModel: vi.fn(),
   previewTrainingRun: vi.fn(), createTrainingRun: vi.fn(), getTrainingRun: vi.fn(),
   getTrainingRunLogs: vi.fn(), getTrainingRunMetrics: vi.fn(), stopTrainingRun: vi.fn(),
@@ -39,7 +39,7 @@ const runSpec = { contract_version: 1 as const, execution_mode: "simulation" as 
 const runningStage = { stage_ref: "stage-1", stage_number: 1, stage_name: "第一阶段", stage_input_source: "manual" as const, status: "running" as const, progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, parameters: { num_video_frames: 8, learning_rate: 0.0001 }, run_spec: runSpec, output_directory: "/workspace/outputs/navila-family/v1-20260806/stage-01" };
 const runningRun: TrainingRun = { run_ref: "run-running", family_ref: "navila-family", family_name: "NaVILA", version_ref: "version-1", version_number: 1, version_date: "20260806", version_label: "v1-20260806", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, stage_count: 1, current_stage_number: 1, stages: [runningStage], created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", version_ref: "version-2", version_number: 2, version_label: "v2-20260806", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20, stages: [{ ...runningStage, status: "succeeded", progress_percent: 100, current_step: 20 }] };
-const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer", status: "pending_enrollment", state_revision: 1, heartbeat_revision: 0, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
+const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: null, status: "pending_enrollment", state_revision: 1, heartbeat_revision: 0, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
 
 class TestResizeObserver {
   observe() {}
@@ -76,44 +76,72 @@ describe("TrainingPlatform", () => {
 
   it("registers a node then automatically deploys a Worker with one-time SSH credentials", async () => {
     mockApi(adminCapabilities);
-    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([]);
     vi.mocked(trainingApi.createTrainingNode).mockResolvedValue(pendingNode);
     const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
     vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
-    vi.mocked(trainingApi.preflightTrainingNodeWorker).mockResolvedValue({ ready: true, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "passed", detail: "已验证 sudo 权限。" }] });
+    vi.mocked(trainingApi.preflightTrainingNodeWorker).mockResolvedValue({ ready: true, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "runtime_identity", label: "Worker 与训练运行身份", status: "passed", detail: "将以 SSH 登录账号 trainer 运行 Worker 和训练任务。" }, { code: "deployment_privilege", label: "部署账号权限", status: "passed", detail: "已验证 sudo 权限。" }] });
     vi.mocked(trainingApi.deployTrainingNodeWorker).mockResolvedValue({ node: { ...pendingNode, state_revision: 2, deployment_status: "succeeded", installed_worker_version: "0.1.0" }, deployment: { status: "succeeded", worker_version: "0.1.0", message: "Worker deployed." } });
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
     fireEvent.change(screen.getByLabelText("节点名称"), { target: { value: "测试训练节点" } });
-    fireEvent.change(screen.getByLabelText("SSH 用户名"), { target: { value: "trainer" } });
     fireEvent.change(screen.getByLabelText("主机地址"), { target: { value: "10.0.0.12" } });
     fireEvent.change(screen.getByLabelText("SSH 端口"), { target: { value: "2222" } });
-    fireEvent.click(screen.getByRole("button", { name: "登记节点" }));
+    expect(screen.queryByLabelText("SSH 登录账号")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "登记并部署 Worker" }));
     expect((await screen.findAllByText("待部署 Worker"))[0]).toBeVisible();
-    expect(trainingApi.createTrainingNode).toHaveBeenCalledWith(expect.objectContaining({ address: "10.0.0.12", ssh_port: 2222, ssh_username: "trainer" }));
-    expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
+    expect(trainingApi.createTrainingNode).toHaveBeenCalledWith({ name: "测试训练节点", address: "10.0.0.12", ssh_port: 2222, description: undefined });
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
-    const sshPasswordInput = screen.getByLabelText("SSH 部署密码");
+    fireEvent.change(screen.getByLabelText("SSH 登录账号"), { target: { value: "trainer" } });
+    const sshPasswordInput = screen.getByLabelText("SSH 登录密码");
     expect(sshPasswordInput).toHaveAttribute("type", "password");
-    fireEvent.click(screen.getByRole("button", { name: "显示 SSH 部署密码" }));
+    fireEvent.click(screen.getByRole("button", { name: "显示 SSH 登录密码" }));
     expect(sshPasswordInput).toHaveAttribute("type", "text");
     fireEvent.click(document.body);
     fireEvent.focus(sshPasswordInput);
-    expect(screen.getByRole("button", { name: "隐藏 SSH 部署密码" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "隐藏 SSH 部署密码" }));
+    expect(screen.getByRole("button", { name: "隐藏 SSH 登录密码" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "隐藏 SSH 登录密码" }));
     expect(sshPasswordInput).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
-    fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-password" } });
+    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
+    expect(screen.queryByLabelText("Worker 部署提权方式")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
     expect(await screen.findByText("部署条件已满足")).toBeVisible();
+    expect(screen.getByText("将以 SSH 登录账号 trainer 运行 Worker 和训练任务。")).toBeVisible();
     expect(screen.getByText("已验证 sudo 权限。")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
-    await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
+    await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, ssh_username: "trainer", confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
     expect(await screen.findByText("Worker 已自动部署并完成注册，正在等待稳定心跳。")).toBeVisible();
-    expect(screen.queryByLabelText("SSH 部署密码")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("SSH 登录密码")).not.toBeInTheDocument();
   }, 20_000);
+
+  it("keeps low-frequency registration collapsed after nodes already exist", async () => {
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    expect(screen.queryByLabelText("节点名称")).not.toBeInTheDocument();
+    expect(screen.queryByText(/最近一次成功部署的 SSH 账号/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "登记新节点" }));
+    expect(screen.getByLabelText("节点名称")).toBeVisible();
+    expect(screen.getByRole("button", { name: "取消" })).toBeVisible();
+  });
+
+  it("uses node status to present one recommended primary action", async () => {
+    const onlineNode: TrainingNode = { ...pendingNode, ssh_username: "trainer", status: "online", deployment_status: "succeeded", installed_worker_version: "0.1.0", worker_version: "0.1.0", enrolled_at: "2026-08-12T00:00:00Z" };
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([onlineNode]);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    expect(screen.getByText("Worker 已连接中心服务，节点可以用于创建训练。")).toBeVisible();
+    expect(screen.getByRole("button", { name: "查看服务器资源" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "修复 Worker" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看服务器资源" }));
+    expect(screen.getByRole("tab", { name: "服务器资源" })).toHaveAttribute("aria-selected", "true");
+  });
 
   it("shows available memory percentage and reported disk capacity for a real node", async () => {
     const gib = 1024 ** 3;
@@ -167,6 +195,7 @@ describe("TrainingPlatform", () => {
   it("requires two confirmations and temporary SSH credentials before removing a Worker", async () => {
     const installedNode: TrainingNode = {
       ...pendingNode,
+      ssh_username: "trainer",
       status: "online",
       state_revision: 7,
       deployment_status: "succeeded",
@@ -193,23 +222,62 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
 
-    fireEvent.click(await screen.findByRole("button", { name: "删除 Worker" }));
-    expect(await screen.findByRole("heading", { name: "删除 测试训练节点 的 Worker" })).toBeVisible();
-    expect(screen.getByText(/不删除模型工程、数据集或训练产物/)).toBeVisible();
-    fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-removal-password" } });
-    fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+    fireEvent.click(screen.getByText("危险操作"));
+    fireEvent.click(await screen.findByRole("button", { name: "卸载 Worker（保留节点）" }));
+    expect(await screen.findByRole("heading", { name: "卸载 测试训练节点 的 Worker" })).toBeVisible();
+    expect(screen.getByText(/系统只卸载 DataPilot Worker 服务和自身文件/)).toBeVisible();
+    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-removal-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "继续卸载" }));
 
-    expect(await screen.findByRole("heading", { name: "再次确认删除 Worker" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "再次确认卸载 Worker" })).toBeVisible();
     expect(trainingApi.removeTrainingNodeWorker).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "再次确认并删除" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认卸载 Worker" }));
     await waitFor(() => expect(trainingApi.removeTrainingNodeWorker).toHaveBeenCalledWith("node-test", {
       expected_revision: 7,
+      ssh_username: "trainer",
       ssh_password: "one-time-removal-password",
       sudo_password_mode: "same_as_ssh",
     }));
-    expect(await screen.findByText(/重新部署 Worker 前不可用于训练/)).toBeVisible();
+    expect(await screen.findByText(/重新部署 Worker 前不能用于训练/)).toBeVisible();
     expect(screen.getByRole("button", { name: "部署 Worker" })).toBeVisible();
-    expect(screen.queryByRole("button", { name: "删除 Worker" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "卸载 Worker（保留节点）" })).not.toBeInTheDocument();
+  });
+
+  it("separates Worker repair from changing the Worker and training account", async () => {
+    const installedNode: TrainingNode = { ...pendingNode, ssh_username: "trainer", status: "offline", deployment_status: "succeeded", installed_worker_version: "0.1.0", enrolled_at: "2026-08-12T00:00:00Z" };
+    const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([installedNode]);
+    vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    expect(screen.getByRole("button", { name: "修复 Worker" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
+    fireEvent.click(screen.getByRole("button", { name: "更换Worker和训练所属账号" }));
+    expect(await screen.findByText("更换 Worker 和训练所属账号")).toBeVisible();
+    const username = screen.getByLabelText("SSH 登录账号");
+    expect(username).toHaveValue("trainer");
+    expect(username).not.toBeDisabled();
+    fireEvent.change(username, { target: { value: "root" } });
+    expect(username).toHaveValue("root");
+  });
+
+  it("deletes a never-deployed training node after confirmation without asking for SSH credentials", async () => {
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
+    vi.mocked(trainingApi.deleteTrainingNode).mockResolvedValue(undefined);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    fireEvent.click(screen.getByText("危险操作"));
+    fireEvent.click(screen.getByRole("button", { name: "删除训练节点" }));
+    expect(await screen.findByRole("heading", { name: "再次确认删除训练节点" })).toBeVisible();
+    expect(screen.queryByLabelText("删除操作 SSH 登录账号")).not.toBeInTheDocument();
+    expect(trainingApi.deleteTrainingNode).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "确认删除训练节点" }));
+    await waitFor(() => expect(trainingApi.deleteTrainingNode).toHaveBeenCalledWith("node-test", 1));
+    expect(await screen.findByText("尚未登记训练节点。")).toBeVisible();
   });
 
   it("clearly reports an insufficient deployment account without suggesting manual setup", async () => {
@@ -217,20 +285,29 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
     const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
     vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
-    vi.mocked(trainingApi.preflightTrainingNodeWorker).mockResolvedValue({ ready: false, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "failed", detail: "部署账号权限不足" }] });
+    vi.mocked(trainingApi.preflightTrainingNodeWorker)
+      .mockResolvedValueOnce({ ready: false, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "failed", detail: "部署账号权限不足" }] })
+      .mockResolvedValueOnce({ ready: true, checked_at: "2026-08-13T08:01:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "passed", detail: "独立 sudo 密码有效。" }] });
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
     fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
     await screen.findByText(hostKey.sha256_fingerprint);
+    fireEvent.change(screen.getByLabelText("SSH 登录账号"), { target: { value: "trainer" } });
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
-    fireEvent.change(screen.getByLabelText("SSH 部署密码"), { target: { value: "one-time-password" } });
+    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
     fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
 
     expect(await screen.findByText("存在阻止部署的问题")).toBeVisible();
-    expect(screen.getByText("部署账号权限不足")).toBeVisible();
+    expect(screen.getAllByText(/部署账号权限不足/).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeDisabled();
     expect(trainingApi.deployTrainingNodeWorker).not.toHaveBeenCalled();
     expect(screen.queryByText(/手工创建账号/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "sudo 密码与登录密码不同？" }));
+    fireEvent.change(screen.getByLabelText("独立 sudo 密码"), { target: { value: "separate-sudo-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
+    await waitFor(() => expect(trainingApi.preflightTrainingNodeWorker).toHaveBeenLastCalledWith("node-test", expect.objectContaining({ sudo_password_mode: "separate", sudo_password: "separate-sudo-password" })));
+    expect(await screen.findByText("部署条件已满足")).toBeVisible();
   });
 
   it("surfaces a registered dataset parameter separately from hyperparameters", async () => {

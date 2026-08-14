@@ -42,7 +42,6 @@ def _register_online_node(client: TestClient) -> tuple[dict[str, object], str]:
             "name": "NaVILA node",
             "address": "192.0.2.20",
             "ssh_port": 22,
-            "ssh_username": "trainer",
         },
     ).json()["node"]
     token = client.post(
@@ -190,7 +189,6 @@ def test_verification_requires_online_real_worker_and_worker_authentication(tmp_
             "name": "Pending node",
             "address": "192.0.2.21",
             "ssh_port": 22,
-            "ssh_username": "trainer",
         },
     ).json()["node"]
     pending_model = admin.post(

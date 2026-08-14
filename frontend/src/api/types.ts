@@ -474,7 +474,8 @@ export interface TrainingNode {
   description?: string | null;
   address?: string;
   ssh_port?: number;
-  ssh_username?: string;
+  /** Last SSH account that successfully deployed this node's Worker. */
+  ssh_username?: string | null;
   host_key_algorithm?: string | null;
   host_public_key?: string | null;
   host_key_fingerprint?: string | null;

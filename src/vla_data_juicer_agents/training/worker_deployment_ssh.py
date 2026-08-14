@@ -33,12 +33,12 @@ from .worker_deployment import (
     PASSWORDLESS_SUDO_PROBE_ARGV,
     PASSWORD_SUDO_PROBE_ARGV,
     ROOT_IDENTITY_PROBE_ARGV,
-    ServiceAccountSpec,
+    RuntimeIdentity,
     SudoPasswordMode,
     TrainingNodeDeploymentError,
-    WORKER_ACCOUNT,
     WORKER_CONFIG_ROOT,
-    WORKER_GROUP,
+    LEGACY_WORKER_ACCOUNT,
+    LEGACY_WORKER_GROUP,
     WORKER_OPT_ROOT,
     WORKER_STATE_ROOT,
     WORKER_SYSTEMD_UNIT_NAME,
@@ -60,7 +60,6 @@ class _FixedArgvSshSession(SshSession, Protocol):
 
 
 class _Operation(StrEnum):
-    ENSURE_ACCOUNT = "ensure_account"
     ENSURE_DIRECTORY = "ensure_directory"
     INSTALL_RELEASE = "install_release"
     WRITE_FILE = "write_file"
@@ -70,6 +69,45 @@ class _Operation(StrEnum):
     START_SERVICE = "start_service"
     IS_ACTIVE = "is_active"
     REMOVE_WORKER = "remove_worker"
+    REMOVE_LEGACY_ACCOUNT = "remove_legacy_account"
+
+
+_RUNTIME_IDENTITY_SOURCE = r'''import grp
+import json
+import os
+import pathlib
+import pwd
+import shutil
+
+account = pwd.getpwuid(os.getuid())
+group = grp.getgrgid(account.pw_gid)
+home = pathlib.Path(account.pw_dir)
+candidates = [
+    os.environ.get("CONDA_EXE"),
+    shutil.which("conda"),
+    *(str(home / name / "bin" / "conda") for name in (
+        "miniconda3", "anaconda3", "miniforge3", "mambaforge"
+    )),
+    "/opt/conda/bin/conda",
+]
+conda = None
+for raw_candidate in candidates:
+    if not raw_candidate:
+        continue
+    candidate = pathlib.Path(raw_candidate).expanduser()
+    if candidate.is_absolute() and candidate.is_file() and os.access(candidate, os.X_OK):
+        conda = str(candidate.resolve())
+        break
+print(json.dumps({
+    "username": account.pw_name,
+    "primary_group": group.gr_name,
+    "uid": account.pw_uid,
+    "home_directory": account.pw_dir,
+    "conda_executable": conda,
+}, separators=(",", ":")))
+'''
+
+_RUNTIME_IDENTITY_ARGV = ("/usr/bin/python3", "-c", _RUNTIME_IDENTITY_SOURCE)
 
 
 _REMOTE_INSTALLER = r'''import grp
@@ -128,35 +166,38 @@ def atomic_file(path, content, owner, group, mode):
             pass
     return True
 
-if operation == "ensure_account":
-    username = arguments["username"]
-    group = arguments["group"]
+def remove_legacy_account(account_name, group_name, expected_home):
     changed = False
     try:
-        group_record = grp.getgrnam(group)
+        account = pwd.getpwnam(account_name)
     except KeyError:
-        subprocess.run(["/usr/sbin/groupadd", "--system", group], check=True)
-        group_record = grp.getgrnam(group)
-        changed = True
+        account = None
+    if account is not None:
+        expected_shell = account.pw_shell.endswith(("/nologin", "/false"))
+        if account.pw_dir != expected_home or not expected_shell:
+            return False
+        completed = subprocess.run(
+            ["/usr/sbin/userdel", account_name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        changed = completed.returncode == 0
+        if not changed:
+            return False
     try:
-        account = pwd.getpwnam(username)
+        group = grp.getgrnam(group_name)
     except KeyError:
-        subprocess.run([
-            "/usr/sbin/useradd", "--system", "--gid", group,
-            "--home-dir", arguments["home_directory"], "--no-create-home",
-            "--shell", arguments["login_shell"], username,
-        ], check=True)
-        account = pwd.getpwnam(username)
-        changed = True
-    if account.pw_gid != group_record.gr_gid or account.pw_dir != arguments["home_directory"]:
-        raise RuntimeError("existing worker account has incompatible ownership or home")
-    if account.pw_shell != arguments["login_shell"]:
-        subprocess.run([
-            "/usr/sbin/usermod", "--shell", arguments["login_shell"], username,
-        ], check=True)
-        changed = True
-    output(changed)
-elif operation == "ensure_directory":
+        group = None
+    if group is not None:
+        primary_users = [entry for entry in pwd.getpwall() if entry.pw_gid == group.gr_gid]
+        if not group.gr_mem and not primary_users:
+            completed = subprocess.run(
+                ["/usr/sbin/groupdel", group_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            changed = completed.returncode == 0 or changed
+    return changed
+
+if operation == "ensure_directory":
     path = pathlib.Path(arguments["path"])
     if path.is_symlink():
         raise RuntimeError("managed directory is a symbolic link")
@@ -165,6 +206,15 @@ elif operation == "ensure_directory":
     changed = ensure_metadata(
         path, arguments["owner"], arguments["group"], arguments["mode"]
     ) or changed
+    if arguments.get("recursive_ownership"):
+        uid, gid = owner_ids(arguments["owner"], arguments["group"])
+        for child in path.rglob("*"):
+            if child.is_symlink():
+                continue
+            current = child.stat()
+            if current.st_uid != uid or current.st_gid != gid:
+                os.chown(child, uid, gid, follow_symlinks=False)
+                changed = True
     output(changed)
 elif operation == "install_release":
     content = sys.stdin.buffer.read()
@@ -281,30 +331,17 @@ elif operation == "remove_worker":
         elif path.is_dir():
             shutil.rmtree(path)
             changed = True
-    account = arguments["account"]
-    group = arguments["group"]
-    try:
-        pwd.getpwnam(account)
-    except KeyError:
-        pass
-    else:
-        if subprocess.run(
-            ["/usr/sbin/userdel", account], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0:
-            changed = True
-    try:
-        grp.getgrnam(group)
-    except KeyError:
-        pass
-    else:
-        if subprocess.run(
-            ["/usr/sbin/groupdel", group], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0:
-            changed = True
+    changed = remove_legacy_account(
+        arguments["legacy_account"], arguments["legacy_group"],
+        arguments["legacy_home"],
+    ) or changed
     subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
     output(changed)
+elif operation == "remove_legacy_account":
+    output(remove_legacy_account(
+        arguments["legacy_account"], arguments["legacy_group"],
+        arguments["legacy_home"],
+    ))
 else:
     raise RuntimeError("unsupported deployment operation")
 '''
@@ -431,6 +468,29 @@ class OpenSshWorkerDeploymentBackend:
         self._ssh_password = None
         self._effective_sudo_password = None
 
+    def inspect_runtime_identity(self) -> RuntimeIdentity:
+        result = self._session.run_fixed_argv(
+            _RUNTIME_IDENTITY_ARGV,
+            stdin_payload=b"",
+            timeout_seconds=10,
+            operation_name="runtime_identity_probe",
+        )
+        if result.return_code != 0:
+            raise RuntimeError("fixed runtime identity probe failed")
+        try:
+            value = json.loads(result.stdout.decode("utf-8"))
+            identity = RuntimeIdentity(
+                username=value["username"],
+                primary_group=value["primary_group"],
+                uid=value["uid"],
+                home_directory=value["home_directory"],
+                conda_executable=value.get("conda_executable"),
+            )
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise RuntimeError("fixed runtime identity response is invalid") from None
+        identity.validate()
+        return identity
+
     def inspect_privilege(
         self,
         *,
@@ -473,23 +533,6 @@ class OpenSshWorkerDeploymentBackend:
         )
         return FixedCommandResult(result.return_code, result.stdout)
 
-    def ensure_service_account(
-        self,
-        spec: ServiceAccountSpec,
-        *,
-        privilege: DeploymentPrivilege,
-    ) -> bool:
-        return self._operation(
-            _Operation.ENSURE_ACCOUNT,
-            {
-                "username": spec.username,
-                "group": spec.group,
-                "home_directory": spec.home_directory,
-                "login_shell": spec.login_shell,
-            },
-            privilege=privilege,
-        )
-
     def ensure_directory(
         self,
         spec: DirectorySpec,
@@ -503,6 +546,7 @@ class OpenSshWorkerDeploymentBackend:
                 "owner": spec.owner,
                 "group": spec.group,
                 "mode": spec.mode,
+                "recursive_ownership": spec.recursive_ownership,
             },
             privilege=privilege,
         )
@@ -640,8 +684,24 @@ class OpenSshWorkerDeploymentBackend:
                     WORKER_STATE_ROOT,
                     WORKER_OPT_ROOT,
                 ],
-                "account": WORKER_ACCOUNT,
-                "group": WORKER_GROUP,
+                "legacy_account": LEGACY_WORKER_ACCOUNT,
+                "legacy_group": LEGACY_WORKER_GROUP,
+                "legacy_home": WORKER_STATE_ROOT,
+            },
+            privilege=privilege,
+        )
+
+    def remove_legacy_service_account(
+        self,
+        *,
+        privilege: DeploymentPrivilege,
+    ) -> bool:
+        return self._operation(
+            _Operation.REMOVE_LEGACY_ACCOUNT,
+            {
+                "legacy_account": LEGACY_WORKER_ACCOUNT,
+                "legacy_group": LEGACY_WORKER_GROUP,
+                "legacy_home": WORKER_STATE_ROOT,
             },
             privilege=privilege,
         )

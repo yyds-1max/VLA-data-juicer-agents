@@ -32,6 +32,7 @@ import { App } from "./App";
 
 vi.mock("../api/client", () => ({
   createTrainingNode: vi.fn(),
+  deleteTrainingNode: vi.fn(),
   createTrainingNodeEnrollmentToken: vi.fn(),
   createSession: vi.fn(),
   createNavigationDatasetRelease: vi.fn(),

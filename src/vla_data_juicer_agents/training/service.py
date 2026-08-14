@@ -163,7 +163,10 @@ class TrainingService:
                 principal.subject,
             )
             deployment = self.node_deployment_manager.deploy_worker(
-                node=token_result["node"],
+                node={
+                    **token_result["node"],
+                    "ssh_username": payload.ssh_username,
+                },
                 confirmed_host_key=confirmed,
                 ssh_password=ssh_password,
                 sudo_password_mode=payload.sudo_password_mode,
@@ -193,6 +196,7 @@ class TrainingService:
             message=deployment.get("message", "Training Worker deployed."),
             worker_version=worker_version,
             actor=principal.subject,
+            ssh_username=payload.ssh_username,
         )
         return {
             "node": node,
@@ -212,7 +216,10 @@ class TrainingService:
                 "training_node_deployment_unavailable",
                 "Training Worker deployment is not configured on this server.",
             )
-        node = self.store.get_node(node_ref)
+        node = {
+            **self.store.get_node(node_ref),
+            "ssh_username": payload.ssh_username,
+        }
         expected_revision = int(payload.expected_revision)
         if int(node["state_revision"]) != expected_revision:
             raise TrainingConflictError(
@@ -256,7 +263,7 @@ class TrainingService:
         )
         try:
             removal = self.node_deployment_manager.remove_worker(
-                node=removing,
+                node={**removing, "ssh_username": payload.ssh_username},
                 ssh_password=ssh_password,
                 sudo_password_mode=payload.sudo_password_mode,
                 sudo_password=sudo_password,

@@ -166,11 +166,6 @@ class CreateTrainingNodeRequest(StrictRequest):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,253}$",
     )
     ssh_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 22
-    ssh_username: str = Field(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
-    )
 
     @field_validator("name")
     @classmethod
@@ -205,12 +200,6 @@ class UpdateTrainingNodeRequest(StrictRequest):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,253}$",
     )
     ssh_port: Annotated[int, Field(strict=True, ge=1, le=65535)] | None = None
-    ssh_username: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=64,
-        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
-    )
     desired_state: Literal["offline", "repair_required", "disabled"] | None = None
 
     @field_validator("name")
@@ -243,7 +232,6 @@ class UpdateTrainingNodeRequest(StrictRequest):
                 "description",
                 "address",
                 "ssh_port",
-                "ssh_username",
                 "desired_state",
             )
         ):
@@ -276,6 +264,11 @@ class ConfirmedHostKey(StrictRequest):
 
 class DeployTrainingNodeWorkerRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    ssh_username: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
+    )
     confirmed_host_key: ConfirmedHostKey
     host_key_confirmed: Literal[True]
     ssh_password: SecretStr
@@ -310,6 +303,11 @@ class DeployTrainingNodeWorkerRequest(StrictRequest):
 
 class RemoveTrainingNodeWorkerRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
+    ssh_username: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$",
+    )
     ssh_password: SecretStr
     sudo_password_mode: Literal["same_as_ssh", "separate", "not_required"] = (
         "same_as_ssh"

@@ -113,7 +113,7 @@ class TrainingStore:
             "description": row["description"],
             "address": row["address"],
             "ssh_port": row["ssh_port"],
-            "ssh_username": row["ssh_username"],
+            "ssh_username": row["ssh_username"] or None,
             "host_key_algorithm": row["host_key_algorithm"],
             "host_public_key": row["host_public_key"],
             "host_key_fingerprint": row["host_key_fingerprint"],
@@ -154,7 +154,7 @@ class TrainingStore:
                     data.get("description") or "",
                     data["address"],
                     data.get("ssh_port", 22),
-                    data["ssh_username"],
+                    data.get("ssh_username") or "",
                     timestamp,
                     timestamp,
                 ),
@@ -426,6 +426,7 @@ class TrainingStore:
         message: str,
         worker_version: str | None,
         actor: str,
+        ssh_username: str | None = None,
     ) -> dict[str, Any]:
         timestamp = now_iso()
         safe_message = message[:1000]
@@ -440,12 +441,15 @@ class TrainingStore:
             db.execute(
                 """UPDATE training_nodes SET deployment_status=?,deployment_message=?,
                 deployment_finished_at=?,installed_worker_version=COALESCE(?,installed_worker_version),
+                ssh_username=CASE WHEN ? THEN ? ELSE ssh_username END,
                 state_revision=state_revision+1,updated_at=? WHERE id=?""",
                 (
                     "succeeded" if succeeded else "failed",
                     safe_message,
                     timestamp,
                     worker_version,
+                    1 if succeeded and ssh_username is not None else 0,
+                    ssh_username,
                     timestamp,
                     row["id"],
                 ),
@@ -552,9 +556,15 @@ class TrainingStore:
                     last_heartbeat_at=NULL,worker_instance_id=NULL,
                     worker_version=NULL,protocol_version=NULL,
                     worker_token_sha256=NULL,health_message=NULL,
-                    capabilities_json=NULL,state_revision=state_revision+1,
+                    capabilities_json=NULL,
+                    state_revision=state_revision+1,
                     updated_at=? WHERE id=?""",
-                    (safe_message, timestamp, timestamp, row["id"]),
+                    (
+                        safe_message,
+                        timestamp,
+                        timestamp,
+                        row["id"],
+                    ),
                 )
                 db.execute(
                     "DELETE FROM training_node_resource_snapshots WHERE node_id=?",

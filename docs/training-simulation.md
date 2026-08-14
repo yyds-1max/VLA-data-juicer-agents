@@ -116,7 +116,7 @@ Fake Runner 按阶段顺序执行。上一阶段成功后才进入下一阶段�
 本里程碑已经建立训练节点、只读 Worker 和 SSH preflight，并把真实节点资源接入模型
 注册与新建训练。服务器目录与“服务器资源”页面只展示 Worker 上报的真实节点；没有
 登记节点时显示空状态，不混入 Fake GPU。资源详情集中在“服务器资源”，训练节点页
-只负责登记、部署、修复、删除 Worker 和查看节点状态。绑定真实节点的模型族可以查看节点快照和
+只负责登记、部署、修复、更换运行账号、卸载 Worker、删除节点记录和查看节点状态。绑定真实节点的模型族可以查看节点快照和
 填写参数，但页面不会开放模拟预览、GPU 选择或启动按钮，后端同样拒绝在真实节点上
 创建 Fake Run。真实 Runner
 仍保持关闭。在训练服务器目录、输入权重、数据路径、输出根目录、账号权限和专用
@@ -125,8 +125,10 @@ Fake Runner 按阶段顺序执行。上一阶段成功后才进入下一阶段�
 
 ## 训练节点与 Worker v1
 
-管理员可在“训练节点”页登记名称、主机地址、SSH 端口和用户名；这些连接元数据会
-保存，但 SSH 与 sudo 密码仅存在于一次部署请求的内存中，不写入数据库、日志、argv、
+管理员可在“训练节点”页登记名称、主机地址和 SSH 端口，登记本身不绑定 Linux
+账号。登记成功后页面直接进入 Worker 部署，用户此时才填写 SSH 登录账号及一次性
+凭据。只有部署成功后，平台才记录该账号为 Worker 和训练所属账号；SSH 与 sudo 密码
+仅存在于一次部署请求的内存中，不写入数据库、日志、argv、
 环境变量或远端文件。节点状态为 `pending_enrollment / online / degraded / offline /
 repair_required / disabled`，在线状态由中心根据最近心跳计算，不能由 Worker 自报。
 默认只读身份只能查看安全投影，地址和 SSH 信息仅 `training:manage_nodes` 可见。
@@ -146,8 +148,9 @@ token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换�
 进程启动标记和 argv digest 同时匹配，无法确认时标为 unknown，绝不发送信号。
 
 Worker HTTP 客户端只允许固定中心 origin 上的 enroll、heartbeat 和验证结果回传端点，
-拒绝重定向并限制超时和响应大小。部署模板位于 `deployment/systemd/`，使用独立的
-`datapilot-worker` 系统账号、系统级 systemd、`NoNewPrivileges` 和只读文件系统保护。
+拒绝重定向并限制超时和响应大小。部署使用系统级 systemd 自启动服务，但 Worker 与
+未来训练都沿用 SSH 实际登录身份；平台不创建另一套 Linux 账号。systemd 仍启用
+`NoNewPrivileges` 等不妨碍工程、Home、Conda 和输出目录访问的基础保护。
 中心公网 Nginx 的最小端点白名单模板位于
 `deployment/nginx/datapilot-training-center.conf`；新增 Worker 命令时必须同时更新该
 白名单，否则请求会在到达中心应用前被拒绝。
@@ -178,20 +181,23 @@ Worker 默认读取 Linux 当前挂载表，自动上报所有持久存储挂载
 等独立数据盘无需用户额外配置，新增挂载也会在后续心跳中自动出现。未挂载的裸设备不
 属于可用文件系统容量，不在资源页面展示。
 
-用户登记节点后点击“部署 Worker”，页面先读取未受信任的 SSH host key 并显示
+用户点击“登记并部署 Worker”后，平台先保存节点信息，再读取未受信任的 SSH host key 并显示
 `SHA256:...` 指纹。用户必须通过可信渠道核对并明确确认；实际连接随后固定该 public
 key，强制 `StrictHostKeyChecking=yes`，不会把首次扫描结果直接当作可信身份。
 
-用户只需提供本次 SSH 登录密码，并选择 sudo 使用同一密码、独立密码或无需密码。
+用户只需提供本次 SSH 登录密码。页面默认由系统自动检查 root、免密 sudo，以及登录
+密码能否用于 sudo；只有 SSH 与 sudo 使用不同密码时，用户才需要展开并填写独立
+sudo 密码，不要求算法用户预先判断提权方式。
 密码通过本机短生命周期的受控 askpass 通道交给 OpenSSH，不使用 `sshpass`；部署结束
 即销毁。安装按钮前会显示一次只读部署条件检查，固定检查 Linux、系统级 systemd、
 Python 3、安装磁盘、NVIDIA 工具及 root/sudo 能力；未安装 NVIDIA 工具只会提示 GPU
-资源无法上报，安装目录尚不存在会提示由首次安装创建。修改密码、指纹确认或提权方式
+资源无法上报，安装目录尚不存在会提示由首次安装创建。修改密码、指纹确认或 sudo 密码
 后必须重新检查，实际部署时服务端还会强制复查。系统只执行内部固定的幂等安装操作，
 不接收 Shell 文本或自定义命令：
 
 1. 检查部署账号是 root 或可用 sudo；
-2. 创建无登录权限的 `datapilot-worker` 系统账号；
+2. 识别 SSH 实际登录账号及其主组；该身份将用于 Worker 和未来训练，root 也允许，
+   但部署检查会明确提示其拥有节点完整权限；
 3. 创建 `/opt/datapilot-training-worker`、`/var/lib/datapilot-training-worker` 和
    `/etc/datapilot-training-worker`；
 4. 校验并安装版本化 Worker 制品，写入不含秘密的固定配置和 systemd unit；
@@ -199,18 +205,27 @@ Python 3、安装磁盘、NVIDIA 工具及 root/sudo 能力；未安装 NVIDIA �
 
 如果部署账号不是 root 且不能使用 sudo，系统在任何特权写操作前终止，接口返回稳定
 错误码 `training_node_deployment_account_insufficient`，页面明确显示“部署账号权限不足”。
-系统不会退回到用 SSH 登录账号长期运行 Worker，也不会让算法用户手工执行补救命令。
+系统不会让算法用户手工创建额外账号或执行补救命令。模型配置验证会以同一 SSH 身份
+检查工程读取、所选 Conda 环境和输出目录写入权限；不满足时由用户更换 SSH 账号或路径。
 
 系统级 service 不依赖登录会话或 systemd linger。正常升级可由仍在线的 Worker 后续
 接管；Worker 完全损坏时，用户可在页面再次提供一次 SSH 授权执行同一套幂等修复。
 修复只管理 Worker 自身，不扫描、重启、停止或修改已有训练进程。
 
-已安装的节点可在页面执行“删除 Worker”。操作要求再次提供一次临时 SSH/sudo 凭据，
+“修复 Worker”沿用最近一次成功部署的账号；“更换Worker和训练所属账号”允许用户
+输入另一个 SSH 账号并重新执行相同的只读检查和幂等部署。新账号只有在部署成功后才
+成为记录中的运行账号，失败的尝试不会覆盖原账号。
+
+已安装的节点可在“危险操作”中执行“卸载 Worker（保留节点）”。操作要求再次提供一次临时 SSH/sudo 凭据，
 并经过影响说明和二次确认。中心会先撤销 Worker token、使节点退出可训练状态，再通过
-固定卸载操作停止并删除 systemd 服务、Worker 专用目录和 `datapilot-worker` 账号；
+固定卸载操作停止并删除 systemd 服务和 Worker 专用目录，但绝不删除 SSH 登录账号；
 不会删除模型工程、数据集、权重、checkpoint 或训练输出。成功后保留节点登记记录并
 恢复为“待部署 Worker”，以后可以重新一键部署；卸载失败时节点保持“需要修复”，不会
 继续被当作可用训练节点。
+
+页面还提供“删除训练节点”。从未部署过 Worker 的节点在确认后直接删除中心记录；已
+部署 Worker 的节点必须先提供临时 SSH/sudo 凭据，系统成功卸载 Worker 后才删除中心
+记录。该操作不删除 Linux 账号、模型工程、数据集、权重、checkpoint 或训练输出。
 
 即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。除管理员主动发起的
 模型配置只读验证外，当前部署和 Worker 不读取模型工程；任何情况下都不会修改模型工程、
