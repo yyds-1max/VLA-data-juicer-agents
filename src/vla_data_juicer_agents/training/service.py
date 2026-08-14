@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shlex
+import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -35,6 +37,7 @@ class TrainingNodeDeploymentManager(Protocol):
         sudo_password_mode: str,
         sudo_password: str | None,
         enrollment_token: str,
+        force_reenrollment: bool = False,
     ) -> dict[str, str]: ...
 
     def preflight_worker(
@@ -58,10 +61,46 @@ class TrainingNodeDeploymentManager(Protocol):
 
 
 class TrainingService:
-    def __init__(self, store: TrainingStore, provider: FakeResourceProvider | TrainingResourceProvider, *, simulation_enabled: bool = True, node_deployment_manager: TrainingNodeDeploymentManager | None = None) -> None:
+    def __init__(
+        self,
+        store: TrainingStore,
+        provider: FakeResourceProvider | TrainingResourceProvider,
+        *,
+        simulation_enabled: bool = True,
+        node_deployment_manager: TrainingNodeDeploymentManager | None = None,
+        repair_heartbeat_timeout_seconds: float = 8.0,
+        heartbeat_poll_interval_seconds: float = 0.25,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.store, self.provider = store, provider
         self.simulation_enabled = simulation_enabled
         self.node_deployment_manager = node_deployment_manager
+        self.repair_heartbeat_timeout_seconds = max(
+            0.0, float(repair_heartbeat_timeout_seconds)
+        )
+        self.heartbeat_poll_interval_seconds = max(
+            0.01, float(heartbeat_poll_interval_seconds)
+        )
+        self._monotonic_clock = monotonic_clock
+        self._sleeper = sleeper
+
+    def _wait_for_node_heartbeat(
+        self, node_ref: str, *, after_revision: int
+    ) -> bool:
+        deadline = (
+            self._monotonic_clock() + self.repair_heartbeat_timeout_seconds
+        )
+        while True:
+            node = self.store.get_node(node_ref)
+            if int(node["heartbeat_revision"]) > after_revision:
+                return True
+            remaining = deadline - self._monotonic_clock()
+            if remaining <= 0:
+                return False
+            self._sleeper(
+                min(self.heartbeat_poll_interval_seconds, remaining)
+            )
 
     @staticmethod
     def _data(payload: Any) -> dict[str, Any]:
@@ -155,6 +194,18 @@ class TrainingService:
             host_key_fingerprint=confirmed["sha256_fingerprint"],
             actor=principal.subject,
         )
+        heartbeat_revision = int(deploying["heartbeat_revision"])
+        is_repair = (
+            deploying["status"] != "online"
+            and any(
+                deploying.get(field) is not None
+                for field in (
+                    "installed_worker_version",
+                    "worker_instance_id",
+                    "enrolled_at",
+                )
+            )
+        )
         try:
             token_result = self.store.create_enrollment_token(
                 node_ref,
@@ -172,7 +223,32 @@ class TrainingService:
                 sudo_password_mode=payload.sudo_password_mode,
                 sudo_password=sudo_password,
                 enrollment_token=token_result["enrollment_token"],
+                force_reenrollment=False,
             )
+            credentials_refreshed = False
+            if is_repair and not self._wait_for_node_heartbeat(
+                node_ref, after_revision=heartbeat_revision
+            ):
+                deployment = self.node_deployment_manager.deploy_worker(
+                    node={
+                        **token_result["node"],
+                        "ssh_username": payload.ssh_username,
+                    },
+                    confirmed_host_key=confirmed,
+                    ssh_password=ssh_password,
+                    sudo_password_mode=payload.sudo_password_mode,
+                    sudo_password=sudo_password,
+                    enrollment_token=token_result["enrollment_token"],
+                    force_reenrollment=True,
+                )
+                credentials_refreshed = True
+                if not self._wait_for_node_heartbeat(
+                    node_ref, after_revision=heartbeat_revision
+                ):
+                    raise TrainingUnavailableError(
+                        "training_node_worker_heartbeat_not_restored",
+                        "Worker restarted but did not reconnect to the center service.",
+                    )
         except Exception as exc:
             self.store.invalidate_node_enrollment_tokens(node_ref)
             message = (
@@ -190,10 +266,19 @@ class TrainingService:
             raise
         self.store.invalidate_node_enrollment_tokens(node_ref)
         worker_version = deployment.get("worker_version", "0.1.0")
+        deployment_message = deployment.get(
+            "message", "Training Worker deployed."
+        )
+        if is_repair:
+            deployment_message = (
+                "Training Worker repaired and credentials refreshed."
+                if credentials_refreshed
+                else "Training Worker repaired and reconnected."
+            )
         node = self.store.finish_node_deployment(
             node_ref,
             succeeded=True,
-            message=deployment.get("message", "Training Worker deployed."),
+            message=deployment_message,
             worker_version=worker_version,
             actor=principal.subject,
             ssh_username=payload.ssh_username,
@@ -203,7 +288,7 @@ class TrainingService:
             "deployment": {
                 "status": "succeeded",
                 "worker_version": worker_version,
-                "message": deployment.get("message", "Training Worker deployed."),
+                "message": deployment_message,
             },
         }
 

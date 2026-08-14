@@ -185,6 +185,21 @@ def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     assert b'DATAPILOT_CONDA_EXECUTABLE="/home/trainer/miniconda3/bin/conda"' in environment
 
 
+def test_forced_reenrollment_replaces_an_existing_worker_credential() -> None:
+    backend = _FakeDeploymentBackend(DeploymentPrivilege.SUDO)
+    backend.enrolled = True
+
+    result = TrainingWorkerSystemDeployer().deploy(
+        backend,
+        _request(force_reenrollment=True),
+    )
+
+    call_names = [call[0] for call in backend.calls]
+    assert "worker_is_enrolled" not in call_names
+    assert call_names.count("enroll_worker") == 1
+    assert "enrollment" in result.changed_steps
+
+
 def test_remote_installer_restarts_an_already_active_worker(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

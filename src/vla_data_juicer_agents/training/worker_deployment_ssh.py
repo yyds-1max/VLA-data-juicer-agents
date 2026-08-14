@@ -116,6 +116,7 @@ import json
 import os
 import pathlib
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -252,7 +253,14 @@ elif operation == "activate_release":
         output(True)
 elif operation == "is_enrolled":
     token = pathlib.Path(arguments["state_directory"]) / "worker-token"
-    output(False, token.is_file() and not token.is_symlink())
+    valid = False
+    if token.is_file() and not token.is_symlink() and token.stat().st_size <= 1024:
+        try:
+            value = token.read_text(encoding="utf-8").strip()
+            valid = re.fullmatch(r"worker_[A-Za-z0-9_-]{33,249}", value) is not None
+        except (OSError, UnicodeError):
+            valid = False
+    output(False, valid)
 elif operation == "enroll":
     token = sys.stdin.buffer.read(1025)
     if not token or len(token) > 1024 or b"\n" in token or b"\r" in token:

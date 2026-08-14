@@ -87,12 +87,12 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("节点名称"), { target: { value: "测试训练节点" } });
     fireEvent.change(screen.getByLabelText("主机地址"), { target: { value: "10.0.0.12" } });
     fireEvent.change(screen.getByLabelText("SSH 端口"), { target: { value: "2222" } });
-    expect(screen.queryByLabelText("SSH 登录账号")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("SSH 登录用户名")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "登记并部署 Worker" }));
     expect((await screen.findAllByText("待部署 Worker"))[0]).toBeVisible();
     expect(trainingApi.createTrainingNode).toHaveBeenCalledWith({ name: "测试训练节点", address: "10.0.0.12", ssh_port: 2222, description: undefined });
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
-    fireEvent.change(screen.getByLabelText("SSH 登录账号"), { target: { value: "trainer" } });
+    fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
     const sshPasswordInput = screen.getByLabelText("SSH 登录密码");
     expect(sshPasswordInput).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByRole("button", { name: "显示 SSH 登录密码" }));
@@ -139,7 +139,7 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("Worker 已连接中心服务，节点可以用于创建训练。")).toBeVisible();
     expect(screen.getByRole("button", { name: "查看服务器资源" })).toBeVisible();
     expect(screen.getByRole("button", { name: "更新 Worker" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "卸载 Worker（保留节点）" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "卸载 Worker（保留节点）" })).toHaveClass("ml-auto");
     expect(screen.getByRole("button", { name: "删除训练节点 测试训练节点" })).toBeVisible();
     expect(screen.queryByText("危险操作")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "修复 Worker" })).not.toBeInTheDocument();
@@ -259,7 +259,7 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
     fireEvent.click(screen.getByRole("button", { name: "更换Worker和训练所属账号" }));
     expect(await screen.findByText("更换 Worker 和训练所属账号")).toBeVisible();
-    const username = screen.getByLabelText("SSH 登录账号");
+    const username = screen.getByLabelText("SSH 登录用户名");
     expect(username).toHaveValue("trainer");
     expect(username).not.toBeDisabled();
     fireEvent.change(username, { target: { value: "root" } });
@@ -281,8 +281,8 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("button", { name: "更新 Worker" }));
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
     expect(screen.getByText("更新 Worker", { selector: "p" })).toBeVisible();
-    expect(screen.getByLabelText("SSH 登录账号")).toHaveValue("trainer");
-    expect(screen.getByLabelText("SSH 登录账号")).toBeDisabled();
+    expect(screen.getByLabelText("SSH 登录用户名")).toHaveValue("trainer");
+    expect(screen.getByLabelText("SSH 登录用户名")).toBeDisabled();
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-update-password" } });
     fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
@@ -294,7 +294,7 @@ describe("TrainingPlatform", () => {
       ssh_username: "trainer",
       ssh_password: "one-time-update-password",
     })));
-    expect(await screen.findByText("Worker 已更新并完成重新注册，正在等待稳定心跳。")).toBeVisible();
+    expect(await screen.findByText("Worker 已更新并重新连接中心服务。")).toBeVisible();
   });
 
   it("deletes a never-deployed training node after confirmation without asking for SSH credentials", async () => {
@@ -306,7 +306,7 @@ describe("TrainingPlatform", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
     expect(await screen.findByRole("heading", { name: "再次确认删除训练节点" })).toBeVisible();
-    expect(screen.queryByLabelText("删除操作 SSH 登录账号")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("删除操作 SSH 登录用户名")).not.toBeInTheDocument();
     expect(trainingApi.deleteTrainingNode).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "确认删除训练节点" }));
     await waitFor(() => expect(trainingApi.deleteTrainingNode).toHaveBeenCalledWith("node-test", 1));
@@ -325,7 +325,7 @@ describe("TrainingPlatform", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
     fireEvent.click(screen.getByRole("button", { name: "部署 Worker" }));
     await screen.findByText(hostKey.sha256_fingerprint);
-    fireEvent.change(screen.getByLabelText("SSH 登录账号"), { target: { value: "trainer" } });
+    fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
     fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
     fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));

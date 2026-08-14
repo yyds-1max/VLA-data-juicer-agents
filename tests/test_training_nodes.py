@@ -113,6 +113,7 @@ class _FakeDeploymentManager:
         self.seen_ssh_username: str | None = None
         self.removed = False
         self.preflight_calls = 0
+        self.force_reenrollment_calls: list[bool] = []
 
     def discover_host_key(self, node: dict[str, object]) -> dict[str, str]:
         assert node["address"] == "192.0.2.10"
@@ -123,6 +124,9 @@ class _FakeDeploymentManager:
         }
 
     def deploy_worker(self, **kwargs: object) -> dict[str, str]:
+        self.force_reenrollment_calls.append(
+            bool(kwargs.get("force_reenrollment", False))
+        )
         self.seen_ssh_username = str(kwargs["node"]["ssh_username"])  # type: ignore[index]
         self.seen_ssh_password = str(kwargs["ssh_password"])
         self.seen_sudo_password = str(kwargs["sudo_password"])
@@ -160,12 +164,17 @@ class _FakeDeploymentManager:
 
 
 def _deployment_client(
-    store: TrainingStore, manager: _FakeDeploymentManager, *, admin: bool = True
+    store: TrainingStore,
+    manager: _FakeDeploymentManager,
+    *,
+    admin: bool = True,
+    repair_heartbeat_timeout_seconds: float = 8.0,
 ) -> TestClient:
     service = TrainingService(
         store,
         FakeResourceProvider(store),
         node_deployment_manager=manager,
+        repair_heartbeat_timeout_seconds=repair_heartbeat_timeout_seconds,
     )
     return _client(service, admin=admin)
 
@@ -371,6 +380,120 @@ def test_one_click_deployment_uses_ephemeral_credentials_and_persists_only_host_
     assert manager.seen_enrollment_token not in database_dump
     assert active_tokens == 0
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_repair_refreshes_worker_credentials_only_after_heartbeat_timeout(
+    store: TrainingStore,
+) -> None:
+    class RecoveringManager(_FakeDeploymentManager):
+        def deploy_worker(self, **kwargs: object) -> dict[str, str]:
+            result = super().deploy_worker(**kwargs)
+            if kwargs.get("force_reenrollment") is True:
+                with store.transaction() as db:
+                    db.execute(
+                        """UPDATE training_nodes SET status='online',
+                        heartbeat_revision=heartbeat_revision+1,
+                        last_heartbeat_at=?
+                        WHERE node_ref=?""",
+                        (
+                            datetime.now(UTC).isoformat(),
+                            kwargs["node"]["node_ref"],  # type: ignore[index]
+                        ),
+                    )
+            return result
+
+    manager = RecoveringManager()
+    client = _deployment_client(
+        store,
+        manager,
+        repair_heartbeat_timeout_seconds=0,
+    )
+    node = _create_node(client)
+    with store.transaction() as db:
+        db.execute(
+            """UPDATE training_nodes SET status='offline',
+            deployment_status='succeeded',installed_worker_version='0.1.0',
+            ssh_username='trainer',worker_instance_id='worker-old',
+            enrolled_at='2026-08-13T08:00:00+00:00'
+            WHERE node_ref=?""",
+            (node["node_ref"],),
+        )
+    node = store.get_node(str(node["node_ref"]))
+    host_key = manager.discover_host_key(node)
+
+    response = client.post(
+        f"/api/training/nodes/{node['node_ref']}/deploy-worker",
+        json={
+            "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
+            "confirmed_host_key": host_key,
+            "host_key_confirmed": True,
+            "ssh_password": "ephemeral-ssh-password",
+            "sudo_password_mode": "same_as_ssh",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert manager.force_reenrollment_calls == [False, True]
+    assert response.json()["deployment"]["message"] == (
+        "Training Worker repaired and credentials refreshed."
+    )
+    assert response.json()["node"]["status"] == "online"
+
+
+def test_repair_preserves_a_valid_worker_credential_after_reconnection(
+    store: TrainingStore,
+) -> None:
+    class ReconnectingManager(_FakeDeploymentManager):
+        def deploy_worker(self, **kwargs: object) -> dict[str, str]:
+            result = super().deploy_worker(**kwargs)
+            with store.transaction() as db:
+                db.execute(
+                    """UPDATE training_nodes SET status='online',
+                    heartbeat_revision=heartbeat_revision+1,
+                    last_heartbeat_at=? WHERE node_ref=?""",
+                    (
+                        datetime.now(UTC).isoformat(),
+                        kwargs["node"]["node_ref"],  # type: ignore[index]
+                    ),
+                )
+            return result
+
+    manager = ReconnectingManager()
+    client = _deployment_client(
+        store,
+        manager,
+        repair_heartbeat_timeout_seconds=0,
+    )
+    node = _create_node(client)
+    with store.transaction() as db:
+        db.execute(
+            """UPDATE training_nodes SET status='offline',
+            deployment_status='succeeded',installed_worker_version='0.1.0',
+            ssh_username='trainer',worker_instance_id='worker-old',
+            enrolled_at='2026-08-13T08:00:00+00:00'
+            WHERE node_ref=?""",
+            (node["node_ref"],),
+        )
+    node = store.get_node(str(node["node_ref"]))
+
+    response = client.post(
+        f"/api/training/nodes/{node['node_ref']}/deploy-worker",
+        json={
+            "expected_revision": node["state_revision"],
+            "ssh_username": "trainer",
+            "confirmed_host_key": manager.discover_host_key(node),
+            "host_key_confirmed": True,
+            "ssh_password": "ephemeral-ssh-password",
+            "sudo_password_mode": "same_as_ssh",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert manager.force_reenrollment_calls == [False]
+    assert response.json()["deployment"]["message"] == (
+        "Training Worker repaired and reconnected."
+    )
 
 
 def test_worker_preflight_is_read_only_and_never_persists_credentials(

@@ -268,6 +268,7 @@ class WorkerDeploymentRequest:
     center_ca_certificate: bytes | None = field(default=None, repr=False)
     sudo_password_mode: SudoPasswordMode = SudoPasswordMode.SAME_AS_SSH
     sudo_password: str | None = field(default=None, repr=False)
+    force_reenrollment: bool = False
 
     def validate(self) -> None:
         self.release.validate()
@@ -279,6 +280,8 @@ class WorkerDeploymentRequest:
             r"enroll_[A-Za-z0-9_-]{33,249}", self.enrollment_token
         ):
             _invalid("Worker enrollment token has an unsupported format")
+        if not isinstance(self.force_reenrollment, bool):
+            _invalid("Worker reenrollment mode has an unsupported format")
         if self.sudo_password_mode is SudoPasswordMode.SEPARATE:
             if not _valid_password(self.sudo_password):
                 _invalid("Separate sudo password is missing or malformed")
@@ -523,7 +526,10 @@ class TrainingWorkerSystemDeployer:
                     privilege=privilege,
                 ),
             )
-            if backend.worker_is_enrolled(privilege=privilege):
+            if (
+                not request.force_reenrollment
+                and backend.worker_is_enrolled(privilege=privilege)
+            ):
                 unchanged.append("enrollment")
             else:
                 if request.enrollment_token is None:

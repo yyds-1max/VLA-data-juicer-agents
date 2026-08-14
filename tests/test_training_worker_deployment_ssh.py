@@ -160,6 +160,50 @@ def test_openssh_worker_removal_uses_the_fixed_remote_operation() -> None:
     assert arguments["legacy_account"] == "datapilot-worker"
 
 
+def test_remote_enrollment_probe_rejects_a_malformed_worker_token(
+    tmp_path: Path,
+) -> None:
+    state_directory = tmp_path / "state"
+    state_directory.mkdir()
+    token_path = state_directory / "worker-token"
+    token_path.write_text("damaged-token\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REMOTE_INSTALLER,
+            "is_enrolled",
+            json.dumps({"state_directory": str(state_directory)}),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {"changed": False, "value": False}
+
+    token_path.write_text("worker_" + "x" * 48 + "\n", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REMOTE_INSTALLER,
+            "is_enrolled",
+            json.dumps({"state_directory": str(state_directory)}),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {"changed": False, "value": True}
+
+
 def test_openssh_backend_rejects_non_catalogue_privilege_command() -> None:
     backend = OpenSshWorkerDeploymentBackend(_FakeFixedSshSession())  # type: ignore[arg-type]
 

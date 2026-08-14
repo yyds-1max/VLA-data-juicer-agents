@@ -159,6 +159,7 @@ class AutomatedNodeDeploymentManager:
         sudo_password_mode: str,
         sudo_password: str | None,
         enrollment_token: str,
+        force_reenrollment: bool = False,
     ) -> dict[str, str]:
         endpoint = _endpoint(node)
         pin = _confirmed_pin(endpoint, confirmed_host_key)
@@ -192,6 +193,7 @@ class AutomatedNodeDeploymentManager:
             center_ca_certificate=self._center_ca_certificate,
             sudo_password_mode=SudoPasswordMode(sudo_password_mode),
             sudo_password=sudo_password,
+            force_reenrollment=force_reenrollment,
         )
         try:
             with self._backend_factory(
