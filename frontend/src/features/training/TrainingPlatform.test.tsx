@@ -138,6 +138,10 @@ describe("TrainingPlatform", () => {
 
     expect(screen.getByText("Worker 已连接中心服务，节点可以用于创建训练。")).toBeVisible();
     expect(screen.getByRole("button", { name: "查看服务器资源" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "更新 Worker" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "卸载 Worker（保留节点）" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "删除训练节点 测试训练节点" })).toBeVisible();
+    expect(screen.queryByText("危险操作")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "修复 Worker" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "查看服务器资源" }));
     expect(screen.getByRole("tab", { name: "服务器资源" })).toHaveAttribute("aria-selected", "true");
@@ -222,7 +226,6 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
 
-    fireEvent.click(screen.getByText("危险操作"));
     fireEvent.click(await screen.findByRole("button", { name: "卸载 Worker（保留节点）" }));
     expect(await screen.findByRole("heading", { name: "卸载 测试训练节点 的 Worker" })).toBeVisible();
     expect(screen.getByText(/系统只卸载 DataPilot Worker 服务和自身文件/)).toBeVisible();
@@ -263,6 +266,37 @@ describe("TrainingPlatform", () => {
     expect(username).toHaveValue("root");
   });
 
+  it("updates an online Worker with its current runtime account", async () => {
+    const installedNode: TrainingNode = { ...pendingNode, ssh_username: "trainer", status: "online", state_revision: 7, deployment_status: "succeeded", installed_worker_version: "0.1.0", worker_version: "0.1.0", enrolled_at: "2026-08-12T00:00:00Z" };
+    const updatedNode: TrainingNode = { ...installedNode, state_revision: 8, installed_worker_version: "0.2.0", worker_version: "0.2.0" };
+    const hostKey = { algorithm: "ssh-ed25519", public_key: "A".repeat(40), sha256_fingerprint: `SHA256:${"B".repeat(43)}` };
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([installedNode]);
+    vi.mocked(trainingApi.discoverTrainingNodeHostKey).mockResolvedValue(hostKey);
+    vi.mocked(trainingApi.preflightTrainingNodeWorker).mockResolvedValue({ ready: true, checked_at: "2026-08-13T08:00:00Z", checks: [{ code: "deployment_privilege", label: "部署账号权限", status: "passed", detail: "已验证部署权限。" }] });
+    vi.mocked(trainingApi.deployTrainingNodeWorker).mockResolvedValue({ node: updatedNode, deployment: { status: "succeeded", worker_version: "0.2.0", message: "Worker updated." } });
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "更新 Worker" }));
+    expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
+    expect(screen.getByText("更新 Worker", { selector: "p" })).toBeVisible();
+    expect(screen.getByLabelText("SSH 登录账号")).toHaveValue("trainer");
+    expect(screen.getByLabelText("SSH 登录账号")).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
+    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-update-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "检查部署条件" }));
+    expect(await screen.findByText("部署条件已满足")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认更新 Worker" }));
+
+    await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({
+      expected_revision: 7,
+      ssh_username: "trainer",
+      ssh_password: "one-time-update-password",
+    })));
+    expect(await screen.findByText("Worker 已更新并完成重新注册，正在等待稳定心跳。")).toBeVisible();
+  });
+
   it("deletes a never-deployed training node after confirmation without asking for SSH credentials", async () => {
     mockApi(adminCapabilities);
     vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);
@@ -270,8 +304,7 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
 
-    fireEvent.click(screen.getByText("危险操作"));
-    fireEvent.click(screen.getByRole("button", { name: "删除训练节点" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
     expect(await screen.findByRole("heading", { name: "再次确认删除训练节点" })).toBeVisible();
     expect(screen.queryByLabelText("删除操作 SSH 登录账号")).not.toBeInTheDocument();
     expect(trainingApi.deleteTrainingNode).not.toHaveBeenCalled();
