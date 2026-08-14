@@ -336,15 +336,22 @@ export async function verifyTrainingModel(familyRef: string, expectedRevision: n
   return data.model;
 }
 
-export type TrainingRunRequest = {
+type TrainingRunPayload = {
   family_ref: string;
   server_ref: string;
   gpu_uuids: string[];
   stages: Array<{ parameters: Record<string, string | number | boolean>; stage_input_source: TrainingStageInputSource }>;
+};
+
+export type TrainingRunPreviewRequest = TrainingRunPayload & {
+  execution_mode: "simulation" | "real";
+};
+
+export type TrainingRunRequest = TrainingRunPayload & {
   execution_mode: "simulation";
 };
 
-export async function previewTrainingRun(payload: TrainingRunRequest): Promise<TrainingRunPreview> {
+export async function previewTrainingRun(payload: TrainingRunPreviewRequest): Promise<TrainingRunPreview> {
   return requestJson<TrainingRunPreview>(`${trainingPath}/runs/preview`, { method: "POST", body: JSON.stringify(payload) });
 }
 

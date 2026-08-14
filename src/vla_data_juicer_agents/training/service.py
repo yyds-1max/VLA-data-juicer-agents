@@ -503,15 +503,42 @@ class TrainingService:
         }
         return adapted
 
-    def _prepare(self, payload: Any, *, ignore_platform_leases: bool = False) -> tuple[dict[str, Any], Any]:
-        if not self.simulation_enabled:
-            raise TrainingForbiddenError("simulation_disabled", "Training simulation is disabled.")
+    def _prepare(
+        self,
+        payload: Any,
+        *,
+        ignore_platform_leases: bool = False,
+        allow_real_preview: bool = False,
+    ) -> tuple[dict[str, Any], Any]:
         data = self._data(payload)
-        if data.get("execution_mode", data.get("mode")) != "simulation":
-            raise TrainingValidationError("unsupported_execution_mode", "Only simulation mode is supported.")
+        execution_mode = data.get("execution_mode", data.get("mode"))
+        if execution_mode not in {"simulation", "real"}:
+            raise TrainingValidationError(
+                "unsupported_execution_mode",
+                "The requested execution mode is not supported.",
+            )
         server = next((item for item in self.provider.list_servers() if item["server_ref"] == data["server_ref"]), None)
-        if server is not None and server.get("kind") != "simulation":
-            raise TrainingValidationError("real_execution_disabled", "真实训练尚未启用；真实训练节点当前只用于登记模型和查看资源。")
+        if execution_mode == "simulation":
+            if not self.simulation_enabled:
+                raise TrainingForbiddenError(
+                    "simulation_disabled", "Training simulation is disabled."
+                )
+            if server is not None and server.get("kind") != "simulation":
+                raise TrainingValidationError(
+                    "real_execution_disabled",
+                    "真实训练尚未启用；真实训练节点当前只允许生成预览。",
+                )
+        else:
+            if not allow_real_preview:
+                raise TrainingValidationError(
+                    "real_execution_disabled",
+                    "真实训练尚未启用；当前只能生成真实 RunSpec 预览。",
+                )
+            if server is not None and server.get("kind") != "training_node":
+                raise TrainingValidationError(
+                    "invalid_real_preview_target",
+                    "真实训练预览必须选择已登记的真实训练节点。",
+                )
         selected = self.provider.require_available(
             data["server_ref"], data["gpu_uuids"],
             ignore_platform_leases=ignore_platform_leases,
@@ -642,9 +669,12 @@ class TrainingService:
                 argv.extend([output_flag, output]); safe_argv.extend([output_flag, output])
                 distributed = {"master_addr": "127.0.0.1" if uses_torchrun else None, "master_port": port if uses_torchrun else None, "node_rank": 0 if uses_torchrun else None}
                 public_parameters = {key: "********" if key in source_stage["sensitive_parameters"] else value for key, value in parameters.items()}
-                public = {"contract_version": 2, "execution_mode": "simulation", "family_ref": model["family_ref"], "family_name": model["family_name"], "version_label": version_meta.get("version_label"), "stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": public_parameters, "entrypoint": template["entrypoint"], "argv": safe_argv, "output_preview": output}
-                private = {**public, "version": 2, "mode": "simulation", "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
-                built_stages.append({"stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "stage_input_source": source_stage["stage_input_source"], "parameters": parameters, "private_spec": private, "run_spec": public, "command_preview": private["safe_command_preview"], "output_directory": output, "total_steps": source_stage["total_steps"], "preflight": [{"ok": True, "code": "simulation_ready", "message": "Simulation inputs and GPU availability are valid."}]})
+                public = {"contract_version": 2, "execution_mode": execution_mode, "family_ref": model["family_ref"], "family_name": model["family_name"], "version_label": version_meta.get("version_label"), "stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": public_parameters, "entrypoint": template["entrypoint"], "argv": safe_argv, "output_preview": output}
+                preview_check = "simulation_only" if execution_mode == "simulation" else "real_preview_only"
+                ready_code = "simulation_ready" if execution_mode == "simulation" else "real_preview_ready"
+                ready_message = "Simulation inputs and GPU availability are valid." if execution_mode == "simulation" else "真实节点、GPU 和参数已通过预览校验；未创建任务、租约或进程。"
+                private = {**public, "version": 2, "mode": execution_mode, "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": [preview_check, "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
+                built_stages.append({"stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "stage_input_source": source_stage["stage_input_source"], "parameters": parameters, "private_spec": private, "run_spec": public, "command_preview": private["safe_command_preview"], "output_directory": output, "total_steps": source_stage["total_steps"], "preflight": [{"ok": True, "code": ready_code, "message": ready_message}]})
                 previous_output = output
             return {"stages": built_stages, "total_steps": sum(stage["total_steps"] for stage in built_stages)}
 
@@ -653,7 +683,7 @@ class TrainingService:
 
     def preview_run(self, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_CREATE_RUNS)
-        prepared, builder = self._prepare(payload)
+        prepared, builder = self._prepare(payload, allow_real_preview=True)
         port = (
             self.store.find_available_port(self._data(payload)["server_ref"])
             if prepared["requires_master_port"]
@@ -669,9 +699,22 @@ class TrainingService:
                 "version_label": "preview",
             },
         )
+        execution_mode = self._data(payload).get("execution_mode", "simulation")
+        ready_code = (
+            "simulation_ready"
+            if execution_mode == "simulation"
+            else "real_preview_ready"
+        )
+        ready_message = (
+            "All simulation stages and GPU selections are valid."
+            if execution_mode == "simulation"
+            else "真实训练预览已生成；未创建任务、GPU 租约、模型版本或进程。"
+        )
         return {
             "stages": built["stages"],
-            "preflight": [{"ok": True, "code": "simulation_ready", "message": "All simulation stages and GPU selections are valid."}],
+            "preflight": [
+                {"ok": True, "code": ready_code, "message": ready_message}
+            ],
         }
 
     def create_run(self, payload: Any, idempotency_key: str, principal: Any) -> dict[str, Any]:

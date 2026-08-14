@@ -544,7 +544,8 @@ export interface TrainingNodeResourceSnapshot {
 
 export interface TrainingRunSpec {
   contract_version: 1 | 2;
-  execution_mode: "simulation";
+  /** `real` is currently returned only by the non-persistent development preview. */
+  execution_mode: "simulation" | "real";
   launcher_kind: "torchrun" | "direct";
   server_ref: string;
   gpu_uuids: string[];

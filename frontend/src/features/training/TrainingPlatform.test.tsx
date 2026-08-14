@@ -457,13 +457,14 @@ describe("TrainingPlatform", () => {
     await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila-family", expect.objectContaining({ expected_revision: 1 })));
   });
 
-  it("binds model registration and new training to a real node without enabling execution", async () => {
+  it("selects real GPUs and generates a non-persistent preview without enabling execution", async () => {
     const realServer: TrainingServer = { server_ref: "node-real", name: "NaVILA 训练节点", kind: "training_node", gpu_count: 1, status: "online", online: true, available: true, stale: false };
     const realResources: TrainingServerResources = { server: realServer, sampled_at: "2026-08-13T08:00:00Z", stale: false, gpus: [{ gpu_uuid: "GPU-real-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 2048, utilization_percent: 3, temperature_c: 42, externally_occupied: false }] };
     const realModel: TrainingModel = { ...model, family_ref: "navila-real", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
     mockApi(adminCapabilities, [realModel]);
     vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([realServer]);
     vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === realServer.server_ref ? realResources : resources);
+    vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py --num_video_frames 4 --output_dir /workspace/outputs/navila-real/preview/stage-01", output_directory: "/workspace/outputs/navila-real/preview/stage-01", run_spec: { ...runSpec, execution_mode: "real", server_ref: realServer.server_ref, gpu_uuids: ["GPU-real-0"], parameters: { num_video_frames: 4 } }, preflight: [{ ok: true, code: "real_preview_ready", message: "真实节点、GPU 和参数已通过预览校验；未创建任务、租约或进程。" }] }] });
     renderPlatform();
 
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
@@ -472,10 +473,21 @@ describe("TrainingPlatform", () => {
     expect(within(registrationServer).getByText("在线")).toHaveClass("text-emerald-600");
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
     expect(screen.getByRole("combobox", { name: "训练节点" })).toHaveTextContent("NaVILA 训练节点在线");
-    expect(screen.getByText(/该模型族绑定了真实训练节点/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "生成预览" })).toBeDisabled();
+    expect(screen.getByText(/开发预览模式/)).toBeVisible();
+    expect(screen.getByText(/当前不会占用或租用 GPU/)).toBeVisible();
+    const gpu = screen.getByRole("checkbox", { name: "选择 GPU 0" });
+    expect(gpu).toBeEnabled();
+    fireEvent.click(gpu);
+    fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
+    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({
+      execution_mode: "real",
+      family_ref: realModel.family_ref,
+      server_ref: realServer.server_ref,
+      gpu_uuids: ["GPU-real-0"],
+    })));
+    expect(await screen.findByText(/python train.py --num_video_frames 4/)).toBeVisible();
     expect(screen.getByRole("button", { name: "真实训练未启用" })).toBeDisabled();
-    expect(trainingApi.previewTrainingRun).not.toHaveBeenCalled();
+    expect(trainingApi.createTrainingRun).not.toHaveBeenCalled();
   });
 
   it("requests Worker verification for a real model family and shows its checks", async () => {

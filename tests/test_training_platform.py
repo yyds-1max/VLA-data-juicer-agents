@@ -916,7 +916,7 @@ def test_legacy_noneditable_parameter_is_normalized_and_can_be_overridden(
     assert preview.json()["stages"][0]["run_spec"]["parameters"]["num_video_frames"] == 8
 
 
-def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
+def test_real_training_node_can_preview_without_creating_a_run_or_lease(
     tmp_path: Path,
 ) -> None:
     store = TrainingStore(tmp_path / "real-node-training.sqlite")
@@ -940,18 +940,98 @@ def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
     assert created.status_code == 201, created.text
     model = created.json()["model"]
     assert model["configuration"]["launch_template"]["server_ref"] == node["node_ref"]
+    token_response = client.post(
+        f"/api/training/nodes/{node['node_ref']}/enrollment-tokens",
+        json={
+            "expected_revision": node["state_revision"],
+            "expires_in_seconds": 600,
+        },
+    )
+    assert token_response.status_code == 201, token_response.text
+    enrolled = client.post(
+        "/api/training/nodes/enroll",
+        json={
+            "enrollment_token": token_response.json()["enrollment_token"],
+            "worker_instance_id": "worker-instance-real-preview",
+            "worker_version": "0.1.0",
+            "protocol_version": 1,
+            "capabilities": {
+                "hostname": "training-preview-node",
+                "operating_system": "Linux",
+                "architecture": "x86_64",
+                "worker_features": ["resource_reporting"],
+            },
+        },
+    )
+    assert enrolled.status_code == 200, enrolled.text
+    heartbeat = client.post(
+        f"/api/training/nodes/{node['node_ref']}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {enrolled.json()['worker_token']}"
+        },
+        json={
+            "worker_instance_id": "worker-instance-real-preview",
+            "worker_version": "0.1.0",
+            "protocol_version": 1,
+            "health": "healthy",
+            "resources": {
+                "cpu": {"logical_cores": 64},
+                "memory": {
+                    "total_bytes": 274_877_906_944,
+                    "available_bytes": 137_438_953_472,
+                },
+                "disks": [],
+                "gpus": [
+                    {
+                        "uuid": "GPU-real-0",
+                        "index": 0,
+                        "name": "NVIDIA A100",
+                        "memory_total_bytes": 85_899_345_920,
+                        "memory_used_bytes": 2_147_483_648,
+                        "utilization_percent": 3.0,
+                        "temperature_celsius": 42.0,
+                    }
+                ],
+            },
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
     listed = client.get("/api/training/servers").json()["servers"]
     real_server = next(item for item in listed if item["server_ref"] == node["node_ref"])
     assert real_server["kind"] == "training_node"
+    preview_payload = {
+        **_run_payload(str(model["family_ref"]), gpu_uuids=["GPU-real-0"]),
+        "server_ref": node["node_ref"],
+        "execution_mode": "real",
+    }
     preview = client.post(
         "/api/training/runs/preview",
-        json={
-            **_run_payload(str(model["family_ref"]), gpu_uuids=["GPU-real-0"]),
-            "server_ref": node["node_ref"],
-        },
+        json=preview_payload,
     )
-    assert preview.status_code == 400
-    assert preview.json()["detail"]["code"] == "real_execution_disabled"
+    assert preview.status_code == 200, preview.text
+    stage = preview.json()["stages"][0]
+    assert stage["run_spec"]["execution_mode"] == "real"
+    assert stage["run_spec"]["gpu_uuids"] == ["GPU-real-0"]
+    assert stage["preflight"] == [
+        {
+            "ok": True,
+            "code": "real_preview_ready",
+            "message": "真实节点、GPU 和参数已通过预览校验；未创建任务、租约或进程。",
+        }
+    ]
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM training_runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM model_versions").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM gpu_leases").fetchone()[0] == 0
+
+    create = client.post(
+        "/api/training/runs",
+        headers={"Idempotency-Key": "real-preview-must-not-run"},
+        json=preview_payload,
+    )
+    assert create.status_code == 422
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM training_runs").fetchone()[0] == 0
 
 
 def test_draft_configuration_preview_and_submission_are_safe_and_idempotent(

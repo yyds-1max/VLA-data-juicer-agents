@@ -953,6 +953,18 @@ class RunRequest(StrictRequest):
         return self
 
 
+class PreviewRunRequest(RunRequest):
+    """Preview-only execution target.
+
+    Real execution remains forbidden on the persistent run endpoint until the
+    Worker runner is available.  Keeping the broader mode on this request only
+    lets development users validate the exact future RunSpec without creating
+    a task, lease, model version, or process.
+    """
+
+    execution_mode: Literal["simulation", "real"]
+
+
 class StopRunRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
 
@@ -1244,7 +1256,7 @@ def create_training_router(
         return {"model": model}
 
     @router.post("/runs/preview")
-    def preview_run(request: RunRequest) -> dict[str, Any]:
+    def preview_run(request: PreviewRunRequest) -> dict[str, Any]:
         return _preview_projection(
             _translate(service.preview_run, request, get_principal())
         )
