@@ -345,8 +345,8 @@ export interface TrainingParameterDefinition {
   key: string;
   label: string;
   type: TrainingParameterType;
-  /** Dataset inputs remain structured CLI parameters, but are surfaced separately when creating a run. */
-  semantic_role?: "hyperparameter" | "dataset";
+  /** Structured purpose used by the run form. At most one string parameter may receive the previous stage output. */
+  semantic_role?: "hyperparameter" | "dataset" | "stage_input";
   default: string | number | boolean;
   description?: string | null;
   minimum?: number | null;
@@ -357,7 +357,7 @@ export interface TrainingParameterDefinition {
   string_max_length?: number | null;
   /** Enable and emit this parameter only while the referenced parameter equals the configured value. */
   visible_when?: { parameter_key: string; equals: string | number | boolean } | null;
-  /** Model-version-owned layout metadata. Older configurations omit these fields and are grouped by known keys. */
+  /** Model-family-owned layout metadata used by every stage of a future run. */
   display_group?: string | null;
   display_group_label?: string | null;
   display_group_order?: number | null;
@@ -393,16 +393,12 @@ export interface TrainingLaunchTemplate {
 }
 
 export interface TrainingModel {
-  model_ref: string;
   family_ref: string;
   family_name: string;
-  version_number: number;
-  version_description?: string | null;
-  based_on_model_ref?: string | null;
   status: TrainingModelStatus;
-  edit_revision: number;
-  has_runs: boolean;
-  configuration_editable: boolean;
+  /** Admin-only optimistic concurrency token; never displayed as a model version. */
+  edit_revision?: number;
+  trained_version_count: number;
   created_at: string;
   updated_at: string;
   configuration?: TrainingModelConfiguration;
@@ -546,7 +542,7 @@ export interface TrainingNodeResourceSnapshot {
 }
 
 export interface TrainingRunSpec {
-  contract_version: 1;
+  contract_version: 1 | 2;
   execution_mode: "simulation";
   launcher_kind: "torchrun" | "direct";
   server_ref: string;
@@ -560,6 +556,7 @@ export interface TrainingRunSpec {
   runtime_environment?: TrainingLaunchTemplate["runtime_environment"];
   monitoring?: TrainingLaunchTemplate["monitoring"];
   parameters: Record<string, string | number | boolean>;
+  entrypoint?: string;
   argv: string[];
   output_preview?: string | null;
 }
@@ -571,13 +568,25 @@ export interface TrainingPreflightResult {
 }
 
 export interface TrainingRunPreview {
+  stages: TrainingStagePreview[];
+}
+
+export type TrainingStageInputSource = "manual" | "previous_stage_output";
+export type TrainingStageStatus = "pending" | "preparing" | "running" | "succeeded" | "failed" | "cancelled" | "skipped" | "lost";
+
+export interface TrainingStagePreview {
+  stage_number: number;
+  stage_name: string;
   run_spec: TrainingRunSpec;
   command_preview: string;
   preflight: TrainingPreflightResult[];
+  output_directory: string;
 }
 
 export interface TrainingMetricSample {
   seq: number;
+  stage_ref?: string | null;
+  stage_number?: number | null;
   created_at: string;
   step: number;
   total_steps: number;
@@ -592,6 +601,8 @@ export interface TrainingMetricSample {
 
 export interface TrainingRunLog {
   seq: number;
+  stage_ref?: string | null;
+  stage_number?: number | null;
   created_at: string;
   level: "info" | "warning" | "error";
   message: string;
@@ -599,11 +610,12 @@ export interface TrainingRunLog {
 
 export interface TrainingRun {
   run_ref: string;
-  model_ref: string;
   family_ref: string;
   family_name: string;
-  model_version_number: number;
-  model_display_name: string;
+  version_ref: string;
+  version_number: number;
+  version_date: string;
+  version_label: string;
   status: TrainingRunStatus;
   state_revision: number;
   server_ref: string;
@@ -613,6 +625,9 @@ export interface TrainingRun {
   total_steps: number;
   current_epoch: number;
   total_epochs: number;
+  stage_count: number;
+  current_stage_number: number | null;
+  stages: TrainingStage[];
   latest_metric?: TrainingMetricSample | null;
   failure_code?: string | null;
   failure_message?: string | null;
@@ -622,11 +637,34 @@ export interface TrainingRun {
   parameters?: Record<string, string | number | boolean>;
   run_spec?: TrainingRunSpec;
   audit_events?: Array<{ created_at: string; action: string; summary: string }>;
+  version_model?: { kind: "version_model"; output_directory: string } | null;
+}
+
+export interface TrainingStage {
+  stage_ref: string;
+  stage_number: number;
+  stage_name: string;
+  stage_input_source: TrainingStageInputSource;
+  status: TrainingStageStatus;
+  progress?: number;
+  progress_percent?: number;
+  current_step: number;
+  total_steps: number;
+  current_epoch?: number;
+  total_epochs?: number;
+  parameters?: Record<string, string | number | boolean>;
+  run_spec?: TrainingRunSpec;
+  output_directory?: string | null;
+  failure_code?: string | null;
+  failure_message?: string | null;
+  failure?: { code: string; message: string } | null;
 }
 
 export interface TrainingEvent {
   event_id: number;
   type: "run.updated" | "run.log.appended" | "run.metric.appended";
   run_ref: string;
+  stage_ref?: string | null;
+  stage_number?: number | null;
   seq?: number;
 }

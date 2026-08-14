@@ -88,7 +88,6 @@ def _heartbeat(client: TestClient, node_ref: str, worker_token: str) -> dict[str
 def _model_payload(node_ref: str) -> dict[str, object]:
     return {
         "family_name": "NaVILA",
-        "version_description": "remote verification",
         "configuration": {
             "launch_template": {
                 "domain": "vla",
@@ -127,7 +126,7 @@ def test_worker_claims_and_completes_read_only_model_verification(tmp_path: Path
     model = created.json()["model"]
 
     queued = admin.post(
-        f"/api/training/models/{model['model_ref']}/verify",
+        f"/api/training/models/{model['family_ref']}/verify",
         json={"expected_revision": model["edit_revision"]},
     )
     assert queued.status_code == 202, queued.text
@@ -156,25 +155,25 @@ def test_worker_claims_and_completes_read_only_model_verification(tmp_path: Path
         },
     )
     assert result.status_code == 200, result.text
-    verified = admin.get(f"/api/training/models/{model['model_ref']}").json()["model"]
+    verified = admin.get(f"/api/training/models/{model['family_ref']}").json()["model"]
     assert verified["status"] == "verified"
-    assert verified["configuration_editable"] is True
+    assert verified["trained_version_count"] == 0
+    assert verified["edit_revision"] == model["edit_revision"]
     assert verified["verification"]["status"] == "succeeded"
     assert verified["verification"]["checks"][0]["code"] == "working_directory"
 
     readonly = _client(service, admin=False)
-    safe = readonly.get(f"/api/training/models/{model['model_ref']}").json()["model"]
+    safe = readonly.get(f"/api/training/models/{model['family_ref']}").json()["model"]
     assert safe["configuration"]["launch_template"] == {"domain": "vla", "server_ref": node["node_ref"]}
     assert "checks" not in safe["verification"]
 
     edited_payload = _model_payload(str(node["node_ref"]))
     edited_payload = {
         "expected_revision": verified["edit_revision"],
-        "version_description": "edited after verification",
         "configuration": edited_payload["configuration"],
     }
     edited = admin.put(
-        f"/api/training/models/{model['model_ref']}", json=edited_payload
+        f"/api/training/models/{model['family_ref']}", json=edited_payload
     )
     assert edited.status_code == 200, edited.text
     assert edited.json()["model"]["status"] == "draft"
@@ -199,7 +198,7 @@ def test_verification_requires_online_real_worker_and_worker_authentication(tmp_
         json=_model_payload(str(pending_node["node_ref"])),
     ).json()["model"]
     rejected = admin.post(
-        f"/api/training/models/{pending_model['model_ref']}/verify",
+        f"/api/training/models/{pending_model['family_ref']}/verify",
         json={"expected_revision": pending_model["edit_revision"]},
     )
     assert rejected.status_code == 409
@@ -211,7 +210,7 @@ def test_verification_requires_online_real_worker_and_worker_authentication(tmp_
         "/api/training/models", json=_model_payload(str(node["node_ref"]))
     ).json()["model"]
     admin.post(
-        f"/api/training/models/{model['model_ref']}/verify",
+        f"/api/training/models/{model['family_ref']}/verify",
         json={"expected_revision": model["edit_revision"]},
     )
     command = _heartbeat(admin, str(node["node_ref"]), worker_token)["command"]

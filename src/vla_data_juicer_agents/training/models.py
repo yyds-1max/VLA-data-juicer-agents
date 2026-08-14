@@ -80,7 +80,7 @@ class ParameterDefinition(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
     label: str = Field(default="", max_length=200)
     kind: Literal["integer", "float", "boolean", "enum", "string"]
-    semantic_role: Literal["hyperparameter", "dataset"] = "hyperparameter"
+    semantic_role: Literal["hyperparameter", "dataset", "stage_input"] = "hyperparameter"
     cli_flag: str = Field(pattern=r"^--[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
     # ``None`` is retained while reading legacy revisions.  Those revisions
     # encoded booleans as presence-only flags; non-booleans always used a
@@ -117,6 +117,10 @@ class ParameterDefinition(BaseModel):
     def validate_definition(self) -> "ParameterDefinition":
         if self.semantic_role == "dataset" and self.kind not in {"string", "enum"}:
             raise ValueError("dataset parameters must be strings or enums")
+        if self.semantic_role == "stage_input" and self.kind != "string":
+            raise ValueError("stage input parameters must be strings")
+        if self.semantic_role == "stage_input" and self.visible_when is not None:
+            raise ValueError("stage input parameters cannot depend on another parameter")
         if self.argument_style is None:
             self.argument_style = (
                 "flag_when_true" if self.kind == "boolean" else "value"
@@ -203,7 +207,12 @@ class ModelRevisionInput(BaseModel):
             item.semantic_role == "dataset"
             for item in self.parameter_definitions
         ) > 1:
-            raise ValueError("a model revision can declare at most one dataset parameter")
+            raise ValueError("a model family can declare at most one dataset parameter")
+        if sum(
+            item.semantic_role == "stage_input"
+            for item in self.parameter_definitions
+        ) > 1:
+            raise ValueError("a model family can declare at most one stage input parameter")
         fields = set(re.findall(r"{([^{}]+)}", self.output_template))
         if fields - {"run_ref", "model_ref"}:
             raise ValueError("output template contains an unsupported field")
@@ -214,13 +223,20 @@ class ModelUpdateInput(ModelRevisionInput):
     expected_revision: int = Field(ge=1)
 
 
+class RunStageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    stage_input_source: Literal["manual", "previous_stage_output"] = "manual"
+
+
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model_ref: str = Field(min_length=1, max_length=128)
+    family_ref: str = Field(min_length=1, max_length=128)
     server_ref: str = Field(default="fake-local", min_length=1, max_length=128)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
-    parameters: dict[str, Any] = Field(default_factory=dict)
+    stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
     mode: Literal["simulation"] = "simulation"
 
     @field_validator("gpu_uuids")
@@ -229,6 +245,12 @@ class RunRequest(BaseModel):
         if len(values) != len(set(values)):
             raise ValueError("GPU selections must be unique")
         return values
+
+    @model_validator(mode="after")
+    def first_stage_is_manual(self) -> "RunRequest":
+        if self.stages[0].stage_input_source != "manual":
+            raise ValueError("the first stage must use manual input")
+        return self
 
 
 def normalize_parameter_value(definition: ParameterDefinition, value: Any) -> Any:

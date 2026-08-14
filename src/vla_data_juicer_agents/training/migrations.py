@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 6
+LATEST_TRAINING_SCHEMA_VERSION = 7
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -63,6 +63,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(6,?,?)",
             ("training_node_revision_split_m6", applied_at),
+        )
+        connection.commit()
+        versions.append(6)
+    if 7 not in versions:
+        connection.executescript(_MIGRATION_007)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(7,?,?)",
+            ("training_workflows_m7", applied_at),
         )
         connection.commit()
 
@@ -329,5 +337,105 @@ BEGIN IMMEDIATE;
 ALTER TABLE training_nodes ADD COLUMN heartbeat_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE training_nodes
 SET heartbeat_revision=CASE WHEN last_heartbeat_at IS NULL THEN 0 ELSE 1 END;
+COMMIT;
+"""
+
+
+_MIGRATION_007 = """
+BEGIN IMMEDIATE;
+DELETE FROM gpu_leases;
+DELETE FROM port_leases;
+DELETE FROM run_logs;
+DELETE FROM metric_samples;
+DELETE FROM training_events;
+DELETE FROM training_idempotency WHERE scope IN ('create_run','stop_run');
+DELETE FROM model_verification_requests;
+DELETE FROM training_runs;
+
+ALTER TABLE model_families ADD COLUMN current_model_id INTEGER REFERENCES registered_models(id);
+UPDATE model_families
+SET current_model_id=(
+  SELECT model.id FROM registered_models AS model
+  WHERE model.family_id=model_families.id
+  ORDER BY model.version_number DESC,model.id DESC LIMIT 1
+);
+UPDATE registered_models SET based_on_model_id=NULL;
+DELETE FROM model_revisions
+WHERE model_id NOT IN (
+  SELECT current_model_id FROM model_families WHERE current_model_id IS NOT NULL
+);
+DELETE FROM registered_models
+WHERE id NOT IN (
+  SELECT current_model_id FROM model_families WHERE current_model_id IS NOT NULL
+);
+DELETE FROM model_revisions
+WHERE id NOT IN (
+  SELECT revision.id
+  FROM registered_models AS model
+  JOIN model_revisions AS revision
+    ON revision.model_id=model.id
+   AND revision.revision_number=model.current_revision
+);
+UPDATE model_revisions SET revision_number=1;
+UPDATE registered_models
+SET status='draft',configuration_locked_at=NULL,based_on_model_id=NULL,
+    current_revision=1,version_number=1,version_description=NULL;
+
+CREATE TABLE model_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_ref TEXT NOT NULL UNIQUE,
+  family_id INTEGER NOT NULL,
+  run_id INTEGER NOT NULL UNIQUE,
+  version_number INTEGER NOT NULL,
+  version_date TEXT NOT NULL,
+  version_label TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(family_id,version_number),
+  FOREIGN KEY(family_id) REFERENCES model_families(id),
+  FOREIGN KEY(run_id) REFERENCES training_runs(id)
+);
+CREATE INDEX idx_model_versions_family ON model_versions(family_id,version_number DESC);
+
+CREATE TABLE training_stages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stage_ref TEXT NOT NULL UNIQUE,
+  run_id INTEGER NOT NULL,
+  stage_number INTEGER NOT NULL,
+  stage_name TEXT NOT NULL,
+  stage_input_source TEXT NOT NULL CHECK(stage_input_source IN ('manual','previous_stage_output')),
+  parameters_json TEXT NOT NULL,
+  run_spec_json TEXT NOT NULL,
+  command_preview TEXT NOT NULL,
+  output_directory TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','preparing','running','succeeded','failed','cancelled','skipped','lost')),
+  current_step INTEGER NOT NULL DEFAULT 0,
+  total_steps INTEGER NOT NULL,
+  failure_code TEXT,
+  failure_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE(run_id,stage_number),
+  FOREIGN KEY(run_id) REFERENCES training_runs(id)
+);
+CREATE INDEX idx_training_stages_run ON training_stages(run_id,stage_number);
+
+ALTER TABLE run_logs ADD COLUMN stage_id INTEGER REFERENCES training_stages(id);
+ALTER TABLE metric_samples ADD COLUMN stage_id INTEGER REFERENCES training_stages(id);
+
+CREATE TABLE training_artifacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artifact_ref TEXT NOT NULL UNIQUE,
+  version_id INTEGER NOT NULL,
+  stage_id INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('stage_output','version_model')),
+  path TEXT NOT NULL,
+  simulated INTEGER NOT NULL CHECK(simulated IN (0,1)),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(version_id) REFERENCES model_versions(id),
+  FOREIGN KEY(stage_id) REFERENCES training_stages(id)
+);
+CREATE INDEX idx_training_artifacts_version ON training_artifacts(version_id,id);
 COMMIT;
 """

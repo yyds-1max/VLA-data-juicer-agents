@@ -16,6 +16,7 @@ import type {
   TrainingRun,
   TrainingRunLog,
   TrainingRunPreview,
+  TrainingStageInputSource,
   TrainingServer,
   TrainingServerResources,
   TrainingMetricSample,
@@ -298,8 +299,8 @@ export async function listTrainingModels(): Promise<TrainingModel[]> {
   return data.models;
 }
 
-export async function getTrainingModel(modelRef: string): Promise<TrainingModel> {
-  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}`);
+export async function getTrainingModel(familyRef: string): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(familyRef)}`);
   return data.model;
 }
 
@@ -310,7 +311,6 @@ export type TrainingModelConfigurationInput = {
 
 export type TrainingModelDraftInput = {
   family_name: string;
-  version_description?: string;
   configuration: TrainingModelConfigurationInput;
 };
 
@@ -319,22 +319,23 @@ export async function createTrainingModel(payload: TrainingModelDraftInput): Pro
   return data.model;
 }
 
-export async function createTrainingModelVersion(familyRef: string, payload: { based_on_model_ref: string; version_description?: string; configuration: TrainingModelConfigurationInput }): Promise<TrainingModel> {
-  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/model-families/${encodeURIComponent(familyRef)}/versions`, { method: "POST", body: JSON.stringify(payload) });
+export async function updateTrainingModel(familyRef: string, payload: { expected_revision: number; configuration: TrainingModelConfigurationInput }): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(familyRef)}`, { method: "PUT", body: JSON.stringify(payload) });
   return data.model;
 }
 
-export async function updateTrainingModel(modelRef: string, payload: { expected_revision: number; version_description?: string; configuration: TrainingModelConfigurationInput }): Promise<TrainingModel> {
-  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}`, { method: "PUT", body: JSON.stringify(payload) });
+export async function verifyTrainingModel(familyRef: string, expectedRevision: number): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(familyRef)}/verify`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) });
   return data.model;
 }
 
-export async function verifyTrainingModel(modelRef: string, expectedRevision: number): Promise<TrainingModel> {
-  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}/verify`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) });
-  return data.model;
-}
-
-type TrainingRunRequest = { model_ref: string; server_ref: string; gpu_uuids: string[]; parameters: Record<string, string | number | boolean>; execution_mode: "simulation" };
+export type TrainingRunRequest = {
+  family_ref: string;
+  server_ref: string;
+  gpu_uuids: string[];
+  stages: Array<{ parameters: Record<string, string | number | boolean>; stage_input_source: TrainingStageInputSource }>;
+  execution_mode: "simulation";
+};
 
 export async function previewTrainingRun(payload: TrainingRunRequest): Promise<TrainingRunPreview> {
   return requestJson<TrainingRunPreview>(`${trainingPath}/runs/preview`, { method: "POST", body: JSON.stringify(payload) });
@@ -360,13 +361,17 @@ export async function stopTrainingRun(runRef: string, expectedRevision: number):
   return data.run;
 }
 
-export async function getTrainingRunLogs(runRef: string, afterSeq = 0): Promise<TrainingRunLog[]> {
-  const data = await requestJson<{ logs: TrainingRunLog[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/logs?after_seq=${afterSeq}`);
+export async function getTrainingRunLogs(runRef: string, afterSeq = 0, stageRef?: string): Promise<TrainingRunLog[]> {
+  const query = new URLSearchParams({ after_seq: String(afterSeq) });
+  if (stageRef) query.set("stage_ref", stageRef);
+  const data = await requestJson<{ logs: TrainingRunLog[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/logs?${query}`);
   return data.logs;
 }
 
-export async function getTrainingRunMetrics(runRef: string, afterSeq = 0): Promise<TrainingMetricSample[]> {
-  const data = await requestJson<{ metrics: TrainingMetricSample[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/metrics?after_seq=${afterSeq}`);
+export async function getTrainingRunMetrics(runRef: string, afterSeq = 0, stageRef?: string): Promise<TrainingMetricSample[]> {
+  const query = new URLSearchParams({ after_seq: String(afterSeq) });
+  if (stageRef) query.set("stage_ref", stageRef);
+  const data = await requestJson<{ metrics: TrainingMetricSample[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/metrics?${query}`);
   return data.metrics;
 }
 

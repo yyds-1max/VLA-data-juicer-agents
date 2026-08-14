@@ -13,7 +13,7 @@ export const builtinTrainingParameterGroups: TrainingParameterGroup[] = [
   { key: "common", label: "常用参数", order: 0, collapsed: false, custom: false, hint: "高频训练参数保持常驻，可直接调整。" },
   { key: "optimizer", label: "优化器与正则", order: 100, collapsed: true, custom: true, hint: "权重衰减和学习率预热。" },
   { key: "performance", label: "性能与显存", order: 200, collapsed: true, custom: true, hint: "并行配置、计算精度和显存优化。" },
-  { key: "multimodal", label: "模型与多模态", order: 300, collapsed: true, custom: true, hint: "模型版本、视觉塔、投影器和图像 token 策略。" },
+  { key: "multimodal", label: "模型与多模态", order: 300, collapsed: true, custom: true, hint: "模型模板、视觉塔、投影器和图像 token 策略。" },
   { key: "data_eval", label: "数据与验证", order: 400, collapsed: true, custom: true, hint: "长视频采样、帧率、预处理和验证行为。" },
   { key: "artifacts", label: "日志与产物", order: 500, collapsed: true, custom: true, hint: "日志频率、保留策略和指标上报。" },
   { key: "other", label: "其他参数", order: 1000, collapsed: true, custom: false, hint: "尚未归入专用分组的参数。" },

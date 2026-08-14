@@ -323,11 +323,16 @@ class TrainingService:
     def list_models(self, *, include_private: bool = False) -> list[dict[str, Any]]:
         models = self.store.list_models()
         if include_private:
-            models = [self.store.get_model(item["model_ref"], include_private=True) for item in models]
+            models = [
+                self.store.get_model(item["family_ref"], include_private=True)
+                for item in models
+            ]
         return [self._project_model(item) for item in models]
 
-    def get_model(self, model_ref: str, *, include_private: bool = False) -> dict[str, Any]:
-        return self._project_model(self.store.get_model(model_ref, include_private=include_private))
+    def get_model(self, family_ref: str, *, include_private: bool = False) -> dict[str, Any]:
+        return self._project_model(
+            self.store.get_model(family_ref, include_private=include_private)
+        )
 
     def create_model(self, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
@@ -335,30 +340,20 @@ class TrainingService:
         self._require_registered_server(data["launch_template"]["server_ref"])
         return self._project_model(self.store.create_model(data, principal.subject))
 
-    def create_model_version(
-        self, family_ref: str, payload: Any, principal: Any
-    ) -> dict[str, Any]:
-        self._require(principal, TRAINING_MANAGE_MODELS)
-        data = self._adapt_model(self._data(payload))
-        self._require_registered_server(data["launch_template"]["server_ref"])
-        return self._project_model(
-            self.store.create_model_version(family_ref, data, principal.subject)
-        )
-
-    def update_model(self, model_ref: str, payload: Any, principal: Any) -> dict[str, Any]:
+    def update_model(self, family_ref: str, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
         data = self._adapt_model(self._data(payload)); expected = int(data.pop("expected_revision"))
         self._require_registered_server(data["launch_template"]["server_ref"])
-        return self._project_model(self.store.update_model(model_ref, expected, data, principal.subject))
+        return self._project_model(self.store.update_model(family_ref, expected, data, principal.subject))
 
     def verify_model(
-        self, model_ref: str, payload: Any, principal: Any
+        self, family_ref: str, payload: Any, principal: Any
     ) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
         data = self._data(payload)
         return self._project_model(
             self.store.request_model_verification(
-                model_ref,
+                family_ref,
                 int(data["expected_revision"]),
                 principal.subject,
             )
@@ -417,137 +412,151 @@ class TrainingService:
         return adapted
 
     def _prepare(self, payload: Any, *, ignore_platform_leases: bool = False) -> tuple[dict[str, Any], Any]:
-        if not self.simulation_enabled: raise TrainingForbiddenError("simulation_disabled", "Training simulation is disabled.")
+        if not self.simulation_enabled:
+            raise TrainingForbiddenError("simulation_disabled", "Training simulation is disabled.")
         data = self._data(payload)
-        mode = data.get("execution_mode", data.get("mode"))
-        if mode != "simulation": raise TrainingValidationError("unsupported_execution_mode", "Only simulation mode is supported.")
-        server = next(
-            (
-                item
-                for item in self.provider.list_servers()
-                if item["server_ref"] == data["server_ref"]
-            ),
-            None,
-        )
+        if data.get("execution_mode", data.get("mode")) != "simulation":
+            raise TrainingValidationError("unsupported_execution_mode", "Only simulation mode is supported.")
+        server = next((item for item in self.provider.list_servers() if item["server_ref"] == data["server_ref"]), None)
         if server is not None and server.get("kind") != "simulation":
-            raise TrainingValidationError(
-                "real_execution_disabled",
-                "真实训练尚未启用；真实训练节点当前只用于登记模型和查看资源。",
-            )
+            raise TrainingValidationError("real_execution_disabled", "真实训练尚未启用；真实训练节点当前只用于登记模型和查看资源。")
         selected = self.provider.require_available(
-            data["server_ref"],
-            data["gpu_uuids"],
+            data["server_ref"], data["gpu_uuids"],
             ignore_platform_leases=ignore_platform_leases,
         )
-        model = self.store.get_model_record(data["model_ref"])
-        if model["status"] != "draft": raise TrainingValidationError("model_unavailable", "The selected model is not an editable simulation draft.")
-        if model["launch_template"]["server_ref"] != data["server_ref"]: raise TrainingValidationError("server_mismatch", "The model template belongs to another server.")
-        normalized: dict[str, Any] = {}
-        sensitive: list[str] = []
-        supplied = data.get("parameters", {})
+        model = self.store.get_model_record(data["family_ref"])
+        if model["status"] == "disabled":
+            raise TrainingValidationError("model_unavailable", "The selected model family is disabled.")
+        if model["launch_template"]["server_ref"] != data["server_ref"]:
+            raise TrainingValidationError("server_mismatch", "The model template belongs to another server.")
+
         definitions = [ParameterDefinition.model_validate(item) for item in model["parameter_definitions"]]
         by_name = {item.name: item for item in definitions}
-        known = set(by_name)
-        if set(supplied) - known: raise TrainingValidationError("unknown_parameter", "The request contains an unknown training parameter.")
-        active: dict[str, bool] = {}
-        resolving: set[str] = set()
+        stage_input = next((item for item in definitions if item.semantic_role == "stage_input"), None)
+        normalized_stages: list[dict[str, Any]] = []
 
-        def resolve_parameter(definition: ParameterDefinition) -> bool:
-            cached = active.get(definition.name)
-            if cached is not None:
-                return cached
-            if definition.name in resolving:
-                raise TrainingValidationError("invalid_parameter_dependency", "The model contains a cyclic parameter dependency.")
-            resolving.add(definition.name)
-            condition = definition.visible_when
-            if condition is not None:
-                controller = by_name.get(condition.parameter_name)
-                if controller is None:
-                    raise TrainingValidationError("invalid_parameter_dependency", "The model contains an unknown dependency controller.")
-                if not resolve_parameter(controller) or normalized.get(controller.name) != condition.equals:
+        def normalize_stage(stage: dict[str, Any], stage_number: int) -> dict[str, Any]:
+            supplied = dict(stage.get("parameters") or {})
+            source = stage.get("stage_input_source", "manual")
+            if stage_number == 1 and source != "manual":
+                raise TrainingValidationError("invalid_stage_input_source", "The first stage must use manual input.")
+            if source == "previous_stage_output" and stage_input is None:
+                raise TrainingValidationError("stage_input_not_registered", "The model family has no stage input parameter; use manual input for every stage.")
+            if set(supplied) - set(by_name):
+                raise TrainingValidationError("unknown_parameter", f"Stage {stage_number} contains an unknown training parameter.")
+            normalized: dict[str, Any] = {}
+            sensitive: list[str] = []
+            active: dict[str, bool] = {}
+            resolving: set[str] = set()
+
+            def resolve(definition: ParameterDefinition) -> bool:
+                if definition.name in active:
+                    return active[definition.name]
+                if definition.name in resolving:
+                    raise TrainingValidationError("invalid_parameter_dependency", "The model contains a cyclic parameter dependency.")
+                resolving.add(definition.name)
+                if (
+                    source == "previous_stage_output"
+                    and stage_input is not None
+                    and definition.name == stage_input.name
+                ):
+                    # The real value is the previous stage's output directory,
+                    # which is only known while RunSpecs are built.  Validate
+                    # that real path below instead of validating a placeholder.
                     resolving.remove(definition.name)
-                    active[definition.name] = False
-                    return False
-            try:
-                normalized[definition.name] = normalize_parameter_value(
-                    definition,
-                    supplied.get(definition.name, definition.default),
-                )
-            except ValueError as exc:
-                raise TrainingValidationError("invalid_parameter", str(exc)) from exc
-            resolving.remove(definition.name)
-            active[definition.name] = True
-            if definition.sensitive:
-                sensitive.append(definition.name)
-            return True
+                    active[definition.name] = True
+                    if definition.sensitive:
+                        sensitive.append(definition.name)
+                    return True
+                condition = definition.visible_when
+                if condition is not None:
+                    controller = by_name.get(condition.parameter_name)
+                    if controller is None:
+                        raise TrainingValidationError("invalid_parameter_dependency", "The model contains an unknown dependency controller.")
+                    if not resolve(controller) or normalized.get(controller.name) != condition.equals:
+                        resolving.remove(definition.name)
+                        active[definition.name] = False
+                        return False
+                try:
+                    normalized[definition.name] = normalize_parameter_value(
+                        definition, supplied.get(definition.name, definition.default)
+                    )
+                except ValueError as exc:
+                    raise TrainingValidationError("invalid_parameter", f"Stage {stage_number}: {exc}") from exc
+                resolving.remove(definition.name)
+                active[definition.name] = True
+                if definition.sensitive:
+                    sensitive.append(definition.name)
+                return True
 
-        for definition in definitions:
-            resolve_parameter(definition)
+            for definition in definitions:
+                resolve(definition)
+            total_steps = int(normalized.get("max_steps", 20))
+            if total_steps < 1 or total_steps > 10_000:
+                raise TrainingValidationError("invalid_max_steps", "Simulation max_steps must be between 1 and 10000.")
+            return {"parameters": normalized, "sensitive_parameters": sensitive, "stage_input_source": source, "total_steps": total_steps}
+
+        for index, stage in enumerate(data["stages"], start=1):
+            normalized_stages.append(normalize_stage(stage, index))
+
         indexes = [item["index"] for item in selected]
         template = model["launch_template"]
-        launcher_kind = template.get("launcher_kind") or (
-            "torchrun"
-            if str(template["executable"]).rsplit("/", 1)[-1] == "torchrun"
-            else "direct"
-        )
+        launcher_kind = template.get("launcher_kind") or ("torchrun" if str(template["executable"]).rsplit("/", 1)[-1] == "torchrun" else "direct")
         uses_torchrun = launcher_kind == "torchrun"
         nproc_per_node = len(indexes) if uses_torchrun else 1
+        stage_names = ("第一阶段", "第二阶段", "第三阶段", "第四阶段", "第五阶段", "第六阶段", "第七阶段", "第八阶段", "第九阶段", "第十阶段")
 
-        def build(run_ref: str, port: int | None) -> dict[str, Any]:
-            output = f"{template['output_root'].rstrip('/')}/{run_ref}"
-            if uses_torchrun:
-                if port is None:
-                    raise TrainingValidationError(
-                        "master_port_required",
-                        "Torchrun requires an allocated master port.",
-                    )
-                argv = [
-                    template["executable"],
-                    "--nnodes=1",
-                    f"--nproc_per_node={nproc_per_node}",
-                    "--master_addr=127.0.0.1",
-                    f"--master_port={port}",
-                    "--node_rank=0",
-                    template["entrypoint"],
-                    *template.get("fixed_argv", []),
-                ]
-            else:
-                argv = [
-                    template["executable"],
-                    template["entrypoint"],
-                    *template.get("fixed_argv", []),
-                ]
-            safe_argv = list(argv)
-            for definition in definitions:
-                if definition.name not in normalized:
-                    continue
-                value = normalized[definition.name]
-                if definition.argument_style == "flag_when_true":
-                    if value: argv.append(definition.cli_flag); safe_argv.append(definition.cli_flag)
-                    continue
-                if definition.argument_style == "explicit_boolean":
-                    rendered = "True" if value else "False"
+        def build(run_ref: str, port: int | None, version_meta: dict[str, Any]) -> dict[str, Any]:
+            if uses_torchrun and port is None:
+                raise TrainingValidationError("master_port_required", "Torchrun requires an allocated master port.")
+            version_segment = "preview" if run_ref == "preview" else version_meta["version_label"]
+            built_stages: list[dict[str, Any]] = []
+            previous_output: str | None = None
+            for stage_number, source_stage in enumerate(normalized_stages, start=1):
+                output = f"{template['output_root'].rstrip('/')}/{model['family_ref']}/{version_segment}/stage-{stage_number:02d}"
+                parameters = dict(source_stage["parameters"])
+                if source_stage["stage_input_source"] == "previous_stage_output" and stage_input is not None:
+                    if previous_output is None:
+                        raise TrainingValidationError(
+                            "invalid_stage_input_source",
+                            "A previous stage output is required for automatic stage input.",
+                        )
+                    try:
+                        parameters[stage_input.name] = normalize_parameter_value(
+                            stage_input, previous_output
+                        )
+                    except ValueError as exc:
+                        raise TrainingValidationError(
+                            "invalid_parameter",
+                            f"Stage {stage_number}: {exc}",
+                        ) from exc
+                if uses_torchrun:
+                    argv = [template["executable"], "--nnodes=1", f"--nproc_per_node={nproc_per_node}", "--master_addr=127.0.0.1", f"--master_port={port}", "--node_rank=0", template["entrypoint"], *template.get("fixed_argv", [])]
                 else:
-                    rendered = str(value)
-                argv.extend([definition.cli_flag, rendered])
-                safe_argv.extend([definition.cli_flag, "********" if definition.sensitive else rendered])
-            output_flag = template.get("output_flag", "--output_dir")
-            argv.extend([output_flag, output])
-            safe_argv.extend([output_flag, output])
-            distributed = {
-                "master_addr": "127.0.0.1" if uses_torchrun else None,
-                "master_port": port if uses_torchrun else None,
-                "node_rank": 0 if uses_torchrun else None,
-            }
-            private = {"version": 1, "mode": "simulation", "model_ref": model["model_ref"], "family_ref": model["family_ref"], "family_name": model["family_name"], "model_version_number": model["version_number"], "model_display_name": f"{model['family_name']} v{model['version_number']}", "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "gpu_indexes": indexes, "launcher_kind": launcher_kind, "nnodes": 1, "nproc_per_node": nproc_per_node, **distributed, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str,indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "sensitive_parameters": sensitive, "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv)}
-            safe = {"contract_version": 1, "execution_mode": "simulation", "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": normalized, "argv": safe_argv, "output_preview": output}
-            safe["parameters"] = {key: "********" if key in sensitive else value for key,value in normalized.items()}
-            private["public_spec"] = safe
-            return {"private_spec": private, "run_spec": safe, "command_preview": private["safe_command_preview"]}
-        total_steps = int(normalized.get("max_steps", 20))
-        if total_steps < 1 or total_steps > 10_000:
-            raise TrainingValidationError("invalid_max_steps", "Simulation max_steps must be between 1 and 10000.")
-        prepared = {"model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "parameters": normalized, "total_steps": total_steps, "requires_master_port": uses_torchrun}
+                    argv = [template["executable"], template["entrypoint"], *template.get("fixed_argv", [])]
+                safe_argv = list(argv)
+                for definition in definitions:
+                    if definition.name not in parameters:
+                        continue
+                    value = parameters[definition.name]
+                    if definition.argument_style == "flag_when_true":
+                        if value:
+                            argv.append(definition.cli_flag); safe_argv.append(definition.cli_flag)
+                        continue
+                    rendered = "True" if definition.argument_style == "explicit_boolean" and value else "False" if definition.argument_style == "explicit_boolean" else str(value)
+                    argv.extend([definition.cli_flag, rendered])
+                    safe_argv.extend([definition.cli_flag, "********" if definition.sensitive else rendered])
+                output_flag = template.get("output_flag", "--output_dir")
+                argv.extend([output_flag, output]); safe_argv.extend([output_flag, output])
+                distributed = {"master_addr": "127.0.0.1" if uses_torchrun else None, "master_port": port if uses_torchrun else None, "node_rank": 0 if uses_torchrun else None}
+                public_parameters = {key: "********" if key in source_stage["sensitive_parameters"] else value for key, value in parameters.items()}
+                public = {"contract_version": 2, "execution_mode": "simulation", "family_ref": model["family_ref"], "family_name": model["family_name"], "version_label": version_meta.get("version_label"), "stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": public_parameters, "entrypoint": template["entrypoint"], "argv": safe_argv, "output_preview": output}
+                private = {**public, "version": 2, "mode": "simulation", "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": ["simulation_only", "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
+                built_stages.append({"stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "stage_input_source": source_stage["stage_input_source"], "parameters": parameters, "private_spec": private, "run_spec": public, "command_preview": private["safe_command_preview"], "output_directory": output, "total_steps": source_stage["total_steps"], "preflight": [{"ok": True, "code": "simulation_ready", "message": "Simulation inputs and GPU availability are valid."}]})
+                previous_output = output
+            return {"stages": built_stages, "total_steps": sum(stage["total_steps"] for stage in built_stages)}
+
+        prepared = {"family_ref": model["family_ref"], "model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "stages": normalized_stages, "total_steps": sum(stage["total_steps"] for stage in normalized_stages), "requires_master_port": uses_torchrun}
         return prepared, build
 
     def preview_run(self, payload: Any, principal: Any) -> dict[str, Any]:
@@ -558,17 +567,43 @@ class TrainingService:
             if prepared["requires_master_port"]
             else None
         )
-        built = builder("preview", port)
-        return {"run_spec": built["run_spec"], "command_preview": built["command_preview"], "preflight": [{"ok": True, "code": "simulation_ready", "message": "Simulation inputs and GPU availability are valid."}]}
+        built = builder(
+            "preview",
+            port,
+            {
+                "version_ref": None,
+                "version_number": None,
+                "version_date": None,
+                "version_label": "preview",
+            },
+        )
+        return {
+            "stages": built["stages"],
+            "preflight": [{"ok": True, "code": "simulation_ready", "message": "All simulation stages and GPU selections are valid."}],
+        }
 
     def create_run(self, payload: Any, idempotency_key: str, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_CREATE_RUNS)
+        public_request = self._data(payload)
+        existing = self.store.find_create_run_by_idempotency(
+            idempotency_key, public_request
+        )
+        if existing is not None:
+            return self._project_run(existing)
         # Store idempotency is checked before its atomic GPU lease check.  We
         # therefore ignore only our own platform leases here, allowing a
         # byte-equivalent retry to return the original run while still
         # rejecting external occupancy and conflicting new submissions.
         prepared, builder = self._prepare(payload, ignore_platform_leases=True)
-        return self._project_run(self.store.create_run(data=prepared, run_spec_builder=builder, idempotency_key=idempotency_key, actor=principal.subject))
+        return self._project_run(
+            self.store.create_run(
+                data=prepared,
+                run_spec_builder=builder,
+                idempotency_key=idempotency_key,
+                actor=principal.subject,
+                idempotency_payload=public_request,
+            )
+        )
 
     def _project_run(self, run: dict[str, Any]) -> dict[str, Any]:
         metric_page = self.store.list_metrics(run["run_ref"], 0, 2000)
@@ -581,6 +616,6 @@ class TrainingService:
     def get_run(self, run_ref: str) -> dict[str, Any]: return self._project_run(self.store.get_run(run_ref))
     def stop_run(self, run_ref: str, expected_revision: int, idempotency_key: str, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_STOP_RUNS); return self._project_run(self.store.stop_run(run_ref, expected_revision, idempotency_key, principal.subject))
-    def list_logs(self, run_ref: str, *, after_seq: int, limit: int) -> dict[str, Any]: return self.store.list_logs(run_ref, after_seq, limit)
-    def list_metrics(self, run_ref: str, *, after_seq: int, limit: int) -> dict[str, Any]: return self.store.list_metrics(run_ref, after_seq, limit)
+    def list_logs(self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]: return self.store.list_logs(run_ref, after_seq, limit, stage_ref=stage_ref)
+    def list_metrics(self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]: return self.store.list_metrics(run_ref, after_seq, limit, stage_ref=stage_ref)
     def list_events(self, *, after_seq: int, limit: int) -> dict[str, Any]: return self.store.list_events(after_seq, limit)

@@ -52,7 +52,8 @@ function NumericField({ ariaLabel, value, integer, optional = false, disabled, p
 
 export function validateParameterDefinitions(definitions: TrainingParameterDefinition[]) {
   if (!definitions.length) throw new Error("请至少添加一个训练参数。");
-  if (definitions.filter((parameter) => parameter.semantic_role === "dataset").length > 1) throw new Error("每个模型版本最多只能指定一个数据集参数。");
+  if (definitions.filter((parameter) => parameter.semantic_role === "dataset").length > 1) throw new Error("每个模型族最多只能指定一个数据集参数。");
+  if (definitions.filter((parameter) => parameter.semantic_role === "stage_input").length > 1) throw new Error("每个模型族最多只能指定一个阶段输入参数。");
   const keys = new Set<string>(); const flags = new Set<string>();
   definitions.forEach((parameter, index) => {
     const position = index + 1;
@@ -61,6 +62,8 @@ export function validateParameterDefinitions(definitions: TrainingParameterDefin
     keys.add(parameter.key);
     if (!parameter.label.trim()) throw new Error(`参数 ${parameter.key} 缺少显示名称。`);
     if (parameter.semantic_role === "dataset" && !["string", "enum"].includes(parameter.type)) throw new Error(`数据集参数 ${parameter.key} 只能使用字符串或枚举类型。`);
+    if (parameter.semantic_role === "stage_input" && parameter.type !== "string") throw new Error(`阶段输入参数 ${parameter.key} 只能使用字符串类型。`);
+    if (parameter.semantic_role === "stage_input" && parameter.visible_when) throw new Error(`阶段输入参数 ${parameter.key} 必须始终可用，不能设置参数依赖条件。`);
     if (parameter.label.trim().length > 200) throw new Error(`参数 ${parameter.key} 的显示名称不能超过 200 个字符。`);
     if ((parameter.description?.length ?? 0) > 120) throw new Error(`参数 ${parameter.key} 的解释不能超过 120 个字符。`);
     const flag = parameter.cli_flag || `--${parameter.key}`;
@@ -221,7 +224,21 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
     key,
     cli_flag: !parameter.cli_flag || parameter.cli_flag === `--${parameter.key}` ? `--${key}` : parameter.cli_flag,
   });
-  const changeType = (type: TrainingParameterType) => onChange({ ...parameter, type, semantic_role: ["string", "enum"].includes(type) ? parameter.semantic_role : "hyperparameter", minimum: undefined, maximum: undefined, string_min_length: undefined, string_max_length: undefined, ...defaultForType(type) });
+  const changeType = (type: TrainingParameterType) => {
+    if (parameter.semantic_role === "stage_input" && type !== "string" && !window.confirm("阶段输入参数只能使用字符串类型。继续修改会同时取消其阶段输入用途，确定继续吗？")) return;
+    onChange({
+      ...parameter,
+      type,
+      semantic_role: parameter.semantic_role === "stage_input"
+        ? (type === "string" ? "stage_input" : "hyperparameter")
+        : ["string", "enum"].includes(type) ? parameter.semantic_role : "hyperparameter",
+      minimum: undefined,
+      maximum: undefined,
+      string_min_length: undefined,
+      string_max_length: undefined,
+      ...defaultForType(type),
+    });
+  };
   const dependencySummary = parameterDependencySummary(definitions, parameter);
   const selectedGroup = trainingParameterGroupFor(parameter);
   const numericDefault = typeof parameter.default === "number" && Number.isFinite(parameter.default) ? parameter.default : null;
@@ -253,7 +270,17 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
       <label className="text-xs text-console-muted">页面显示名称<input aria-label={`${parameter.key || "未命名参数"} 显示名称`} className={inputClass} value={parameter.label} maxLength={200} disabled={disabled} placeholder="视频帧数" onChange={(event) => update("label", event.target.value)} /></label>
       <label className="text-xs text-console-muted">CLI flag<input aria-label={`${parameter.key || "未命名参数"} CLI flag`} className={inputClass} value={parameter.cli_flag ?? `--${parameter.key}`} maxLength={102} disabled={disabled} placeholder="--num_video_frames" onChange={(event) => update("cli_flag", event.target.value)} /></label>
       <label className="text-xs text-console-muted">类型<select aria-label={`${parameter.key || "未命名参数"} 类型`} className={inputClass} value={parameter.type} disabled={disabled} onChange={(event) => changeType(event.target.value as TrainingParameterType)}>{parameterTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select></label>
-      <label className="text-xs text-console-muted">参数用途<select aria-label={`${parameter.key || "未命名参数"} 参数用途`} className={inputClass} value={parameter.semantic_role ?? "hyperparameter"} disabled={disabled || !["string", "enum"].includes(parameter.type)} onChange={(event) => update("semantic_role", event.target.value as "hyperparameter" | "dataset")}><option value="hyperparameter">训练超参数</option><option value="dataset">数据集输入</option></select></label>
+      <label className="text-xs text-console-muted">参数用途<select aria-label={`${parameter.key || "未命名参数"} 参数用途`} className={inputClass} value={parameter.semantic_role ?? "hyperparameter"} disabled={disabled || !["string", "enum"].includes(parameter.type)} onChange={(event) => {
+        const role = event.target.value as NonNullable<TrainingParameterDefinition["semantic_role"]>;
+        if (role === "stage_input") {
+          const existing = definitions.find((item) => item !== parameter && item.semantic_role === "stage_input");
+          if (existing && !window.confirm(`阶段输入参数最多只能有一个。是否改用 ${parameter.key}，并将 ${existing.key} 恢复为训练超参数？`)) return;
+          if (parameter.visible_when && !window.confirm("阶段输入参数必须始终可用。设为阶段输入参数会移除该参数已有的依赖条件，确定继续吗？")) return;
+          onChange({ ...parameter, semantic_role: role, visible_when: null });
+          return;
+        }
+        update("semantic_role", role);
+      }}><option value="hyperparameter">训练超参数</option><option value="dataset">数据集输入</option>{parameter.type === "string" ? <option value="stage_input">阶段输入参数（接收上一阶段输出）</option> : null}</select><span className="mt-1 block text-[11px] leading-4">阶段输入参数用于多阶段训练，后续阶段可自动接收上一阶段产物输出目录。</span></label>
       {parameter.type === "boolean" ? <label className="text-xs text-console-muted">默认值<select aria-label={`${parameter.key} 默认值`} className={inputClass} value={String(parameter.default)} disabled={disabled} onChange={(event) => update("default", event.target.value === "true")}><option value="true">True</option><option value="false">False</option></select></label>
       : parameter.type === "enum" ? null
       : parameter.type === "string" ? <label className="text-xs text-console-muted">默认值<input aria-label={`${parameter.key} 默认值`} aria-invalid={Boolean(stringDefaultError)} className={`${inputClass} ${stringDefaultError ? "border-rose-500" : ""}`} type="text" value={String(parameter.default)} maxLength={Number.isInteger(stringMaximum) && stringMaximum >= 0 && stringMaximum <= 512 ? stringMaximum : 512} disabled={disabled} onChange={(event) => update("default", event.target.value)} />{stringDefaultError ? <span role="alert" className="mt-1 block text-[11px] text-rose-700">{stringDefaultError}</span> : null}</label>
@@ -281,6 +308,7 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
   const [newGroupError, setNewGroupError] = useState<string | null>(null);
   const [manageGroupsOpen, setManageGroupsOpen] = useState(false);
   const [deleteGroupKey, setDeleteGroupKey] = useState<string | null>(null);
+  const [dependencyError, setDependencyError] = useState<string | null>(null);
   const groupOptions = availableTrainingParameterGroups(definitions);
   const usedGroups = usedTrainingParameterGroups(definitions);
   const deleteGroup = usedGroups.find((group) => group.key === deleteGroupKey);
@@ -298,6 +326,7 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
     if (changesTypeWithConfiguration && !window.confirm(`修改参数类型会重置类型专属配置${dependents.length ? `，并移除 ${dependents.length} 条以此参数为条件的依赖规则` : ""}。确定继续吗？`)) return;
     onChange(definitions.map((item) => {
     if (item === target) return next;
+    if (next.semantic_role === "stage_input" && item.semantic_role === "stage_input") return { ...item, semantic_role: "hyperparameter" };
     if (target.type !== next.type && item.visible_when?.parameter_key === target.key) return { ...item, visible_when: null };
     if (target.key !== next.key && item.visible_when?.parameter_key === target.key) return { ...item, visible_when: { ...item.visible_when, parameter_key: next.key } };
     if (item.visible_when?.parameter_key === target.key && renamedValue && item.visible_when.equals === renamedValue.from) return { ...item, visible_when: { ...item.visible_when, equals: renamedValue.to } };
@@ -363,8 +392,18 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
     setDeleteGroupKey(null);
     setManageGroupsOpen(true);
   };
+  const updateDependencies = (nextDefinitions: TrainingParameterDefinition[]) => {
+    const invalidStageInput = nextDefinitions.find((parameter) => parameter.semantic_role === "stage_input" && parameter.visible_when);
+    if (invalidStageInput) {
+      setDependencyError(`阶段输入参数 ${invalidStageInput.key} 必须始终可用，不能设置参数依赖条件。`);
+      return;
+    }
+    setDependencyError(null);
+    onChange(nextDefinitions);
+  };
   return <div className="space-y-4">
-    <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="font-medium text-console-text">训练脚本参数</h3><p className="text-xs text-console-muted">无需填写参数数量。逐项添加字段、类型、默认值、CLI flag 与展示分组，平台会生成结构化 argv。</p></div><div className="flex flex-wrap gap-2"><ParameterDependencyDialog definitions={definitions} disabled={disabled} onChange={onChange} /><ConsoleButton variant="ghost" disabled={disabled || !definitions.length} onClick={() => setManageGroupsOpen(true)}><Settings2 className="h-4 w-4" />管理参数分组</ConsoleButton><ConsoleButton variant="ghost" disabled={disabled} onClick={add}><Plus className="h-4 w-4" />添加参数</ConsoleButton></div></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="font-medium text-console-text">训练脚本参数</h3><p className="text-xs text-console-muted">无需填写参数数量。逐项添加字段、类型、默认值、CLI flag 与展示分组，平台会生成结构化 argv。</p></div><div className="flex flex-wrap gap-2"><ParameterDependencyDialog definitions={definitions} disabled={disabled} onChange={updateDependencies} /><ConsoleButton variant="ghost" disabled={disabled || !definitions.length} onClick={() => setManageGroupsOpen(true)}><Settings2 className="h-4 w-4" />管理参数分组</ConsoleButton><ConsoleButton variant="ghost" disabled={disabled} onClick={add}><Plus className="h-4 w-4" />添加参数</ConsoleButton></div></div>
+    {dependencyError ? <p role="alert" className="text-sm text-rose-700">{dependencyError}</p> : null}
     {usedGroups.map((group) => { const items = definitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key); return <section key={group.key} aria-label={group.label}><details className="rounded-md border border-console-line bg-console-panel p-3" open={openGroups[group.key] ?? !group.collapsed} onToggle={(event) => { const open = event.currentTarget.open; setOpenGroups((current) => current[group.key] === open ? current : { ...current, [group.key]: open }); }}><summary className="cursor-pointer"><span className="text-sm font-semibold text-console-text">{group.label} <span className="font-normal text-console-muted">({items.length})</span></span><span className="ml-2 text-xs text-console-muted">{group.hint}</span></summary><div className="mt-3 space-y-2">{items.map((parameter) => <ParameterCard key={definitions.indexOf(parameter)} parameter={parameter} definitions={definitions} groups={groupOptions} disabled={disabled} onChange={(next) => replace(parameter, next)} onDelete={() => remove(parameter)} onRequestNewGroup={() => requestNewGroup(parameter)} />)}</div></details></section>; })}
     <Dialog open={newGroupTargetKey !== null} onOpenChange={(open) => { if (!open) { setNewGroupTargetKey(null); setNewGroupError(null); } }}>
       <DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>新建参数分组</DialogTitle><DialogDescription>新分组会作为折叠区显示，并自动接收当前参数。</DialogDescription></DialogHeader><label className="text-sm text-console-muted">分组名称<input autoFocus aria-label="新分组名称" className={inputClass} value={newGroupName} maxLength={30} placeholder="例如：LoRA 配置" onChange={(event) => { setNewGroupName(event.target.value); setNewGroupError(null); }} /></label><p className="text-xs text-console-muted">{newGroupName.length}/30，至少 2 个字符</p>{newGroupError ? <p role="alert" className="text-sm text-rose-700">{newGroupError}</p> : null}<DialogFooter><ConsoleButton onClick={() => setNewGroupTargetKey(null)}>取消</ConsoleButton><ConsoleButton variant="primary" onClick={createGroup}>创建并移入</ConsoleButton></DialogFooter></DialogContent>

@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 def verify_model_configuration(payload: Mapping[str, object]) -> dict[str, object]:
-    """Perform deterministic read-only checks for one registered model version."""
+    """Perform deterministic read-only checks for a model family's current definition."""
     working_directory = _required_text(payload, "working_directory", 1000)
     executable = _required_text(payload, "executable", 500)
     entrypoint = _required_text(payload, "entrypoint", 1000)

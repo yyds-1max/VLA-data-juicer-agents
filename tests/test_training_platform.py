@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vla_data_juicer_agents.training.api import create_training_router
-from vla_data_juicer_agents.training.auth import TrainingSettings
+from vla_data_juicer_agents.training.auth import TrainingPrincipal, TrainingSettings
 from vla_data_juicer_agents.training.migrations import LATEST_TRAINING_SCHEMA_VERSION
 from vla_data_juicer_agents.training.resources import (
     FakeResourceProvider,
@@ -23,7 +24,6 @@ from vla_data_juicer_agents.training.worker import TrainingWorker
 def _model_payload(*, name: str = "NaVILA draft") -> dict[str, object]:
     return {
         "family_name": name,
-        "version_description": "Simulation-only launch template.",
         "configuration": {
             "launch_template": {
                 "domain": "vla",
@@ -74,21 +74,24 @@ def _model_payload(*, name: str = "NaVILA draft") -> dict[str, object]:
 
 
 def _run_payload(
-    model_ref: str,
+    family_ref: str,
     *,
     gpu_uuids: list[str] | None = None,
     simulate_failure: bool = False,
 ) -> dict[str, object]:
     return {
-        "model_ref": model_ref,
+        "family_ref": family_ref,
         "server_ref": "fake-local",
         "gpu_uuids": gpu_uuids or ["fake-a100-00", "fake-a100-01"],
-        "parameters": {
-            "num_video_frames": 8,
-            "max_steps": 2,
-            "hub_token": "private",
-            "simulate_failure": simulate_failure,
-        },
+        "stages": [{
+            "stage_input_source": "manual",
+            "parameters": {
+                "num_video_frames": 8,
+                "max_steps": 2,
+                "hub_token": "private",
+                "simulate_failure": simulate_failure,
+            },
+        }],
         "execution_mode": "simulation",
     }
 
@@ -239,10 +242,10 @@ def test_runtime_and_monitoring_contracts_roundtrip_and_reach_run_spec(
 
     preview = client.post(
         "/api/training/runs/preview",
-        json=_run_payload(str(model["model_ref"])),
+        json=_run_payload(str(model["family_ref"])),
     )
     assert preview.status_code == 200, preview.text
-    spec = preview.json()["run_spec"]
+    spec = preview.json()["stages"][0]["run_spec"]
     assert spec["runtime_environment"] == registered_template["runtime_environment"]
     assert spec["monitoring"] == registered_template["monitoring"]
 
@@ -295,7 +298,8 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         (3, "training_node_deployment_m3"),
         (4, "model_families_m4"),
         (5, "model_worker_verification_m5"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "training_node_revision_split_m6"),
+        (6, "training_node_revision_split_m6"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "training_workflows_m7"),
     ]
 
 
@@ -322,7 +326,7 @@ def test_read_only_projection_hides_launch_paths_and_rejects_stop(
     service: TrainingService,
 ) -> None:
     admin = _client(service, admin=True)
-    model_ref = str(_create_model(admin)["model_ref"])
+    model_ref = str(_create_model(admin)["family_ref"])
     created = admin.post(
         "/api/training/runs",
         json=_run_payload(model_ref, gpu_uuids=["fake-a100-00"]),
@@ -354,6 +358,78 @@ def test_read_only_projection_hides_launch_paths_and_rejects_stop(
     assert stop.json()["detail"]["code"] == "training_write_forbidden"
 
 
+def test_run_creator_without_model_management_uses_the_real_sensitive_default(
+    service: TrainingService,
+) -> None:
+    admin = _client(service, admin=True)
+    payload = _model_payload()
+    payload["configuration"]["parameter_definitions"].append(  # type: ignore[index,union-attr]
+        {
+            "key": "private_mode_steps",
+            "label": "Private mode steps",
+            "type": "integer",
+            "default": 1,
+            "cli_flag": "--private_mode_steps",
+            "visible_when": {
+                "parameter_key": "hub_token",
+                "equals": "local-token",
+            },
+        }
+    )
+    created_model = admin.post("/api/training/models", json=payload)
+    assert created_model.status_code == 201, created_model.text
+    family_ref = str(created_model.json()["model"]["family_ref"])
+    principal = TrainingPrincipal(
+        subject="run-creator",
+        authentication_mode="test",
+        permissions=frozenset({"training:view", "training:create_runs"}),
+    )
+    app = FastAPI()
+    app.include_router(
+        create_training_router(
+            service,
+            settings=TrainingSettings(simulation_enabled=True),
+            principal_provider=lambda: principal,
+        )
+    )
+    client = TestClient(app)
+
+    model = client.get(f"/api/training/models/{family_ref}").json()["model"]
+    hub_token = next(
+        definition
+        for definition in model["configuration"]["parameter_definitions"]
+        if definition["key"] == "hub_token"
+    )
+    assert hub_token["default"] == "********"
+    private_mode_steps = next(
+        definition
+        for definition in model["configuration"]["parameter_definitions"]
+        if definition["key"] == "private_mode_steps"
+    )
+    assert private_mode_steps["visible_when"] is None
+    assert "local-token" not in str(model)
+    request = _run_payload(family_ref, gpu_uuids=["fake-a100-00"])
+    del request["stages"][0]["parameters"]["hub_token"]  # type: ignore[index]
+
+    created = client.post(
+        "/api/training/runs",
+        json=request,
+        headers={"Idempotency-Key": "masked-sensitive-default"},
+    )
+
+    assert created.status_code == 201, created.text
+    serialized_response = str(created.json())
+    assert "local-token" not in serialized_response
+    assert "********" in serialized_response
+    with service.store.connection() as db:
+        private_spec = json.loads(db.execute(
+            "SELECT run_spec_json FROM training_stages"
+        ).fetchone()[0])
+    assert private_spec["parameters"]["hub_token"] == "local-token"
+    assert "local-token" in private_spec["argv"]
+    assert "********" not in private_spec["argv"]
+
+
 def test_frame_count_comes_from_parameter_not_entrypoint_name(
     service: TrainingService,
 ) -> None:
@@ -365,12 +441,12 @@ def test_frame_count_comes_from_parameter_not_entrypoint_name(
 
     preview = client.post(
         "/api/training/runs/preview",
-        json=_run_payload(str(created.json()["model"]["model_ref"])),
+        json=_run_payload(str(created.json()["model"]["family_ref"])),
     )
     assert preview.status_code == 200, preview.text
     body = preview.json()
-    assert body["run_spec"]["parameters"]["num_video_frames"] == 8
-    assert "--num_video_frames 8" in body["command_preview"]
+    assert body["stages"][0]["run_spec"]["parameters"]["num_video_frames"] == 8
+    assert "--num_video_frames 8" in body["stages"][0]["command_preview"]
 
 
 def test_argument_styles_and_platform_launch_arguments(
@@ -414,13 +490,13 @@ def test_argument_styles_and_platform_launch_arguments(
     assert projected["gradient_checkpointing"] == "flag_when_true"
     assert model["configuration"]["launch_template"]["output_flag"] == "--save_to"
 
-    request = _run_payload(str(model["model_ref"]))
-    request["parameters"].update(  # type: ignore[union-attr]
+    request = _run_payload(str(model["family_ref"]))
+    request["stages"][0]["parameters"].update(  # type: ignore[index,union-attr]
         {"do_eval": False, "gradient_checkpointing": True}
     )
     preview = client.post("/api/training/runs/preview", json=request)
     assert preview.status_code == 200, preview.text
-    spec = preview.json()["run_spec"]
+    spec = preview.json()["stages"][0]["run_spec"]
     argv = spec["argv"]
     assert spec["launcher_kind"] == "torchrun"
     assert spec["nproc_per_node"] == 2
@@ -430,8 +506,12 @@ def test_argument_styles_and_platform_launch_arguments(
     assert argv[argv.index("--do_eval") + 1] == "False"
     assert "--gradient_checkpointing" in argv
     assert "--simulate_failure" not in argv  # legacy omitted style stays presence-only
-    assert argv[argv.index("--save_to") + 1] == "/workspace/outputs/preview"
-    assert spec["output_preview"] == "/workspace/outputs/preview"
+    assert argv[argv.index("--save_to") + 1] == (
+        f"/workspace/outputs/{model['family_ref']}/preview/stage-01"
+    )
+    assert spec["output_preview"] == (
+        f"/workspace/outputs/{model['family_ref']}/preview/stage-01"
+    )
     assert spec["environment"] == {"CUDA_VISIBLE_DEVICES": "0,1"}
 
 
@@ -511,7 +591,7 @@ def test_enum_choice_value_and_label_roundtrip_through_read_and_configuration(
     created = client.post("/api/training/models", json=payload)
     assert created.status_code == 201, created.text
     model = created.json()["model"]
-    model_ref = model["model_ref"]
+    model_ref = model["family_ref"]
 
     def choices_from(body: dict[str, object]) -> list[dict[str, str]]:
         configuration = body["model"]["configuration"]  # type: ignore[index]
@@ -526,7 +606,6 @@ def test_enum_choice_value_and_label_roundtrip_through_read_and_configuration(
 
     update_source = _typed_model_payload()
     update_payload = {
-        "version_description": "Configuration keeps presentation labels.",
         "configuration": update_source["configuration"],
         "expected_revision": model["edit_revision"],
     }
@@ -613,8 +692,8 @@ def test_preview_strictly_validates_all_parameter_value_types(
     client = _client(service, admin=True)
     created = client.post("/api/training/models", json=_typed_model_payload())
     assert created.status_code == 201, created.text
-    request = _run_payload(created.json()["model"]["model_ref"])
-    request["parameters"].update(  # type: ignore[union-attr]
+    request = _run_payload(created.json()["model"]["family_ref"])
+    request["stages"][0]["parameters"].update(  # type: ignore[index,union-attr]
         {
             "learning_rate": 0.001,
             "use_cache": True,
@@ -651,8 +730,8 @@ def test_string_length_constraints_roundtrip_and_apply_to_run_values(
     assert projected["string_min_length"] == 3
     assert projected["string_max_length"] == 12
 
-    request = _run_payload(model["model_ref"])
-    request["parameters"].update(  # type: ignore[union-attr]
+    request = _run_payload(model["family_ref"])
+    request["stages"][0]["parameters"].update(  # type: ignore[index,union-attr]
         {
             "learning_rate": 0.001,
             "use_cache": True,
@@ -715,28 +794,28 @@ def test_visible_when_roundtrips_and_omits_stale_values_until_enabled(
     )
     assert condition == {"parameter_key": "use_lora", "equals": True}
 
-    stale_request = _run_payload(model["model_ref"])
-    stale_request["parameters"].update(  # type: ignore[union-attr]
+    stale_request = _run_payload(model["family_ref"])
+    stale_request["stages"][0]["parameters"].update(  # type: ignore[index,union-attr]
         {"use_lora": False, "lora_rank": 64}
     )
     hidden = client.post("/api/training/runs/preview", json=stale_request)
     assert hidden.status_code == 200, hidden.text
     hidden_body = hidden.json()
-    assert "lora_rank" not in hidden_body["run_spec"]["parameters"]
-    assert "--lora_rank" not in hidden_body["run_spec"]["argv"]
-    assert "--lora_rank" not in hidden_body["command_preview"]
+    assert "lora_rank" not in hidden_body["stages"][0]["run_spec"]["parameters"]
+    assert "--lora_rank" not in hidden_body["stages"][0]["run_spec"]["argv"]
+    assert "--lora_rank" not in hidden_body["stages"][0]["command_preview"]
 
-    enabled_request = _run_payload(model["model_ref"])
-    enabled_request["parameters"].update(  # type: ignore[union-attr]
+    enabled_request = _run_payload(model["family_ref"])
+    enabled_request["stages"][0]["parameters"].update(  # type: ignore[index,union-attr]
         {"use_lora": True, "lora_rank": 32}
     )
     enabled = client.post("/api/training/runs/preview", json=enabled_request)
     assert enabled.status_code == 200, enabled.text
     enabled_body = enabled.json()
-    assert enabled_body["run_spec"]["parameters"]["lora_rank"] == 32
-    argv = enabled_body["run_spec"]["argv"]
+    assert enabled_body["stages"][0]["run_spec"]["parameters"]["lora_rank"] == 32
+    argv = enabled_body["stages"][0]["run_spec"]["argv"]
     assert argv[argv.index("--lora_rank") + 1] == "32"
-    assert "--lora_rank 32" in enabled_body["command_preview"]
+    assert "--lora_rank 32" in enabled_body["stages"][0]["command_preview"]
 
 
 @pytest.mark.parametrize(
@@ -831,10 +910,10 @@ def test_legacy_noneditable_parameter_is_normalized_and_can_be_overridden(
 
     preview = client.post(
         "/api/training/runs/preview",
-        json=_run_payload(model["model_ref"]),
+        json=_run_payload(model["family_ref"]),
     )
     assert preview.status_code == 200, preview.text
-    assert preview.json()["run_spec"]["parameters"]["num_video_frames"] == 8
+    assert preview.json()["stages"][0]["run_spec"]["parameters"]["num_video_frames"] == 8
 
 
 def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
@@ -867,7 +946,7 @@ def test_real_training_node_can_bind_a_model_but_cannot_create_a_fake_run(
     preview = client.post(
         "/api/training/runs/preview",
         json={
-            **_run_payload(str(model["model_ref"]), gpu_uuids=["GPU-real-0"]),
+            **_run_payload(str(model["family_ref"]), gpu_uuids=["GPU-real-0"]),
             "server_ref": node["node_ref"],
         },
     )
@@ -880,12 +959,11 @@ def test_draft_configuration_preview_and_submission_are_safe_and_idempotent(
 ) -> None:
     client = _client(service, admin=True)
     model = _create_model(client)
-    model_ref = str(model["model_ref"])
+    model_ref = str(model["family_ref"])
 
     # Internal edits remain optimistic, but their revision is not user-facing.
     update_source = _model_payload(name="NaVILA draft v2")
     updated = {
-        "version_description": "Updated draft configuration.",
         "configuration": update_source["configuration"],
         "expected_revision": model["edit_revision"],
     }
@@ -901,15 +979,17 @@ def test_draft_configuration_preview_and_submission_are_safe_and_idempotent(
     preview = client.post("/api/training/runs/preview", json=request)
     assert preview.status_code == 200, preview.text
     preview_body = preview.json()
-    assert preview_body["run_spec"]["launcher_kind"] == "direct"
-    assert preview_body["run_spec"]["nproc_per_node"] == 1
-    assert preview_body["run_spec"]["master_addr"] is None
-    assert preview_body["run_spec"]["master_port"] is None
-    assert preview_body["run_spec"]["node_rank"] is None
-    assert "--nproc_per_node" not in preview_body["command_preview"]
-    assert preview_body["run_spec"]["parameters"]["num_video_frames"] == 8
-    assert "--num_video_frames 8" in preview_body["command_preview"]
-    assert "private" not in preview_body["command_preview"]
+    spec = preview_body["stages"][0]["run_spec"]
+    command_preview = preview_body["stages"][0]["command_preview"]
+    assert spec["launcher_kind"] == "direct"
+    assert spec["nproc_per_node"] == 1
+    assert spec["master_addr"] is None
+    assert spec["master_port"] is None
+    assert spec["node_rank"] is None
+    assert "--nproc_per_node" not in command_preview
+    assert spec["parameters"]["num_video_frames"] == 8
+    assert "--num_video_frames 8" in command_preview
+    assert "private" not in command_preview
     # Preview must be non-mutating: no task or resource lease exists yet.
     assert client.get("/api/training/runs").json()["runs"] == []
     assert service.store.active_gpu_leases() == {}
@@ -935,7 +1015,7 @@ def test_draft_configuration_preview_and_submission_are_safe_and_idempotent(
 
 def test_metrics_stop_release_leases_and_event_cursor(service: TrainingService) -> None:
     client = _client(service, admin=True)
-    model_ref = str(_create_model(client)["model_ref"])
+    model_ref = str(_create_model(client)["family_ref"])
     created = client.post(
         "/api/training/runs",
         json=_run_payload(model_ref, gpu_uuids=["fake-a100-02"]),
@@ -994,7 +1074,7 @@ async def test_fake_worker_success_failure_and_lost_recovery(
     service: TrainingService,
 ) -> None:
     client = _client(service, admin=True)
-    model_ref = str(_create_model(client)["model_ref"])
+    model_ref = str(_create_model(client)["family_ref"])
 
     async def run_worker_until_terminal(run_ref: str) -> dict[str, object]:
         worker = TrainingWorker(service.store, tick_seconds=0.01)

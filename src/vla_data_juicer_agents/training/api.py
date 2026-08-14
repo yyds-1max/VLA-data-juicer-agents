@@ -102,23 +102,19 @@ class TrainingServiceProtocol(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def get_model(
-        self, model_ref: str, *, include_private: bool = False
+        self, family_ref: str, *, include_private: bool = False
     ) -> dict[str, Any]: ...
 
     def create_model(
         self, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
-    def create_model_version(
+    def update_model(
         self, family_ref: str, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
-    def update_model(
-        self, model_ref: str, payload: Any, principal: TrainingPrincipal
-    ) -> dict[str, Any]: ...
-
     def verify_model(
-        self, model_ref: str, payload: Any, principal: TrainingPrincipal
+        self, family_ref: str, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
 
     def preview_run(
@@ -147,11 +143,11 @@ class TrainingServiceProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def list_logs(
-        self, run_ref: str, *, after_seq: int, limit: int
+        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None
     ) -> dict[str, Any]: ...
 
     def list_metrics(
-        self, run_ref: str, *, after_seq: int, limit: int
+        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None
     ) -> dict[str, Any]: ...
 
     def list_events(self, *, after_seq: int, limit: int) -> dict[str, Any]: ...
@@ -564,7 +560,7 @@ class ParameterDefinition(StrictRequest):
     key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
     label: str = Field(min_length=1, max_length=200)
     type: Literal["integer", "number", "boolean", "enum", "string"]
-    semantic_role: Literal["hyperparameter", "dataset"] = "hyperparameter"
+    semantic_role: Literal["hyperparameter", "dataset", "stage_input"] = "hyperparameter"
     default: JsonScalar
     description: str | None = Field(default=None, max_length=120)
     minimum: StrictInt | StrictFloat | None = None
@@ -594,6 +590,10 @@ class ParameterDefinition(StrictRequest):
         default = self.default
         if self.semantic_role == "dataset" and self.type not in {"string", "enum"}:
             raise ValueError("dataset parameters must be strings or enums")
+        if self.semantic_role == "stage_input" and self.type != "string":
+            raise ValueError("stage input parameters must be strings")
+        if self.semantic_role == "stage_input" and self.visible_when is not None:
+            raise ValueError("stage input parameters cannot depend on another parameter")
         valid_default = {
             "integer": type(default) is int,
             "number": type(default) in {int, float},
@@ -783,7 +783,12 @@ class ModelConfigurationRequest(StrictRequest):
             definition.semantic_role == "dataset"
             for definition in self.parameter_definitions
         ) > 1:
-            raise ValueError("a model revision can declare at most one dataset parameter")
+            raise ValueError("a model family can declare at most one dataset parameter")
+        if sum(
+            definition.semantic_role == "stage_input"
+            for definition in self.parameter_definitions
+        ) > 1:
+            raise ValueError("a model family can declare at most one stage input parameter")
         groups: dict[str, tuple[str, int]] = {}
         labels: dict[str, str] = {}
         for definition in self.parameter_definitions:
@@ -886,26 +891,19 @@ class ModelConfigurationRequest(StrictRequest):
 
 class CreateModelRequest(StrictRequest):
     family_name: str = Field(min_length=1, max_length=200)
-    version_description: str | None = Field(default=None, max_length=500)
     configuration: ModelConfigurationRequest
 
-
-class CreateModelVersionRequest(StrictRequest):
-    based_on_model_ref: str = Field(min_length=1, max_length=200)
-    version_description: str | None = Field(default=None, max_length=500)
-    configuration: ModelConfigurationRequest
-
-    @field_validator("based_on_model_ref")
+    @field_validator("family_name")
     @classmethod
-    def safe_model_ref(cls, value: str) -> str:
-        if not _SAFE_REF.fullmatch(value):
-            raise ValueError("resource reference contains unsupported characters")
-        return value
+    def normalize_family_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("family_name cannot be blank")
+        return normalized
 
 
 class UpdateModelRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
-    version_description: str | None = Field(default=None, max_length=500)
     configuration: ModelConfigurationRequest
 
 
@@ -913,14 +911,28 @@ class VerifyModelRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
 
 
+class RunStageRequest(StrictRequest):
+    parameters: dict[str, JsonScalar] = Field(default_factory=dict, max_length=200)
+    stage_input_source: Literal["manual", "previous_stage_output"] = "manual"
+
+    @field_validator("parameters")
+    @classmethod
+    def safe_parameter_keys(
+        cls, value: dict[str, JsonScalar]
+    ) -> dict[str, JsonScalar]:
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", key) for key in value):
+            raise ValueError("parameters contain an invalid key")
+        return value
+
+
 class RunRequest(StrictRequest):
-    model_ref: str = Field(min_length=1, max_length=200)
+    family_ref: str = Field(min_length=1, max_length=200)
     server_ref: str = Field(min_length=1, max_length=200)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
-    parameters: dict[str, JsonScalar] = Field(default_factory=dict, max_length=200)
+    stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
     execution_mode: Literal["simulation"]
 
-    @field_validator("model_ref", "server_ref")
+    @field_validator("family_ref", "server_ref")
     @classmethod
     def safe_ref(cls, value: str) -> str:
         if not _SAFE_REF.fullmatch(value):
@@ -936,14 +948,11 @@ class RunRequest(StrictRequest):
             raise ValueError("gpu_uuids contain an invalid resource reference")
         return value
 
-    @field_validator("parameters")
-    @classmethod
-    def safe_parameter_keys(
-        cls, value: dict[str, JsonScalar]
-    ) -> dict[str, JsonScalar]:
-        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", key) for key in value):
-            raise ValueError("parameters contain an invalid key")
-        return value
+    @model_validator(mode="after")
+    def first_stage_is_manual(self) -> RunRequest:
+        if self.stages[0].stage_input_source != "manual":
+            raise ValueError("the first stage must use manual input")
+        return self
 
 
 class StopRunRequest(StrictRequest):
@@ -1187,13 +1196,13 @@ def create_training_router(
             ]
         }
 
-    @router.get("/models/{model_ref}")
-    def get_model(model_ref: str) -> dict[str, Any]:
+    @router.get("/models/{family_ref}")
+    def get_model(family_ref: str) -> dict[str, Any]:
         principal = get_principal()
         model = _normalize_model(
             _translate(
                 service.get_model,
-                model_ref,
+                family_ref,
                 include_private=principal.can("training:manage_models"),
             )
         )
@@ -1206,22 +1215,14 @@ def create_training_router(
         )
         return {"model": model}
 
-    @router.post("/model-families/{family_ref}/versions", status_code=201)
-    def create_model_version(
+    @router.put("/models/{family_ref}")
+    def update_model(
         family_ref: str,
-        request: CreateModelVersionRequest,
+        request: UpdateModelRequest,
     ) -> dict[str, Any]:
-        if not _SAFE_REF.fullmatch(family_ref):
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "invalid_model_family_ref",
-                    "message": "Model family reference contains unsupported characters.",
-                },
-            )
         model = _normalize_model(
             _translate(
-                service.create_model_version,
+                service.update_model,
                 family_ref,
                 request,
                 get_principal(),
@@ -1229,30 +1230,15 @@ def create_training_router(
         )
         return {"model": model}
 
-    @router.put("/models/{model_ref}")
-    def update_model(
-        model_ref: str,
-        request: UpdateModelRequest,
-    ) -> dict[str, Any]:
-        model = _normalize_model(
-            _translate(
-                service.update_model,
-                model_ref,
-                request,
-                get_principal(),
-            )
-        )
-        return {"model": model}
-
-    @router.post("/models/{model_ref}/verify", status_code=202)
+    @router.post("/models/{family_ref}/verify", status_code=202)
     def verify_model(
-        model_ref: str,
+        family_ref: str,
         request: VerifyModelRequest,
     ) -> dict[str, Any]:
         model = _normalize_model(
             _translate(
                 service.verify_model,
-                model_ref,
+                family_ref,
                 request,
                 get_principal(),
             )
@@ -1331,12 +1317,14 @@ def create_training_router(
         run_ref: str,
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=500, ge=1, le=2000),
+        stage_ref: str | None = Query(default=None, max_length=200),
     ) -> dict[str, Any]:
         page = _translate(
             service.list_logs,
             run_ref,
             after_seq=after_seq,
             limit=limit,
+            stage_ref=stage_ref,
         )
         return _page_projection(page, "logs")
 
@@ -1345,12 +1333,14 @@ def create_training_router(
         run_ref: str,
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=500, ge=1, le=2000),
+        stage_ref: str | None = Query(default=None, max_length=200),
     ) -> dict[str, Any]:
         page = _translate(
             service.list_metrics,
             run_ref,
             after_seq=after_seq,
             limit=limit,
+            stage_ref=stage_ref,
         )
         projection = _page_projection(page, "metrics")
         projection["metrics"] = [
@@ -1633,16 +1623,11 @@ def _normalize_parameter_definition(definition: dict[str, Any]) -> dict[str, Any
 
 def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
     result = {
-        "model_ref": model["model_ref"],
         "family_ref": model["family_ref"],
         "family_name": model["family_name"],
-        "version_number": int(model["version_number"]),
-        "version_description": model.get("version_description") or None,
-        "based_on_model_ref": model.get("based_on_model_ref"),
         "status": model.get("status", "draft"),
         "edit_revision": int(model.get("edit_revision", 1)),
-        "has_runs": bool(model.get("has_runs", False)),
-        "configuration_editable": bool(model.get("configuration_editable", False)),
+        "trained_version_count": int(model.get("trained_version_count", 0)),
         "created_at": model.get("created_at"),
         "updated_at": model.get("updated_at"),
     }
@@ -1703,12 +1688,30 @@ def _run_spec_projection(spec: dict[str, Any]) -> dict[str, Any]:
             "monitoring", {"source": "stdout", "format": "plain"}
         ),
         "parameters": spec.get("parameters", {}),
+        "entrypoint": spec.get("entrypoint"),
         "argv": spec.get("argv", []),
         "output_preview": spec.get("output_preview"),
     }
 
 
 def _preview_projection(preview: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(preview.get("stages"), list):
+        return {
+            "stages": [
+                {
+                    "stage_number": int(stage["stage_number"]),
+                    "stage_name": stage["stage_name"],
+                    "stage_input_source": stage.get("stage_input_source", "manual"),
+                    "parameters": stage.get("run_spec", {}).get("parameters", {}),
+                    "run_spec": _run_spec_projection(stage["run_spec"]),
+                    "command_preview": stage.get("command_preview", ""),
+                    "output_directory": stage.get("output_directory"),
+                    "preflight": stage.get("preflight", []),
+                }
+                for stage in preview["stages"]
+            ],
+            "preflight": preview.get("preflight", []),
+        }
     raw_preflight = preview.get("preflight", [])
     if isinstance(raw_preflight, dict):
         checks = raw_preflight.get("checks") or []
@@ -1736,13 +1739,58 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         progress = float(run.get("progress", 0)) * 100
     failure = run.get("failure") if isinstance(run.get("failure"), dict) else {}
     run_spec = run.get("run_spec")
+    raw_stages = run.get("stages", [])
+    stages = [
+        {
+            "stage_ref": stage["stage_ref"],
+            "stage_number": int(stage["stage_number"]),
+            "stage_name": stage["stage_name"],
+            "stage_input_source": stage.get("stage_input_source", "manual"),
+            "status": stage["status"],
+            "progress_percent": round(
+                float(stage.get("progress_percent", float(stage.get("progress", 0)) * 100)),
+                4,
+            ),
+            "current_step": int(stage.get("current_step", 0)),
+            "total_steps": int(stage.get("total_steps", 0)),
+            "current_epoch": float(stage.get("current_epoch", 0)),
+            "total_epochs": float(stage.get("total_epochs", 3)),
+            "parameters": stage.get("parameters", {}),
+            "run_spec": (
+                _run_spec_projection(stage["run_spec"])
+                if isinstance(stage.get("run_spec"), dict)
+                else None
+            ),
+            "command_preview": stage.get("command_preview"),
+            "output_directory": stage.get("output_directory"),
+            "artifact": stage.get("artifact"),
+            "failure_code": stage.get(
+                "failure_code",
+                stage.get("failure", {}).get("code")
+                if isinstance(stage.get("failure"), dict)
+                else None,
+            ),
+            "failure_message": stage.get(
+                "failure_message",
+                stage.get("failure", {}).get("message")
+                if isinstance(stage.get("failure"), dict)
+                else None,
+            ),
+            "created_at": stage.get("created_at"),
+            "started_at": stage.get("started_at"),
+            "finished_at": stage.get("finished_at"),
+        }
+        for stage in raw_stages
+        if isinstance(stage, dict)
+    ]
     result = {
         "run_ref": run["run_ref"],
-        "model_ref": run.get("model_ref", "unknown-model"),
         "family_ref": run.get("family_ref"),
         "family_name": run.get("family_name"),
-        "model_version_number": int(run.get("model_version_number", 1)),
-        "model_display_name": run.get("model_display_name"),
+        "version_ref": run.get("version_ref"),
+        "version_number": int(run.get("version_number", 1)),
+        "version_date": run.get("version_date"),
+        "version_label": run.get("version_label"),
         "status": run["status"],
         "state_revision": int(run.get("state_revision", 1)),
         "server_ref": run.get("server_ref", ""),
@@ -1760,6 +1808,10 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "finished_at": run.get("finished_at"),
         "parameters": run.get("parameters", {}),
         "audit_events": run.get("audit_events", []),
+        "stage_count": int(run.get("stage_count", len(stages) or 1)),
+        "current_stage_number": run.get("current_stage_number"),
+        "stages": stages,
+        "version_model": run.get("version_model", run.get("version_model_output")),
     }
     if isinstance(run_spec, dict):
         result["run_spec"] = _run_spec_projection(run_spec)
@@ -1839,6 +1891,12 @@ def _safe_event(raw_event: Any) -> dict[str, Any]:
     )
     if type(item_seq) is int and item_seq >= 0:
         event["seq"] = item_seq
+    stage_ref = raw_event.get("stage_ref", payload.get("stage_ref"))
+    stage_number = raw_event.get("stage_number", payload.get("stage_number"))
+    if isinstance(stage_ref, str) and _SAFE_REF.fullmatch(stage_ref):
+        event["stage_ref"] = stage_ref
+    if type(stage_number) is int and 1 <= stage_number <= 10:
+        event["stage_number"] = stage_number
     return event
 
 
@@ -1848,6 +1906,7 @@ def _model_projection(
     if principal.can("training:manage_models"):
         return model
     projected = dict(model)
+    projected.pop("edit_revision", None)
     verification = projected.get("verification")
     if isinstance(verification, dict):
         projected["verification"] = {
@@ -1864,15 +1923,30 @@ def _model_projection(
         safe_configuration = dict(configuration)
         definitions = safe_configuration.get("parameter_definitions")
         if isinstance(definitions, list):
-            safe_configuration["parameter_definitions"] = [
-                {
-                    **definition,
-                    "default": "********",
-                }
-                if isinstance(definition, dict) and definition.get("sensitive")
-                else definition
+            sensitive_keys = {
+                definition.get("key")
                 for definition in definitions
-            ]
+                if isinstance(definition, dict) and definition.get("sensitive")
+            }
+            safe_definitions: list[Any] = []
+            for definition in definitions:
+                if not isinstance(definition, dict):
+                    safe_definitions.append(definition)
+                    continue
+                safe_definition = dict(definition)
+                if safe_definition.get("sensitive"):
+                    safe_definition["default"] = "********"
+                condition = safe_definition.get("visible_when")
+                if (
+                    isinstance(condition, dict)
+                    and condition.get("parameter_key") in sensitive_keys
+                ):
+                    # The condition value can itself be a secret.  Hiding the
+                    # condition is safe because the server remains the source
+                    # of truth for whether the dependent parameter is active.
+                    safe_definition["visible_when"] = None
+                safe_definitions.append(safe_definition)
+            safe_configuration["parameter_definitions"] = safe_definitions
         template = safe_configuration.get("launch_template")
         if isinstance(template, dict):
             safe_configuration["launch_template"] = {
@@ -1891,6 +1965,28 @@ def _run_projection(
         return run
     projected = dict(run)
     projected.pop("run_spec", None)
+    projected.pop("version_model", None)
+    stages = projected.get("stages")
+    if isinstance(stages, list):
+        projected["stages"] = [
+            {
+                key: stage.get(key)
+                for key in (
+                    "stage_ref",
+                    "stage_number",
+                    "stage_name",
+                    "status",
+                    "current_step",
+                    "total_steps",
+                    "failure_code",
+                    "failure_message",
+                    "started_at",
+                    "finished_at",
+                )
+            }
+            for stage in stages
+            if isinstance(stage, dict)
+        ]
     return projected
 
 

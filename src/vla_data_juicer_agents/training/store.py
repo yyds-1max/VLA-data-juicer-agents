@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from .errors import (
     TrainingConflictError,
@@ -782,13 +783,16 @@ class TrainingStore:
             }
 
     def request_model_verification(
-        self, model_ref: str, expected_revision: int, actor: str
+        self, family_ref: str, expected_revision: int, actor: str
     ) -> dict[str, Any]:
         timestamp = now_iso()
         verification_ref = new_ref("verify")
         with self.transaction() as db:
             model = db.execute(
-                "SELECT * FROM registered_models WHERE model_ref=?", (model_ref,)
+                """SELECT model.* FROM registered_models AS model
+                JOIN model_families AS family ON family.current_model_id=model.id
+                WHERE family.family_ref=?""",
+                (family_ref,),
             ).fetchone()
             if model is None:
                 raise TrainingNotFoundError(
@@ -802,8 +806,8 @@ class TrainingStore:
                 )
             if model["status"] == "disabled":
                 raise TrainingConflictError(
-                    "model_version_disabled",
-                    "Disabled model versions cannot be verified.",
+                    "model_family_disabled",
+                    "Disabled model families cannot be verified.",
                 )
             existing = db.execute(
                 """SELECT verification_ref FROM model_verification_requests
@@ -813,7 +817,7 @@ class TrainingStore:
             if existing is not None:
                 raise TrainingConflictError(
                     "model_verification_in_progress",
-                    "A verification request is already in progress for this model version.",
+                    "A verification request is already in progress for this model family configuration.",
                     current={"verification_ref": existing["verification_ref"]},
                 )
             revision = db.execute(
@@ -837,7 +841,7 @@ class TrainingStore:
                     "The selected Training Worker node must be online before verification.",
                 )
             request = {
-                "model_ref": model_ref,
+                "family_ref": family_ref,
                 "working_directory": template["working_directory"],
                 "executable": template["executable"],
                 "entrypoint": template["entrypoint"],
@@ -865,11 +869,11 @@ class TrainingStore:
                 db,
                 actor,
                 "model.verification_requested",
-                model_ref,
+                family_ref,
                 {"verification_ref": verification_ref, "node_ref": node["node_ref"]},
                 timestamp,
             )
-        return self.get_model(model_ref, include_private=True)
+        return self.get_model(family_ref, include_private=True)
 
     def finish_model_verification(
         self,
@@ -1003,119 +1007,60 @@ class TrainingStore:
                 (
                     model_ref,
                     data["family_name"],
-                    data.get("version_description") or "",
+                    data.get("description") or "",
                     timestamp,
                     timestamp,
                     int(family_cursor.lastrowid),
                     1,
-                    data.get("version_description"),
+                    None,
                 ),
             )
             model_id = int(cursor.lastrowid)
             self._insert_revision(db, model_id, revision_ref, 1, data, timestamp)
-            self._audit(
-                db, actor, "model.created", model_ref,
-                {"family_ref": family_ref, "version_number": 1}, timestamp,
-            )
-        return self.get_model(model_ref, include_private=True)
-
-    def create_model_version(
-        self, family_ref: str, data: dict[str, Any], actor: str
-    ) -> dict[str, Any]:
-        timestamp = now_iso()
-        model_ref, revision_ref = new_ref("model"), new_ref("mrev")
-        with self.transaction() as db:
-            family = db.execute(
-                "SELECT * FROM model_families WHERE family_ref=?", (family_ref,)
-            ).fetchone()
-            if family is None:
-                raise TrainingNotFoundError(
-                    "model_family_not_found", "Model family was not found."
-                )
-            source = db.execute(
-                "SELECT * FROM registered_models WHERE model_ref=?",
-                (data["based_on_model_ref"],),
-            ).fetchone()
-            if source is None:
-                raise TrainingNotFoundError(
-                    "model_not_found", "The base model version was not found."
-                )
-            if int(source["family_id"]) != int(family["id"]):
-                raise TrainingConflictError(
-                    "model_version_family_mismatch",
-                    "The base model version belongs to another model family.",
-                )
-            version_number = int(
-                db.execute(
-                    "SELECT COALESCE(MAX(version_number),0)+1 FROM registered_models WHERE family_id=?",
-                    (family["id"],),
-                ).fetchone()[0]
-            )
-            cursor = db.execute(
-                """INSERT INTO registered_models(
-                model_ref,name,description,status,current_revision,created_at,updated_at,
-                family_id,version_number,based_on_model_id,version_description)
-                VALUES(?,?,?,'draft',1,?,?,?,?,?,?)""",
-                (
-                    model_ref,
-                    family["name"],
-                    data.get("version_description") or "",
-                    timestamp,
-                    timestamp,
-                    family["id"],
-                    version_number,
-                    source["id"],
-                    data.get("version_description"),
-                ),
-            )
-            self._insert_revision(
-                db, int(cursor.lastrowid), revision_ref, 1, data, timestamp
-            )
             db.execute(
-                "UPDATE model_families SET updated_at=? WHERE id=?",
-                (timestamp, family["id"]),
+                "UPDATE model_families SET current_model_id=? WHERE id=?",
+                (model_id, int(family_cursor.lastrowid)),
             )
             self._audit(
-                db, actor, "model.version_created", model_ref,
-                {
-                    "family_ref": family_ref,
-                    "version_number": version_number,
-                    "based_on_model_ref": source["model_ref"],
-                }, timestamp,
+                db, actor, "model.created", family_ref,
+                {}, timestamp,
             )
-        return self.get_model(model_ref, include_private=True)
+        return self.get_model(family_ref, include_private=True)
 
-    def update_model(self, model_ref: str, expected_revision: int, data: dict[str, Any], actor: str) -> dict[str, Any]:
+    def update_model(self, family_ref: str, expected_revision: int, data: dict[str, Any], actor: str) -> dict[str, Any]:
         timestamp = now_iso()
         with self.transaction() as db:
-            row = db.execute("SELECT * FROM registered_models WHERE model_ref=?", (model_ref,)).fetchone()
+            row = db.execute(
+                """SELECT model.* FROM registered_models AS model
+                JOIN model_families AS family ON family.current_model_id=model.id
+                WHERE family.family_ref=?""",
+                (family_ref,),
+            ).fetchone()
             if row is None:
                 raise TrainingNotFoundError("model_not_found", "Training model was not found.")
             if row["status"] == "disabled":
                 raise TrainingConflictError("model_not_editable", "Disabled models cannot be edited.")
-            if row["configuration_locked_at"] is not None:
-                raise TrainingConflictError(
-                    "model_version_configuration_locked",
-                    "This model version already has a training run. Register a new version to change its configuration.",
-                )
             if row["current_revision"] != expected_revision:
                 raise TrainingConflictError("model_configuration_edit_conflict", "The model configuration was edited by another request.", current={"edit_revision": row["current_revision"]})
             revision = expected_revision + 1
             revision_ref = new_ref("mrev")
             db.execute(
-                """UPDATE registered_models SET description=?,version_description=?,
+                """UPDATE registered_models SET description=?,version_description=NULL,
                 status='draft',current_revision=?,updated_at=? WHERE id=?""",
                 (
-                    data.get("version_description") or "",
-                    data.get("version_description"),
+                    data.get("description") or row["description"] or "",
                     revision,
                     timestamp,
                     row["id"],
                 ),
             )
             self._insert_revision(db, row["id"], revision_ref, revision, data, timestamp)
-            self._audit(db, actor, "model.updated", model_ref, {"edit_revision": revision}, timestamp)
-        return self.get_model(model_ref, include_private=True)
+            db.execute(
+                "UPDATE model_families SET updated_at=? WHERE family_ref=?",
+                (timestamp, family_ref),
+            )
+            self._audit(db, actor, "model.updated", family_ref, {"edit_revision": revision}, timestamp)
+        return self.get_model(family_ref, include_private=True)
 
     def _insert_revision(self, db: sqlite3.Connection, model_id: int, revision_ref: str, revision: int, data: dict[str, Any], timestamp: str) -> None:
         template = data["launch_template"]
@@ -1127,13 +1072,13 @@ class TrainingStore:
 
     def list_models(self) -> list[dict[str, Any]]:
         with self.connection() as db:
-            rows = db.execute(self._MODEL_SELECT + " ORDER BY model.id DESC").fetchall()
+            rows = db.execute(self._MODEL_SELECT + " ORDER BY family.id DESC").fetchall()
         return [self._safe_model(row) for row in rows]
 
-    def get_model(self, model_ref: str, *, revision: int | None = None, include_private: bool = False) -> dict[str, Any]:
+    def get_model(self, family_ref: str, *, revision: int | None = None, include_private: bool = False) -> dict[str, Any]:
         with self.connection() as db:
             model = db.execute(
-                self._MODEL_SELECT + " WHERE model.model_ref=?", (model_ref,)
+                self._MODEL_SELECT + " WHERE family.family_ref=?", (family_ref,)
             ).fetchone()
             if model is None:
                 raise TrainingNotFoundError("model_not_found", "Training model was not found.")
@@ -1149,33 +1094,78 @@ class TrainingStore:
             result["output_template"] = rev["output_template"]
         return result
 
-    def get_model_record(self, model_ref: str, revision: int | None = None) -> dict[str, Any]:
-        result = self.get_model(model_ref, revision=revision, include_private=True)
+    def get_model_record(self, family_ref: str, revision: int | None = None) -> dict[str, Any]:
         with self.connection() as db:
             model = db.execute(
-                "SELECT id,current_revision FROM registered_models WHERE model_ref=?",
-                (model_ref,),
+                self._MODEL_SELECT + " WHERE family.family_ref=?",
+                (family_ref,),
             ).fetchone()
+            if model is None:
+                raise TrainingNotFoundError(
+                    "model_not_found", "Training model was not found."
+                )
             number = revision or int(model["current_revision"])
             rev = db.execute(
-                "SELECT revision_ref FROM model_revisions WHERE model_id=? AND revision_number=?",
+                """SELECT * FROM model_revisions
+                WHERE model_id=? AND revision_number=?""",
                 (model["id"], number),
             ).fetchone()
+            if rev is None:
+                raise TrainingNotFoundError(
+                    "model_revision_not_found",
+                    "Training model configuration was not found.",
+                )
+        # ``number`` is captured from the same model row that selected the
+        # configuration.  A concurrent edit may create a newer revision after
+        # these reads, but it cannot turn this result into an old-definition /
+        # new-revision hybrid; create_run will reject the now-stale revision.
+        result = self._safe_model(model)
+        result["parameter_definitions"] = json.loads(
+            rev["parameter_definitions_json"]
+        )
+        result["launch_template"] = json.loads(rev["launch_template_json"])
+        result["output_template"] = rev["output_template"]
         result["internal_revision"] = number
         result["revision_ref"] = rev["revision_ref"]
+        result["model_ref"] = model["model_ref"]
         return result
 
+    def find_create_run_by_idempotency(
+        self, idempotency_key: str, request_payload: Any
+    ) -> dict[str, Any] | None:
+        """Return an earlier run before mutable model/resource preparation.
+
+        The caller must pass the original public request payload, not a
+        prepared object containing the model's current internal revision.  A
+        second check remains in ``create_run`` to close the lookup/create race.
+        """
+
+        digest = payload_hash(request_payload)
+        with self.connection() as db:
+            idem = db.execute(
+                """SELECT payload_sha256,response_ref FROM training_idempotency
+                WHERE scope='create_run' AND idempotency_key=?""",
+                (idempotency_key,),
+            ).fetchone()
+            if idem is None:
+                return None
+            if idem["payload_sha256"] != digest:
+                raise TrainingConflictError(
+                    "idempotency_conflict",
+                    "Idempotency-Key was already used for another request.",
+                )
+            return self._get_run_in(db, idem["response_ref"])
+
     _MODEL_SELECT = """SELECT model.*,family.family_ref,family.name AS family_name,
-      source.model_ref AS based_on_model_ref,
-      EXISTS(SELECT 1 FROM training_runs AS run WHERE run.model_id=model.id) AS has_runs,
+      (SELECT COUNT(*) FROM model_versions AS version
+       WHERE version.family_id=family.id) AS trained_version_count,
       verification.verification_ref AS verification_ref,
       verification.status AS verification_status,
       verification.result_json AS verification_result_json,
       verification.created_at AS verification_created_at,
       verification.finished_at AS verification_finished_at
       FROM registered_models AS model
-      JOIN model_families AS family ON family.id=model.family_id
-      LEFT JOIN registered_models AS source ON source.id=model.based_on_model_id
+      JOIN model_families AS family ON family.current_model_id=model.id
       LEFT JOIN model_verification_requests AS verification ON verification.id=(
         SELECT latest_verification.id
         FROM model_verification_requests AS latest_verification
@@ -1188,22 +1178,13 @@ class TrainingStore:
 
     @staticmethod
     def _safe_model(row: sqlite3.Row) -> dict[str, Any]:
-        has_runs = bool(row["has_runs"])
         result = {
-            "model_ref": row["model_ref"],
             "family_ref": row["family_ref"],
             "family_name": row["family_name"],
-            "version_number": int(row["version_number"]),
-            "version_description": row["version_description"],
-            "based_on_model_ref": row["based_on_model_ref"],
             "status": row["status"],
             "edit_revision": int(row["current_revision"]),
-            "has_runs": has_runs,
-            "configuration_editable": (
-                row["status"] != "disabled"
-                and row["configuration_locked_at"] is None
-                and not has_runs
-            ),
+            "trained_version_count": int(row["trained_version_count"]),
+            "configuration_editable": row["status"] != "disabled",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1231,8 +1212,18 @@ class TrainingStore:
         with self.connection() as connection:
             return find(connection)
 
-    def create_run(self, *, data: dict[str, Any], run_spec_builder: Any, idempotency_key: str, actor: str) -> dict[str, Any]:
-        digest = payload_hash(data)
+    def create_run(
+        self,
+        *,
+        data: dict[str, Any],
+        run_spec_builder: Any,
+        idempotency_key: str,
+        actor: str,
+        idempotency_payload: Any | None = None,
+    ) -> dict[str, Any]:
+        digest = payload_hash(
+            data if idempotency_payload is None else idempotency_payload
+        )
         timestamp = now_iso()
         with self.transaction() as db:
             idem = db.execute("SELECT * FROM training_idempotency WHERE scope='create_run' AND idempotency_key=?", (idempotency_key,)).fetchone()
@@ -1246,7 +1237,11 @@ class TrainingStore:
             if conflicts:
                 raise TrainingConflictError("gpu_lease_conflict", "One or more GPUs are already leased.", current={"gpu_uuids": [row[0] for row in conflicts]})
             model = db.execute(
-                "SELECT id,current_revision FROM registered_models WHERE model_ref=?",
+                """SELECT model.id,model.model_ref,model.current_revision,
+                family.id AS family_id,family.family_ref,family.name AS family_name
+                FROM registered_models AS model
+                JOIN model_families AS family ON family.id=model.family_id
+                WHERE model.model_ref=?""",
                 (data["model_ref"],),
             ).fetchone()
             revision = db.execute(
@@ -1269,28 +1264,127 @@ class TrainingStore:
                 else None
             )
             run_ref = new_ref("run")
-            spec = run_spec_builder(run_ref, port)
+            version_number = int(
+                db.execute(
+                    """SELECT COALESCE(MAX(version_number),0)+1
+                    FROM model_versions WHERE family_id=?""",
+                    (model["family_id"],),
+                ).fetchone()[0]
+            )
+            version_date = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+            version_meta = {
+                "version_ref": new_ref("version"),
+                "version_number": version_number,
+                "version_date": version_date,
+                "version_label": f"v{version_number}-{version_date}",
+            }
+            spec = run_spec_builder(run_ref, port, version_meta)
+            stage_specs = list(spec.get("stages") or [])
+            if not 1 <= len(stage_specs) <= 10:
+                raise TrainingConflictError(
+                    "invalid_training_stage_count",
+                    "A training run must contain between 1 and 10 stages.",
+                )
             seed = int(hashlib.sha256(run_ref.encode()).hexdigest()[:8], 16)
-            total_steps = int(data.get("total_steps", 20))
+            total_steps = sum(
+                max(1, int(stage.get("total_steps", 20))) for stage in stage_specs
+            )
+            first_stage = stage_specs[0]
+            parent_spec = {
+                "model_ref": model["model_ref"],
+                "family_ref": model["family_ref"],
+                "family_name": model["family_name"],
+                "version_ref": version_meta["version_ref"],
+                "version_number": version_number,
+                "version_date": version_date,
+                "version_label": version_meta["version_label"],
+            }
             cursor = db.execute(
                 """INSERT INTO training_runs(run_ref,model_id,model_revision_id,mode,server_ref,gpu_uuids_json,parameters_json,run_spec_json,command_preview,status,state_revision,seed,total_steps,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,'queued',1,?,?,?,?)""",
-                (run_ref, model["id"], revision["id"], "simulation", data["server_ref"], canonical_json(data["gpu_uuids"]), canonical_json(data["parameters"]), canonical_json(spec["private_spec"]), spec["command_preview"], seed, total_steps, timestamp, timestamp),
+                (
+                    run_ref,
+                    model["id"],
+                    revision["id"],
+                    "simulation",
+                    data["server_ref"],
+                    canonical_json(data["gpu_uuids"]),
+                    canonical_json(first_stage.get("parameters", {})),
+                    canonical_json(parent_spec),
+                    first_stage.get("command_preview", ""),
+                    seed,
+                    total_steps,
+                    timestamp,
+                    timestamp,
+                ),
             )
             run_id = int(cursor.lastrowid)
             db.execute(
-                """UPDATE registered_models SET configuration_locked_at=COALESCE(
-                configuration_locked_at,?) WHERE id=?""",
-                (timestamp, model["id"]),
+                """INSERT INTO model_versions(
+                version_ref,family_id,run_id,version_number,version_date,
+                version_label,created_at) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    version_meta["version_ref"],
+                    model["family_id"],
+                    run_id,
+                    version_number,
+                    version_date,
+                    version_meta["version_label"],
+                    timestamp,
+                ),
             )
+            for index, stage in enumerate(stage_specs, start=1):
+                private_spec = stage.get("private_spec") or {}
+                stage_ref = stage.get("stage_ref") or new_ref("stage")
+                output_directory = stage.get("output_directory") or private_spec.get(
+                    "output_directory", ""
+                )
+                stage_input_source = stage.get("stage_input_source", "manual")
+                db.execute(
+                    """INSERT INTO training_stages(
+                    stage_ref,run_id,stage_number,stage_name,stage_input_source,
+                    parameters_json,run_spec_json,command_preview,output_directory,
+                    status,total_steps,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
+                    (
+                        stage_ref,
+                        run_id,
+                        index,
+                        stage.get("stage_name") or self._stage_name(index),
+                        stage_input_source,
+                        canonical_json(stage.get("parameters", {})),
+                        canonical_json(private_spec),
+                        stage.get("command_preview", ""),
+                        output_directory,
+                        max(1, int(stage.get("total_steps", 20))),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
             db.executemany("INSERT INTO gpu_leases(gpu_uuid,run_id,acquired_at) VALUES(?,?,?)", [(gpu, run_id, timestamp) for gpu in data["gpu_uuids"]])
             if port is not None:
                 db.execute("INSERT INTO port_leases(server_ref,master_port,run_id,acquired_at) VALUES(?,?,?,?)", (data["server_ref"], port, run_id, timestamp))
             db.execute("INSERT INTO training_idempotency(scope,idempotency_key,payload_sha256,response_ref,created_at) VALUES('create_run',?,?,?,?)", (idempotency_key, digest, run_ref, timestamp))
-            self._log(db, run_id, "info", "Simulation run queued.", timestamp)
-            self._event(db, "run.updated", run_ref, {}, timestamp)
-            self._audit(db, actor, "run.created", run_ref, {"mode": "simulation"}, timestamp)
+            self._log(db, run_id, "info", "Simulation workflow queued.", timestamp)
+            self._event(db, "run.updated", run_ref, {"stage_count": len(stage_specs)}, timestamp)
+            self._audit(
+                db,
+                actor,
+                "run.created",
+                run_ref,
+                {
+                    "mode": "simulation",
+                    "stage_count": len(stage_specs),
+                    "version_label": version_meta["version_label"],
+                },
+                timestamp,
+            )
             return self._get_run_in(db, run_ref)
+
+    @staticmethod
+    def _stage_name(number: int) -> str:
+        names = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
+        return f"第{names[number - 1]}阶段"
 
     def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:
         clauses, values = [], []
@@ -1306,7 +1400,11 @@ class TrainingStore:
                 f"""{self._RUN_SELECT} {where} ORDER BY run.id DESC LIMIT ?""",
                 (*values, limit + 1),
             ).fetchall()
-        return {"items": [self._safe_run(row) for row in rows[:limit]], "next_after": str(rows[limit - 1]["id"]) if len(rows) > limit else None}
+            items = [
+                self._safe_run(row, self._load_stages(db, int(row["id"])))
+                for row in rows[:limit]
+            ]
+        return {"items": items, "next_after": str(rows[limit - 1]["id"]) if len(rows) > limit else None}
 
     def get_run(self, run_ref: str) -> dict[str, Any]:
         with self.connection() as db:
@@ -1318,34 +1416,176 @@ class TrainingStore:
         ).fetchone()
         if row is None:
             raise TrainingNotFoundError("run_not_found", "Training run was not found.")
-        return self._safe_run(row)
+        return self._safe_run(row, self._load_stages(db, int(row["id"])))
 
     _RUN_SELECT = """SELECT run.*,family.family_ref,family.name AS family_name,
-      model.version_number AS model_version_number
+      model.model_ref,version.version_ref,version.version_number,
+      version.version_date,version.version_label,
+      version_artifact.path AS version_model_path
       FROM training_runs AS run
       JOIN registered_models AS model ON model.id=run.model_id
-      JOIN model_families AS family ON family.id=model.family_id"""
+      JOIN model_families AS family ON family.id=model.family_id
+      JOIN model_versions AS version ON version.run_id=run.id
+      LEFT JOIN training_artifacts AS version_artifact ON version_artifact.id=(
+        SELECT latest_artifact.id FROM training_artifacts AS latest_artifact
+        WHERE latest_artifact.version_id=version.id
+          AND latest_artifact.kind='version_model'
+        ORDER BY latest_artifact.id DESC LIMIT 1
+      )"""
+
+    @classmethod
+    def _safe_run(
+        cls, row: sqlite3.Row, stages: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        stage_items = stages or []
+        current_stage = next(
+            (
+                stage
+                for stage in stage_items
+                if stage["status"] in {"preparing", "running"}
+            ),
+            None,
+        )
+        if current_stage is None and stage_items:
+            current_stage = next(
+                (
+                    stage
+                    for stage in stage_items
+                    if stage["status"] in {"failed", "lost"}
+                ),
+                None,
+            )
+        if current_stage is None and stage_items:
+            current_stage = next(
+                (stage for stage in stage_items if stage["status"] == "pending"),
+                None,
+            )
+        if current_stage is None and stage_items and row["status"] == "cancelled":
+            current_stage = next(
+                (stage for stage in stage_items if stage["status"] == "cancelled"),
+                stage_items[-1],
+            )
+        if current_stage is None and stage_items:
+            current_stage = stage_items[-1]
+        first_stage = stage_items[0] if stage_items else None
+        version_number = int(row["version_number"])
+        return {
+            "run_ref": row["run_ref"],
+            "status": row["status"],
+            "state_revision": row["state_revision"],
+            "mode": row["mode"],
+            "server_ref": row["server_ref"],
+            "gpu_uuids": json.loads(row["gpu_uuids_json"]),
+            "model_ref": row["model_ref"],
+            "family_ref": row["family_ref"],
+            "family_name": row["family_name"],
+            "version_ref": row["version_ref"],
+            "version_number": version_number,
+            "version_date": row["version_date"],
+            "version_label": row["version_label"],
+            # Kept temporarily for older clients while the public API migrates.
+            "model_version_number": version_number,
+            "model_display_name": f"{row['family_name']} {row['version_label']}",
+            "stage_count": len(stage_items),
+            "current_stage_number": (
+                current_stage["stage_number"] if current_stage is not None else None
+            ),
+            "stages": stage_items,
+            "parameters": first_stage["parameters"] if first_stage else {},
+            "run_spec": first_stage["run_spec"] if first_stage else None,
+            "command_preview": first_stage["command_preview"] if first_stage else "",
+            "current_step": row["current_step"],
+            "total_steps": row["total_steps"],
+            "progress": row["current_step"] / row["total_steps"] if row["total_steps"] else 0,
+            "version_model": (
+                {"kind": "version_model", "output_directory": row["version_model_path"]}
+                if row["version_model_path"] is not None
+                else None
+            ),
+            "failure": {"code": row["failure_code"], "message": row["failure_message"]} if row["failure_code"] else None,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
+
+    @classmethod
+    def _load_stages(
+        cls, db: sqlite3.Connection, run_id: int
+    ) -> list[dict[str, Any]]:
+        rows = db.execute(
+            """SELECT stage.*,artifact.path AS artifact_path
+            FROM training_stages AS stage
+            LEFT JOIN training_artifacts AS artifact ON artifact.id=(
+              SELECT latest.id FROM training_artifacts AS latest
+              WHERE latest.stage_id=stage.id AND latest.kind='stage_output'
+              ORDER BY latest.id DESC LIMIT 1
+            )
+            WHERE stage.run_id=? ORDER BY stage.stage_number""",
+            (run_id,),
+        ).fetchall()
+        return [cls._safe_stage(row) for row in rows]
 
     @staticmethod
-    def _safe_run(row: sqlite3.Row) -> dict[str, Any]:
+    def _safe_stage(row: sqlite3.Row) -> dict[str, Any]:
         spec = json.loads(row["run_spec_json"])
-        params = spec.get("parameters", {})
+        parameters = json.loads(row["parameters_json"])
         sensitive = set(spec.get("sensitive_parameters", []))
-        keys = set(row.keys())
-        family_ref = row["family_ref"] if "family_ref" in keys else spec.get("family_ref")
-        family_name = row["family_name"] if "family_name" in keys else spec.get("family_name")
-        version_number = (
-            int(row["model_version_number"])
-            if "model_version_number" in keys
-            else int(spec.get("model_version_number", 1))
-        )
-        return {"run_ref": row["run_ref"], "status": row["status"], "state_revision": row["state_revision"], "mode": row["mode"], "server_ref": row["server_ref"], "gpu_uuids": json.loads(row["gpu_uuids_json"]), "model_ref": spec["model_ref"], "family_ref": family_ref, "family_name": family_name, "model_version_number": version_number, "model_display_name": f"{family_name} v{version_number}", "parameters": {key: "********" if key in sensitive else value for key, value in params.items()}, "run_spec": spec.get("public_spec"), "command_preview": spec.get("safe_command_preview", ""), "current_step": row["current_step"], "total_steps": row["total_steps"], "progress": row["current_step"] / row["total_steps"] if row["total_steps"] else 0, "failure": {"code": row["failure_code"], "message": row["failure_message"]} if row["failure_code"] else None, "created_at": row["created_at"], "updated_at": row["updated_at"], "started_at": row["started_at"], "finished_at": row["finished_at"]}
+        return {
+            "stage_ref": row["stage_ref"],
+            "stage_number": int(row["stage_number"]),
+            "stage_name": row["stage_name"],
+            "stage_input_source": row["stage_input_source"],
+            "status": row["status"],
+            "parameters": {
+                key: "********" if key in sensitive else value
+                for key, value in parameters.items()
+            },
+            "run_spec": spec.get("public_spec"),
+            "command_preview": spec.get(
+                "safe_command_preview", row["command_preview"]
+            ),
+            "output_directory": row["output_directory"],
+            "artifact": (
+                {"kind": "stage_output", "output_directory": row["artifact_path"]}
+                if row["artifact_path"] is not None
+                else None
+            ),
+            "current_step": int(row["current_step"]),
+            "total_steps": int(row["total_steps"]),
+            "progress": (
+                int(row["current_step"]) / int(row["total_steps"])
+                if row["total_steps"]
+                else 0
+            ),
+            "failure": (
+                {"code": row["failure_code"], "message": row["failure_message"]}
+                if row["failure_code"]
+                else None
+            ),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
 
     def stop_run(self, run_ref: str, expected_revision: int, idempotency_key: str, actor: str) -> dict[str, Any]:
         timestamp = now_iso()
+        digest = payload_hash(
+            {"run_ref": run_ref, "expected_revision": expected_revision}
+        )
         with self.transaction() as db:
-            idem = db.execute("SELECT response_ref FROM training_idempotency WHERE scope='stop_run' AND idempotency_key=?", (idempotency_key,)).fetchone()
+            idem = db.execute(
+                """SELECT payload_sha256,response_ref FROM training_idempotency
+                WHERE scope='stop_run' AND idempotency_key=?""",
+                (idempotency_key,),
+            ).fetchone()
             if idem is not None:
+                if idem["payload_sha256"] != digest or idem["response_ref"] != run_ref:
+                    raise TrainingConflictError(
+                        "idempotency_conflict",
+                        "Idempotency-Key was already used for another request.",
+                    )
                 return self._get_run_in(db, idem["response_ref"])
             row = db.execute(
                 self._RUN_SELECT + " WHERE run.run_ref=?", (run_ref,)
@@ -1353,16 +1593,16 @@ class TrainingStore:
             if row is None:
                 raise TrainingNotFoundError("run_not_found", "Training run was not found.")
             if row["state_revision"] != expected_revision:
-                raise TrainingConflictError("run_revision_conflict", "The run state changed.", current=self._safe_run(row))
+                raise TrainingConflictError("run_revision_conflict", "The run state changed.", current=self._safe_run(row, self._load_stages(db, int(row["id"]))))
             if RunStatus(row["status"]) in TERMINAL_RUN_STATUSES:
-                raise TrainingConflictError("run_already_finished", "The run is already finished.", current=self._safe_run(row))
+                raise TrainingConflictError("run_already_finished", "The run is already finished.", current=self._safe_run(row, self._load_stages(db, int(row["id"]))))
             if row["status"] == "queued":
                 result = self._finish_in(db, row, "cancelled", timestamp)
             else:
                 db.execute("UPDATE training_runs SET status='stop_requested',state_revision=state_revision+1,updated_at=? WHERE id=?", (timestamp, row["id"]))
                 self._event(db, "run.updated", run_ref, {}, timestamp)
                 result = self._get_run_in(db, run_ref)
-            db.execute("INSERT INTO training_idempotency(scope,idempotency_key,payload_sha256,response_ref,created_at) VALUES('stop_run',?,?,?,?)", (idempotency_key, payload_hash({"run_ref": run_ref, "expected_revision": expected_revision}), run_ref, timestamp))
+            db.execute("INSERT INTO training_idempotency(scope,idempotency_key,payload_sha256,response_ref,created_at) VALUES('stop_run',?,?,?,?)", (idempotency_key, digest, run_ref, timestamp))
             self._audit(db, actor, "run.stop_requested", run_ref, {}, timestamp)
             return result
 
@@ -1372,7 +1612,32 @@ class TrainingStore:
             row = db.execute("SELECT * FROM training_runs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
             if row is None: return None
             db.execute("UPDATE training_runs SET status='preparing',state_revision=state_revision+1,owner_id=?,owner_epoch=owner_epoch+1,lease_expires_at=?,heartbeat_at=?,updated_at=? WHERE id=?", (worker_id, expiry, timestamp, timestamp, row["id"]))
-            self._event(db, "run.updated", row["run_ref"], {}, timestamp)
+            stage = db.execute(
+                """SELECT * FROM training_stages WHERE run_id=? AND status='pending'
+                ORDER BY stage_number LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            if stage is None:
+                return self._finish_in(
+                    db,
+                    row,
+                    "failed",
+                    timestamp,
+                    "training_stages_missing",
+                    "The training workflow has no pending stage.",
+                )
+            db.execute(
+                """UPDATE training_stages SET status='preparing',updated_at=?
+                WHERE id=?""",
+                (timestamp, stage["id"]),
+            )
+            self._event(
+                db,
+                "run.updated",
+                row["run_ref"],
+                {"stage_ref": stage["stage_ref"], "stage_number": stage["stage_number"]},
+                timestamp,
+            )
             return self._get_run_in(db, row["run_ref"])
 
     def transition_running(self, run_ref: str, worker_id: str) -> dict[str, Any]:
@@ -1381,40 +1646,317 @@ class TrainingStore:
             row = db.execute("SELECT * FROM training_runs WHERE run_ref=? AND owner_id=?", (run_ref, worker_id)).fetchone()
             if row is None: raise TrainingConflictError("worker_lease_lost", "Worker no longer owns this run.")
             if row["status"] == "stop_requested": return self._finish_in(db, row, "cancelled", timestamp)
-            if row["status"] != "preparing": raise TrainingConflictError("invalid_run_transition", "Run cannot enter running state.")
-            db.execute("UPDATE training_runs SET status='running',state_revision=state_revision+1,started_at=?,updated_at=? WHERE id=?", (timestamp, timestamp, row["id"]))
-            self._log(db, row["id"], "info", "Simulation training started.", timestamp)
-            self._event(db, "run.updated", run_ref, {}, timestamp)
+            if row["status"] not in {"preparing", "running"}: raise TrainingConflictError("invalid_run_transition", "Run cannot enter running state.")
+            stage = db.execute(
+                """SELECT * FROM training_stages WHERE run_id=? AND status='preparing'
+                ORDER BY stage_number LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            if stage is None:
+                raise TrainingConflictError(
+                    "invalid_stage_transition", "No stage is ready to start."
+                )
+            db.execute(
+                """UPDATE training_runs SET status='running',
+                state_revision=state_revision+1,started_at=COALESCE(started_at,?),
+                updated_at=? WHERE id=?""",
+                (timestamp, timestamp, row["id"]),
+            )
+            db.execute(
+                """UPDATE training_stages SET status='running',started_at=?,
+                updated_at=? WHERE id=?""",
+                (timestamp, timestamp, stage["id"]),
+            )
+            log_seq = self._log(
+                db,
+                row["id"],
+                "info",
+                f"{stage['stage_name']} simulation started.",
+                timestamp,
+                stage_id=int(stage["id"]),
+            )
+            payload = {
+                "stage_ref": stage["stage_ref"],
+                "stage_number": stage["stage_number"],
+            }
+            self._event(db, "run.updated", run_ref, payload, timestamp)
+            self._event(db, "run.log.appended", run_ref, {**payload, "item_seq": log_seq}, timestamp)
             return self._get_run_in(db, run_ref)
 
-    def append_step(self, run_ref: str, worker_id: str, metric: dict[str, Any], message: str) -> dict[str, Any]:
+    def append_step(self, run_ref: str, worker_id: str, metric: dict[str, Any], message: str, stage_ref: str | None = None) -> dict[str, Any]:
         timestamp = now_iso()
         with self.transaction() as db:
             row = db.execute("SELECT * FROM training_runs WHERE run_ref=? AND owner_id=?", (run_ref, worker_id)).fetchone()
             if row is None: raise TrainingConflictError("worker_lease_lost", "Worker no longer owns this run.")
             if row["status"] == "stop_requested": return self._finish_in(db, row, "cancelled", timestamp)
-            if row["status"] != "running": return self._safe_run(row)
+            if row["status"] != "running": return self._get_run_in(db, run_ref)
+            if stage_ref is None:
+                stage = db.execute(
+                    """SELECT * FROM training_stages WHERE run_id=? AND status='running'
+                    ORDER BY stage_number LIMIT 1""",
+                    (row["id"],),
+                ).fetchone()
+            else:
+                stage = db.execute(
+                    """SELECT * FROM training_stages
+                    WHERE run_id=? AND stage_ref=? AND status='running'""",
+                    (row["id"], stage_ref),
+                ).fetchone()
+            if stage is None:
+                raise TrainingConflictError(
+                    "worker_stage_lease_lost", "Worker no longer owns this stage."
+                )
             seq = int(db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM metric_samples WHERE run_id=?", (row["id"],)).fetchone()[0])
-            db.execute("""INSERT INTO metric_samples(run_id,seq,step,total_steps,epoch,loss,learning_rate,grad_norm,elapsed_seconds,gpu_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (row["id"], seq, metric["step"], metric["total_steps"], metric["epoch"], metric["loss"], metric["learning_rate"], metric["grad_norm"], metric["elapsed_seconds"], canonical_json(metric["gpus"]), timestamp))
-            db.execute("UPDATE training_runs SET current_step=?,heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE id=?", (metric["step"], timestamp, (datetime.now(UTC)+timedelta(seconds=10)).isoformat(timespec="milliseconds"), timestamp, row["id"]))
-            log_seq = self._log(db, row["id"], "info", message, timestamp)
-            self._event(db, "run.metric.appended", run_ref, {"item_seq": seq}, timestamp)
-            self._event(db, "run.log.appended", run_ref, {"item_seq": log_seq}, timestamp)
+            db.execute("""INSERT INTO metric_samples(run_id,seq,step,total_steps,epoch,loss,learning_rate,grad_norm,elapsed_seconds,gpu_json,created_at,stage_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (row["id"], seq, metric["step"], metric["total_steps"], metric["epoch"], metric["loss"], metric["learning_rate"], metric["grad_norm"], metric["elapsed_seconds"], canonical_json(metric["gpus"]), timestamp, stage["id"]))
+            completed_steps = int(
+                db.execute(
+                    """SELECT COALESCE(SUM(total_steps),0) FROM training_stages
+                    WHERE run_id=? AND status='succeeded'""",
+                    (row["id"],),
+                ).fetchone()[0]
+            )
+            overall_step = min(int(row["total_steps"]), completed_steps + int(metric["step"]))
+            db.execute(
+                """UPDATE training_stages SET current_step=?,updated_at=? WHERE id=?""",
+                (metric["step"], timestamp, stage["id"]),
+            )
+            db.execute("UPDATE training_runs SET current_step=?,heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE id=?", (overall_step, timestamp, (datetime.now(UTC)+timedelta(seconds=10)).isoformat(timespec="milliseconds"), timestamp, row["id"]))
+            log_seq = self._log(db, row["id"], "info", message, timestamp, stage_id=int(stage["id"]))
+            event_payload = {
+                "stage_ref": stage["stage_ref"],
+                "stage_number": stage["stage_number"],
+            }
+            self._event(db, "run.metric.appended", run_ref, {**event_payload, "item_seq": seq}, timestamp)
+            self._event(db, "run.log.appended", run_ref, {**event_payload, "item_seq": log_seq}, timestamp)
             return self._get_run_in(db, run_ref)
 
-    def finish_run(self, run_ref: str, worker_id: str, status: str = "succeeded", failure_code: str | None = None, failure_message: str | None = None) -> dict[str, Any]:
+    def finish_stage(
+        self,
+        run_ref: str,
+        worker_id: str,
+        stage_ref: str | None = None,
+        status: str = "succeeded",
+        failure_code: str | None = None,
+        failure_message: str | None = None,
+    ) -> dict[str, Any]:
         timestamp = now_iso()
         with self.transaction() as db:
-            row = db.execute("SELECT * FROM training_runs WHERE run_ref=? AND owner_id=?", (run_ref, worker_id)).fetchone()
-            if row is None: raise TrainingConflictError("worker_lease_lost", "Worker no longer owns this run.")
-            if row["status"] == "stop_requested": status = "cancelled"
-            return self._finish_in(db, row, status, timestamp, failure_code, failure_message)
+            row = db.execute(
+                "SELECT * FROM training_runs WHERE run_ref=? AND owner_id=?",
+                (run_ref, worker_id),
+            ).fetchone()
+            if row is None:
+                raise TrainingConflictError(
+                    "worker_lease_lost", "Worker no longer owns this run."
+                )
+            if row["status"] == "stop_requested":
+                return self._finish_in(db, row, "cancelled", timestamp)
+            if stage_ref is None:
+                stage = db.execute(
+                    """SELECT * FROM training_stages
+                    WHERE run_id=? AND status IN ('running','preparing')
+                    ORDER BY stage_number LIMIT 1""",
+                    (row["id"],),
+                ).fetchone()
+            else:
+                stage = db.execute(
+                    """SELECT * FROM training_stages WHERE run_id=? AND stage_ref=?
+                    AND status IN ('running','preparing')""",
+                    (row["id"], stage_ref),
+                ).fetchone()
+            if stage is None:
+                raise TrainingConflictError(
+                    "invalid_stage_transition", "The stage is no longer active."
+                )
+            if status != "succeeded":
+                db.execute(
+                    """UPDATE training_stages SET status=?,failure_code=?,
+                    failure_message=?,finished_at=?,updated_at=? WHERE id=?""",
+                    (
+                        status,
+                        failure_code,
+                        failure_message,
+                        timestamp,
+                        timestamp,
+                        stage["id"],
+                    ),
+                )
+                return self._finish_in(
+                    db, row, status, timestamp, failure_code, failure_message
+                )
+
+            db.execute(
+                """UPDATE training_stages SET status='succeeded',
+                current_step=total_steps,finished_at=?,updated_at=? WHERE id=?""",
+                (timestamp, timestamp, stage["id"]),
+            )
+            version = db.execute(
+                "SELECT id FROM model_versions WHERE run_id=?", (row["id"],)
+            ).fetchone()
+            db.execute(
+                """INSERT INTO training_artifacts(
+                artifact_ref,version_id,stage_id,kind,path,simulated,created_at)
+                VALUES(?,?,?,'stage_output',?,1,?)""",
+                (
+                    new_ref("artifact"),
+                    version["id"],
+                    stage["id"],
+                    stage["output_directory"],
+                    timestamp,
+                ),
+            )
+            completed_steps = int(
+                db.execute(
+                    """SELECT COALESCE(SUM(total_steps),0) FROM training_stages
+                    WHERE run_id=? AND status='succeeded'""",
+                    (row["id"],),
+                ).fetchone()[0]
+            )
+            next_stage = db.execute(
+                """SELECT * FROM training_stages WHERE run_id=? AND status='pending'
+                ORDER BY stage_number LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            log_seq = self._log(
+                db,
+                row["id"],
+                "info",
+                f"{stage['stage_name']} simulation succeeded.",
+                timestamp,
+                stage_id=int(stage["id"]),
+            )
+            finished_payload = {
+                "stage_ref": stage["stage_ref"],
+                "stage_number": stage["stage_number"],
+            }
+            self._event(db, "run.log.appended", run_ref, {**finished_payload, "item_seq": log_seq}, timestamp)
+            if next_stage is not None:
+                db.execute(
+                    """UPDATE training_stages SET status='preparing',updated_at=?
+                    WHERE id=?""",
+                    (timestamp, next_stage["id"]),
+                )
+                db.execute(
+                    """UPDATE training_runs SET current_step=?,
+                    state_revision=state_revision+1,heartbeat_at=?,
+                    lease_expires_at=?,updated_at=? WHERE id=?""",
+                    (
+                        completed_steps,
+                        timestamp,
+                        (datetime.now(UTC) + timedelta(seconds=10)).isoformat(
+                            timespec="milliseconds"
+                        ),
+                        timestamp,
+                        row["id"],
+                    ),
+                )
+                self._event(
+                    db,
+                    "run.updated",
+                    run_ref,
+                    {
+                        "stage_ref": next_stage["stage_ref"],
+                        "stage_number": next_stage["stage_number"],
+                    },
+                    timestamp,
+                )
+                return self._get_run_in(db, run_ref)
+
+            db.execute(
+                """INSERT INTO training_artifacts(
+                artifact_ref,version_id,stage_id,kind,path,simulated,created_at)
+                VALUES(?,?,?,'version_model',?,1,?)""",
+                (
+                    new_ref("artifact"),
+                    version["id"],
+                    stage["id"],
+                    stage["output_directory"],
+                    timestamp,
+                ),
+            )
+            return self._finish_in(db, row, "succeeded", timestamp)
+
+    def finish_run(self, run_ref: str, worker_id: str, status: str = "succeeded", failure_code: str | None = None, failure_message: str | None = None) -> dict[str, Any]:
+        return self.finish_stage(
+            run_ref,
+            worker_id,
+            None,
+            status,
+            failure_code,
+            failure_message,
+        )
 
     def _finish_in(self, db: sqlite3.Connection, row: sqlite3.Row, status: str, timestamp: str, failure_code: str | None = None, failure_message: str | None = None) -> dict[str, Any]:
-        db.execute("UPDATE training_runs SET status=?,state_revision=state_revision+1,owner_id=NULL,lease_expires_at=NULL,finished_at=?,updated_at=?,failure_code=?,failure_message=? WHERE id=?", (status, timestamp, timestamp, failure_code, failure_message, row["id"]))
+        if status == "cancelled":
+            db.execute(
+                """UPDATE training_stages SET status='cancelled',finished_at=?,
+                updated_at=? WHERE run_id=?
+                AND status IN ('pending','preparing','running')""",
+                (timestamp, timestamp, row["id"]),
+            )
+        elif status in {"failed", "lost"}:
+            active_status = "lost" if status == "lost" else "failed"
+            db.execute(
+                """UPDATE training_stages SET status=?,failure_code=COALESCE(failure_code,?),
+                failure_message=COALESCE(failure_message,?),finished_at=?,updated_at=?
+                WHERE run_id=? AND status IN ('preparing','running')""",
+                (
+                    active_status,
+                    failure_code,
+                    failure_message,
+                    timestamp,
+                    timestamp,
+                    row["id"],
+                ),
+            )
+            db.execute(
+                """UPDATE training_stages SET status='skipped',finished_at=?,updated_at=?
+                WHERE run_id=? AND status='pending'""",
+                (timestamp, timestamp, row["id"]),
+            )
+        db.execute("""UPDATE training_runs SET status=?,
+            current_step=CASE WHEN ?='succeeded' THEN total_steps ELSE current_step END,
+            state_revision=state_revision+1,owner_id=NULL,lease_expires_at=NULL,
+            finished_at=?,updated_at=?,failure_code=?,failure_message=? WHERE id=?""",
+            (status, status, timestamp, timestamp, failure_code, failure_message, row["id"]),
+        )
         db.execute("DELETE FROM gpu_leases WHERE run_id=?", (row["id"],)); db.execute("DELETE FROM port_leases WHERE run_id=?", (row["id"],))
-        self._log(db, row["id"], "info" if status in {"succeeded", "cancelled"} else "error", f"Simulation run {status}.", timestamp)
-        self._event(db, "run.updated", row["run_ref"], {}, timestamp)
+        if status == "succeeded":
+            stage = db.execute(
+                """SELECT * FROM training_stages WHERE run_id=?
+                AND status='succeeded' ORDER BY stage_number DESC LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+        else:
+            stage = db.execute(
+                """SELECT * FROM training_stages WHERE run_id=? AND status=?
+                ORDER BY stage_number LIMIT 1""",
+                (row["id"], status),
+            ).fetchone()
+        stage_payload = (
+            {
+                "stage_ref": stage["stage_ref"],
+                "stage_number": stage["stage_number"],
+            }
+            if stage is not None
+            else {}
+        )
+        log_seq = self._log(
+            db,
+            row["id"],
+            "info" if status in {"succeeded", "cancelled"} else "error",
+            f"Simulation run {status}.",
+            timestamp,
+            stage_id=int(stage["id"]) if stage is not None else None,
+        )
+        self._event(
+            db,
+            "run.log.appended",
+            row["run_ref"],
+            {**stage_payload, "item_seq": log_seq},
+            timestamp,
+        )
+        self._event(db, "run.updated", row["run_ref"], stage_payload, timestamp)
         return self._get_run_in(db, row["run_ref"])
 
     def recover_stale_runs(self) -> int:
@@ -1425,19 +1967,40 @@ class TrainingStore:
                 self._finish_in(db, row, "lost", timestamp, "worker_lease_expired", "The simulation worker lease expired.")
             return len(rows)
 
-    def list_logs(self, run_ref: str, after_seq: int, limit: int) -> dict[str, Any]:
+    def list_logs(self, run_ref: str, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]:
         with self.connection() as db:
             row = db.execute("SELECT id FROM training_runs WHERE run_ref=?", (run_ref,)).fetchone()
             if row is None: raise TrainingNotFoundError("run_not_found", "Training run was not found.")
-            items = [dict(item) for item in db.execute("SELECT seq,level,message,created_at FROM run_logs WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (row["id"], after_seq, limit + 1)).fetchall()]
+            values: list[Any] = [row["id"], after_seq]
+            stage_clause = ""
+            if stage_ref is not None:
+                stage_clause = " AND stage.stage_ref=?"
+                values.append(stage_ref)
+            values.append(limit + 1)
+            items = [dict(item) for item in db.execute(f"""SELECT log.seq,log.level,
+                log.message,log.created_at,stage.stage_ref,stage.stage_number
+                FROM run_logs AS log
+                LEFT JOIN training_stages AS stage ON stage.id=log.stage_id
+                WHERE log.run_id=? AND log.seq>?{stage_clause}
+                ORDER BY log.seq LIMIT ?""", tuple(values)).fetchall()]
         return {"items": items[:limit], "next_after": items[limit-1]["seq"] if len(items) > limit else None}
 
-    def list_metrics(self, run_ref: str, after_seq: int, limit: int) -> dict[str, Any]:
+    def list_metrics(self, run_ref: str, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]:
         with self.connection() as db:
             row = db.execute("SELECT id FROM training_runs WHERE run_ref=?", (run_ref,)).fetchone()
             if row is None: raise TrainingNotFoundError("run_not_found", "Training run was not found.")
-            rows = db.execute("SELECT * FROM metric_samples WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (row["id"], after_seq, limit + 1)).fetchall()
-        items = [{**{key: item[key] for key in ("seq","step","total_steps","epoch","loss","learning_rate","grad_norm","elapsed_seconds","created_at")}, "gpus": json.loads(item["gpu_json"])} for item in rows]
+            values: list[Any] = [row["id"], after_seq]
+            stage_clause = ""
+            if stage_ref is not None:
+                stage_clause = " AND stage.stage_ref=?"
+                values.append(stage_ref)
+            values.append(limit + 1)
+            rows = db.execute(f"""SELECT metric.*,stage.stage_ref,stage.stage_number
+                FROM metric_samples AS metric
+                LEFT JOIN training_stages AS stage ON stage.id=metric.stage_id
+                WHERE metric.run_id=? AND metric.seq>?{stage_clause}
+                ORDER BY metric.seq LIMIT ?""", tuple(values)).fetchall()
+        items = [{**{key: item[key] for key in ("seq","step","total_steps","epoch","loss","learning_rate","grad_norm","elapsed_seconds","created_at","stage_ref","stage_number")}, "gpus": json.loads(item["gpu_json"])} for item in rows]
         return {"items": items[:limit], "next_after": items[limit-1]["seq"] if len(items) > limit else None}
 
     def list_events(self, after_seq: int, limit: int) -> dict[str, Any]:
@@ -1466,9 +2029,9 @@ class TrainingStore:
             return {row["gpu_uuid"]: row["run_ref"] for row in db.execute("SELECT g.gpu_uuid,r.run_ref FROM gpu_leases g JOIN training_runs r ON r.id=g.run_id")}
 
     @staticmethod
-    def _log(db: sqlite3.Connection, run_id: int, level: str, message: str, timestamp: str) -> int:
+    def _log(db: sqlite3.Connection, run_id: int, level: str, message: str, timestamp: str, stage_id: int | None = None) -> int:
         seq = int(db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM run_logs WHERE run_id=?", (run_id,)).fetchone()[0])
-        db.execute("INSERT INTO run_logs(run_id,seq,level,message,created_at) VALUES(?,?,?,?,?)", (run_id, seq, level, message, timestamp)); return seq
+        db.execute("INSERT INTO run_logs(run_id,seq,level,message,created_at,stage_id) VALUES(?,?,?,?,?,?)", (run_id, seq, level, message, timestamp, stage_id)); return seq
 
     @staticmethod
     def _event(db: sqlite3.Connection, event_type: str, run_ref: str, payload: dict[str, Any], timestamp: str) -> None:

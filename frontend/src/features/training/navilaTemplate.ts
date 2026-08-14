@@ -12,8 +12,8 @@ const value = (key: string, label: string, type: TrainingParameterDefinition["ty
 export const navilaTrajectoryParameters: TrainingParameterDefinition[] = [
   value("longvila_sampler", "LongVILA 采样器", "boolean", true, { description: "启用面向长视频序列的采样方式。" }),
   value("deepspeed", "DeepSpeed 配置", "string", "./scripts/zero3.json", { description: "指定 DeepSpeed/ZeRO 并行训练配置文件。" }),
-  value("model_name_or_path", "预训练参数加载地址", "string", "/workspace/checkpoints/navila", { editable: true, description: "注册前请替换为部署环境允许的路径。" }),
-  value("version", "模型版本", "enum", "llama_3", { choices: [{ value: "llama_3", label: "llama_3" }], description: "选择训练代码使用的对话模板版本。" }),
+  value("model_name_or_path", "预训练参数加载地址", "string", "/workspace/checkpoints/navila", { editable: true, semantic_role: "stage_input", description: "第一阶段手动指定；后续阶段可自动接收上一阶段输出目录。" }),
+  value("version", "对话模板版本", "enum", "llama_3", { choices: [{ value: "llama_3", label: "llama_3" }], description: "选择训练代码使用的对话模板版本。" }),
   value("seed", "随机种子", "integer", 10, { editable: true, minimum: 0, description: "控制随机初始化和数据顺序，便于复现。" }),
   value("data_mixture", "数据混合配置", "string", "rxr", { editable: true, semantic_role: "dataset", description: "指定训练数据集或数据混合方案。" }),
   value("vision_tower", "视觉编码器", "string", "google/siglip-so400m-patch14-384", { description: "指定提取图像特征的视觉骨干模型。" }),
