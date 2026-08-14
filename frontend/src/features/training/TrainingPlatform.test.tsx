@@ -193,7 +193,7 @@ describe("TrainingPlatform", () => {
     expect(trainingApi.getTrainingServerResources).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
-    expect(await screen.findByRole("option", { name: "尚未登记训练节点" })).toBeVisible();
+    expect(await screen.findByRole("combobox", { name: "训练节点 · Server" })).toHaveTextContent("尚未登记训练节点");
   });
 
   it("requires two confirmations and temporary SSH credentials before removing a Worker", async () => {
@@ -373,6 +373,17 @@ describe("TrainingPlatform", () => {
     expect(screen.getByLabelText(/产物输出参数 · Output flag/)).toBeVisible();
     expect(screen.getByLabelText("运行环境 · Runtime environment")).toBeVisible();
     expect(screen.getByLabelText("指标日志格式 · Metrics format")).toBeVisible();
+    expect(screen.getByLabelText("领域 · Domain")).toHaveValue("");
+    expect(screen.getByLabelText("领域 · Domain")).toHaveAttribute("placeholder", "例如 vla");
+    expect(screen.getByLabelText("工作目录 · Working directory")).toHaveValue("");
+    expect(screen.getByLabelText("工作目录 · Working directory")).toHaveAttribute("placeholder", "例如 /data/project/NaVILA");
+    expect(screen.getByLabelText("训练入口 · Entrypoint")).toHaveAttribute("placeholder", "例如 llava/train/train_mem.py");
+    expect(screen.getByLabelText("输出根目录 · Output root")).toHaveAttribute("placeholder", "例如 /data/training_outputs");
+    expect(screen.getByText("绝对路径。填写训练节点上的模型工程目录。")).toBeVisible();
+    expect(screen.getByText("相对路径。以工作目录为起点，且必须位于工作目录内。")).toBeVisible();
+    expect(screen.getByText("绝对路径。平台会在此目录下生成模型版本和训练阶段目录。")).toBeVisible();
+    expect(screen.getByRole("option", { name: "单进程启动（不使用 Torchrun）" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "登记模型" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
     expect(screen.getByLabelText("启动方式 · Launcher")).toHaveValue("torchrun");
     expect(screen.getByText(/--master_port=<自动分配>/)).toBeVisible();
@@ -398,13 +409,35 @@ describe("TrainingPlatform", () => {
     expect(commandSummary).toBeVisible();
     expect(commandSummary).not.toHaveTextContent("--master_port");
     expect(commandSummary).not.toHaveTextContent("--nproc_per_node");
-    expect(screen.getByText("GPU 和产物输出目录由平台管理；直接执行不会注入 Torchrun 分布式参数。")).toBeVisible();
+    expect(screen.getByText("GPU 和产物输出目录由平台管理；单进程启动不会注入 Torchrun 分布式参数。")).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "登记模型" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
     expect(trainingApi.createTrainingModel).toHaveBeenCalledWith(expect.objectContaining({
       configuration: expect.objectContaining({ launch_template: expect.objectContaining({ launcher_kind: "direct", executable: "python", entrypoint: "llava/train/train_mem.py" }) }),
     }));
+  });
+
+  it("rejects ambiguous model paths before registration", async () => {
+    mockApi(adminCapabilities);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
+
+    fireEvent.change(screen.getByLabelText("工作目录 · Working directory"), { target: { value: "relative/project" } });
+    fireEvent.click(screen.getByRole("button", { name: "登记模型" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("工作目录必须填写训练节点上的绝对路径");
+
+    fireEvent.change(screen.getByLabelText("工作目录 · Working directory"), { target: { value: "/data/project" } });
+    fireEvent.change(screen.getByLabelText("训练入口 · Entrypoint"), { target: { value: "/data/project/train.py" } });
+    fireEvent.click(screen.getByRole("button", { name: "登记模型" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("训练入口必须填写工作目录内的相对路径");
+
+    fireEvent.change(screen.getByLabelText("训练入口 · Entrypoint"), { target: { value: "train.py" } });
+    fireEvent.change(screen.getByLabelText("输出根目录 · Output root"), { target: { value: "relative/outputs" } });
+    fireEvent.click(screen.getByRole("button", { name: "登记模型" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("输出根目录必须填写训练节点上的绝对路径");
+    expect(trainingApi.createTrainingModel).not.toHaveBeenCalled();
   });
 
   it("shows one current configuration per family and keeps it editable after training", async () => {
@@ -429,14 +462,16 @@ describe("TrainingPlatform", () => {
     const realResources: TrainingServerResources = { server: realServer, sampled_at: "2026-08-13T08:00:00Z", stale: false, gpus: [{ gpu_uuid: "GPU-real-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 2048, utilization_percent: 3, temperature_c: 42, externally_occupied: false }] };
     const realModel: TrainingModel = { ...model, family_ref: "navila-real", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
     mockApi(adminCapabilities, [realModel]);
-    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, realServer]);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([realServer]);
     vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === realServer.server_ref ? realResources : resources);
     renderPlatform();
 
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
-    expect(screen.getByLabelText("训练节点 · Server")).toHaveTextContent("NaVILA 训练节点 · online");
+    const registrationServer = screen.getByLabelText("训练节点 · Server");
+    expect(registrationServer).toHaveTextContent("NaVILA 训练节点在线");
+    expect(within(registrationServer).getByText("在线")).toHaveClass("text-emerald-600");
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
-    expect(screen.getByRole("combobox", { name: "训练节点" })).toHaveValue(realServer.server_ref);
+    expect(screen.getByRole("combobox", { name: "训练节点" })).toHaveTextContent("NaVILA 训练节点在线");
     expect(screen.getByText(/该模型族绑定了真实训练节点/)).toBeVisible();
     expect(screen.getByRole("button", { name: "生成预览" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "真实训练未启用" })).toBeDisabled();
@@ -1059,6 +1094,12 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
     fireEvent.change(screen.getByLabelText("模型族名称"), { target: { value: "枚举注册测试" } });
+    fireEvent.change(screen.getByLabelText("领域 · Domain"), { target: { value: "vla" } });
+    fireEvent.change(screen.getByLabelText("工作目录 · Working directory"), { target: { value: "/workspace/project" } });
+    fireEvent.change(screen.getByLabelText("启动程序 · Executable"), { target: { value: "torchrun" } });
+    fireEvent.change(screen.getByLabelText("训练入口 · Entrypoint"), { target: { value: "train.py" } });
+    fireEvent.change(screen.getByLabelText("输出根目录 · Output root"), { target: { value: "/workspace/outputs" } });
+    fireEvent.change(screen.getByLabelText("产物输出参数 · Output flag"), { target: { value: "--output_dir" } });
     fireEvent.click(screen.getByRole("button", { name: "添加参数" }));
     fireEvent.change(screen.getByLabelText("parameter_1 参数字段名"), { target: { value: "optimizer" } });
     fireEvent.change(screen.getByLabelText("optimizer 类型"), { target: { value: "enum" } });

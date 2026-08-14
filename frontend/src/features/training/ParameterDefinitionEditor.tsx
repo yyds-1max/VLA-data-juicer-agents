@@ -13,7 +13,7 @@ type Props = {
   onChange: (definitions: TrainingParameterDefinition[]) => void;
 };
 
-const inputClass = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-sm text-console-text focus:border-console-cyan focus:outline-hidden";
+const inputClass = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-sm text-console-text placeholder:text-slate-400 placeholder:opacity-100 focus:border-console-cyan focus:outline-hidden";
 const maxSafeInteger = Number.MAX_SAFE_INTEGER;
 const parameterTypes: Array<{ value: TrainingParameterType; label: string }> = [
   { value: "integer", label: "整数" }, { value: "number", label: "浮点数" }, { value: "boolean", label: "布尔值" }, { value: "enum", label: "枚举" }, { value: "string", label: "字符串" },
