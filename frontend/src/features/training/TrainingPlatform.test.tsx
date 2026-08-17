@@ -127,6 +127,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.deployTrainingNodeWorker).mockResolvedValue({ node: { ...pendingNode, state_revision: 2, deployment_status: "succeeded", installed_worker_version: "0.1.0" }, deployment: { status: "succeeded", worker_version: "0.1.0", message: "Worker deployed." } });
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+    fireEvent.click(screen.getByRole("button", { name: "登记新节点" }));
     fireEvent.change(screen.getByLabelText("节点名称"), { target: { value: "测试训练节点" } });
     fireEvent.change(screen.getByLabelText("主机地址"), { target: { value: "10.0.0.12" } });
     fireEvent.change(screen.getByLabelText("SSH 端口"), { target: { value: "2222" } });
@@ -284,6 +285,7 @@ describe("TrainingPlatform", () => {
       sudo_password_mode: "same_as_ssh",
     }));
     expect(await screen.findByText(/重新部署 Worker 前不能用于训练/)).toBeVisible();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "操作进度" })).getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("button", { name: "部署 Worker" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "卸载 Worker（保留节点）" })).not.toBeInTheDocument();
   });
@@ -322,7 +324,7 @@ describe("TrainingPlatform", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "更新 Worker" }));
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
-    expect(screen.getByText("更新 Worker", { selector: "p" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "更新 Worker" })).toBeVisible();
     expect(screen.getByLabelText("SSH 登录用户名")).toHaveValue("trainer");
     expect(screen.getByLabelText("SSH 登录用户名")).toBeDisabled();
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
@@ -392,6 +394,7 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByText(/Worker 已卸载，但节点记录删除失败/)).toBeVisible();
     expect(trainingApi.removeTrainingNodeWorker).toHaveBeenCalledTimes(1);
     expect(trainingApi.deleteTrainingNode).toHaveBeenCalledWith("node-test", 9);
+    fireEvent.click(within(screen.getByRole("dialog", { name: "操作进度" })).getByRole("button", { name: "关闭" }));
     fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
     fireEvent.click(await screen.findByRole("button", { name: "确认删除训练节点" }));
 
@@ -421,6 +424,7 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByText("存在阻止部署的问题")).toBeVisible();
     expect(screen.getAllByText(/部署账号权限不足/).length).toBeGreaterThan(0);
     expect(screen.getByText("部分条件未满足，请根据检查结果调整后重试。")).toBeVisible();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "操作进度" })).getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeEnabled();
     expect(trainingApi.deployTrainingNodeWorker).not.toHaveBeenCalled();
     expect(screen.queryByText(/手工创建账号/)).not.toBeInTheDocument();
@@ -1182,6 +1186,7 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("num_video_frames 默认值"), { target: { value: "8" } });
     fireEvent.click(screen.getByRole("button", { name: "保存模型配置" }));
     await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila-family", expect.objectContaining({ expected_revision: 1, configuration: { parameter_definitions: editedDefinitions, launch_template: launchTemplate } })));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "操作进度" })).getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("button", { name: "登记新模型" })).toBeVisible();
   });
 

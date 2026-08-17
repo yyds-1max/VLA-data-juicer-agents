@@ -55,6 +55,7 @@ import { trainingParameterGroupFor, usedTrainingParameterGroups } from "./parame
 import { enabledTrainingParameters } from "./parameterAvailability";
 import { TrainingNodesPanel } from "./TrainingNodesPanel";
 import { TrainingOperationFeedback, type TrainingOperationState } from "./TrainingOperationFeedback";
+import { TrainingOperationDialog } from "./TrainingOperationDialog";
 
 type TrainingTab = "runs" | "new" | "models" | "nodes" | "resources";
 const tabs = [
@@ -606,6 +607,7 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [verifyingFamilyRef, setVerifyingFamilyRef] = useState<string | null>(null);
   const [operation, setOperation] = useState<TrainingOperationState | null>(null);
+  const [operationOpen, setOperationOpen] = useState(false);
   const editorHeadingRef = useRef<HTMLHeadingElement>(null);
   const textInput = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text placeholder:text-slate-400 placeholder:opacity-100";
   useEffect(() => {
@@ -624,7 +626,11 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
     setEntrypoint(emptyLaunchTemplate.entrypoint); setFixedArgv(""); setOutputRoot(emptyLaunchTemplate.output_root); setOutputFlag(emptyLaunchTemplate.output_flag);
     setRuntimeKind(emptyLaunchTemplate.runtime_environment.kind); setCondaEnvironment(""); setMonitoringFormat(emptyLaunchTemplate.monitoring.format); setParameterDefinitions([]); setError(null);
   };
-  const openCreateMode = () => { resetCreateMode(); setEditorOpen(true); setOperation(null); };
+  const showOperation = (next: TrainingOperationState) => {
+    setOperation(next);
+    setOperationOpen(true);
+  };
+  const openCreateMode = () => { resetCreateMode(); setEditorOpen(true); setOperation(null); setOperationOpen(false); };
   const populateFromModel = (model: TrainingModel) => {
     const template = model.configuration?.launch_template;
     if (!template || !model.configuration) { setError("该模型族缺少可编辑的 launch template，请重新加载管理员投影。"); return false; }
@@ -656,7 +662,7 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
     if (duplicateFixedFlag) { setError(`额外固定 argv 与训练参数重复声明了 ${duplicateFixedFlag}。`); return; }
     const normalizedCondaEnvironment = condaEnvironment.trim();
     if (runtimeKind === "conda" && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(normalizedCondaEnvironment)) { setError("Conda 环境名只能包含字母、数字、点、下划线和短横线，且不能为空。"); return; }
-    setBusy(true); setError(null); setOperation({ status: "loading", title: editingFamilyRef ? "正在保存模型配置" : "正在登记模型", detail: "保存训练入口、运行环境和参数定义。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 0 });
+    setBusy(true); setError(null); showOperation({ status: "loading", title: editingFamilyRef ? "正在保存模型配置" : "正在登记模型", detail: "保存训练入口、运行环境和参数定义。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 0 });
     try {
       const launchTemplate = {
         domain, server_ref: serverRef, working_directory: workingDirectory, launcher_kind: launcherKind, executable, entrypoint,
@@ -671,20 +677,20 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
         ? await updateTrainingModel(editingModel.family_ref, { expected_revision: editingModel.edit_revision ?? 0, configuration })
         : await createTrainingModel({ family_name: familyName.trim(), configuration });
       onSaved(saved);
-      setOperation({ status: "loading", title: "配置已保存，正在请求 Worker 验证", detail: "系统会在模型绑定的训练节点上检查目录、入口和运行环境。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 1 });
+      showOperation({ status: "loading", title: "配置已保存，正在请求 Worker 验证", detail: "系统会在模型绑定的训练节点上检查目录、入口和运行环境。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 1 });
       try {
         const verifying = await verifyTrainingModel(saved.family_ref, saved.edit_revision ?? 0);
         if (verifying) onSaved(verifying);
-        setOperation({ status: "success", title: "模型配置已保存，验证任务已提交", detail: "Worker 会继续执行检查；验证结果会自动刷新到模型列表。" });
+        showOperation({ status: "success", title: "模型配置已保存，验证任务已提交", detail: "Worker 会继续执行检查；验证结果会自动刷新到模型列表。" });
         setEditorOpen(false);
         resetCreateMode();
       } catch (verifyError) {
         const detail = errorText(verifyError);
         setError(`模型配置已保存，但验证未能启动：${detail}`);
-        setOperation({ status: "error", title: "配置已保存，验证未完成", detail: "模型仍保留为草稿，可返回列表后重新验证。" });
+        showOperation({ status: "error", title: "配置已保存，验证未完成", detail: "模型仍保留为草稿，可返回列表后重新验证。" });
         if (editingModel) edit(saved);
       }
-    } catch (caught) { const detail = errorText(caught); setError(detail); setOperation({ status: "error", title: editingFamilyRef ? "保存模型配置失败" : "登记模型失败", detail }); } finally { setBusy(false); }
+    } catch (caught) { const detail = errorText(caught); setError(detail); showOperation({ status: "error", title: editingFamilyRef ? "保存模型配置失败" : "登记模型失败", detail }); } finally { setBusy(false); }
   };
   const loadNavilaPreset = () => {
     setFamilyName("NaVILA 轨迹训练");
@@ -695,9 +701,9 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
     setParameterDefinitions(structuredClone(navilaTrajectoryParameters)); setError(null);
   };
   const verify = async (model: TrainingModel) => {
-    setVerifyingFamilyRef(model.family_ref); setError(null); setOperation({ status: "loading", title: `正在验证 ${model.family_name}`, detail: "已请求 Worker 检查模型配置。" });
-    try { const verifying = await verifyTrainingModel(model.family_ref, model.edit_revision ?? 0); if (verifying) onSaved(verifying); setOperation({ status: "success", title: "验证任务已提交", detail: "结果会自动刷新到模型列表。" }); }
-    catch (caught) { const detail = errorText(caught); setError(detail); setOperation({ status: "error", title: "验证请求失败", detail }); }
+    setVerifyingFamilyRef(model.family_ref); setError(null); showOperation({ status: "loading", title: `正在验证 ${model.family_name}`, detail: "已请求 Worker 检查模型配置。" });
+    try { const verifying = await verifyTrainingModel(model.family_ref, model.edit_revision ?? 0); if (verifying) onSaved(verifying); showOperation({ status: "success", title: "验证任务已提交", detail: "结果会自动刷新到模型列表。" }); }
+    catch (caught) { const detail = errorText(caught); setError(detail); showOperation({ status: "error", title: "验证请求失败", detail }); }
     finally { setVerifyingFamilyRef(null); }
   };
   const defaultParameterValues = Object.fromEntries(parameterDefinitions.map((parameter) => [parameter.key, parameter.default]));
@@ -730,12 +736,12 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
       <div><h2 className="text-xl font-semibold text-console-text">模型注册</h2><p className="mt-1 text-sm text-console-muted">管理模型族当前训练定义。每次训练会保留当时的完整配置快照。</p></div>
       {canManage ? <ConsoleButton variant="primary" onClick={openCreateMode}><Plus className="h-4 w-4" />登记新模型</ConsoleButton> : null}
     </header>
-    <TrainingOperationFeedback operation={operation} />
     {error ? <p role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</p> : null}
     <section aria-labelledby="registered-models-title">
       <div className="mb-3 flex items-center justify-between"><div className="flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h3 id="registered-models-title" className="font-semibold text-console-text">已登记模型族</h3></div><span className="text-xs text-console-muted">共 {models.length} 个</span></div>
       {models.length ? <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">{models.map((model) => <ModelFamilyCard key={model.family_ref} model={model} servers={servers} canManage={canManage} verifying={verifyingFamilyRef === model.family_ref} onEdit={() => { setOperation(null); edit(model); }} onVerify={() => void verify(model)} />)}</div> : <div className="rounded-xl border border-dashed border-console-line py-16 text-center"><BookOpen className="mx-auto h-8 w-8 text-console-muted" /><p className="mt-3 text-sm font-medium text-console-text">尚未登记模型</p><p className="mt-1 text-sm text-console-muted">登记训练入口和参数定义后即可创建训练。</p>{canManage ? <ConsoleButton className="mt-4" variant="primary" onClick={openCreateMode}><Plus className="h-4 w-4" />登记第一个模型</ConsoleButton> : null}</div>}
     </section>
+    <TrainingOperationDialog open={operationOpen} operation={operation} onOpenChange={setOperationOpen} />
   </div>;
 
   return <div className="mx-auto max-w-[1520px] space-y-5">
@@ -743,7 +749,6 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
       <div><button type="button" className="mb-2 text-sm font-medium text-console-cyan hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/30" onClick={() => { setEditorOpen(false); setError(null); }}>← 返回模型列表</button><h2 ref={editorHeadingRef} tabIndex={-1} className="text-xl font-semibold text-console-text outline-none">{formTitle}</h2><p className="mt-1 text-sm text-console-muted">{editingFamilyRef ? "修改只影响之后创建的训练，历史模型版本保留原配置快照。" : "登记训练入口、参数定义和输出规则；保存后系统会自动发起验证。"}</p></div>
       {!editingFamilyRef ? <ConsoleButton variant="ghost" disabled={!canManage || busy} onClick={loadNavilaPreset}>一键载入 NaVILA 轨迹训练模板</ConsoleButton> : null}
     </header>
-    <TrainingOperationFeedback operation={operation} />
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(320px,420px)]">
     <ConsoleCard className="min-w-0 shadow-none">
       <section aria-labelledby="model-basic-config-title"><h3 id="model-basic-config-title" className="font-semibold text-console-text">基础配置</h3><p className="mt-1 text-xs text-console-muted">灰色文字仅为填写示例，不会作为真实配置保存。</p>
@@ -773,6 +778,7 @@ function ModelsPanel({ models, servers, canManage, active, onSaved }: { models: 
       <p className="mt-3 px-1 text-xs leading-5 text-console-muted">宽屏下摘要会固定在视口内；参数较多时仅滚动摘要区域。</p>
     </aside>
     </div>
+    <TrainingOperationDialog open={operationOpen} operation={operation} onOpenChange={setOperationOpen} />
   </div>;
 }
 

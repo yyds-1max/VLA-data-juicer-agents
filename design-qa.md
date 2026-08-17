@@ -1,62 +1,52 @@
-# Training UI design QA
+# Training modal workflow design QA
 
-- Source visual truth:
-  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-43ff94a6-957c-4e78-bc34-3e120527bff1.png`
-  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-85cbb3ee-768e-494b-bb5c-fef16ce78576.png`
-  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-afaeda8e-8fb6-4720-ad88-e00764dd48ce.png`
-- Implementation screenshots:
-  - `/private/tmp/training-gpu-card-bars-active.png`
-  - `/private/tmp/training-model-basic-config-aligned.png`
-  - `/private/tmp/training-parameters-compact-restored.png`
-- Browser-rendered viewport: 1265 × 712 CSS px; device pixel ratio 1.
-- Pixel dimensions:
-  - GPU source: 1630 × 507; implementation: 1265 × 712.
-  - Model basic-config source: 1169 × 919; implementation: 1265 × 712.
-  - Parameter-layout source: 1659 × 998; implementation: 1265 × 712.
-- Density normalization: all artifacts are DPR 1. Comparisons use focused content regions because the supplied images use different crops and viewport widths.
-- State: real Worker resource snapshot; GPU 6/7 under high utilization; editing a verified NaVILA family; first-stage common parameters.
+- Source visual truth: `/private/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-31e9aaf3-61db-45d7-8224-4d77fbffb047.png`
+- Rendered desktop implementation: `/private/tmp/training-modal-desktop-final.png`
+- Rendered mobile implementation: `/private/tmp/training-modal-mobile.png`
+- Source pixels: 1666 × 999
+- Desktop capture: browser CSS viewport 1280 × 720; screenshot 1265 × 712; device scale factor 1
+- Mobile capture: browser CSS viewport 390 × 844; screenshot 375 × 812; device scale factor 1
+- State: training-node registration dialog open; no form submission or remote mutation performed
+
+## Comparison scope
+
+The source screenshot documents the prior inline Worker deployment flow. The requested target intentionally changes spatial hierarchy rather than cloning that state pixel-for-pixel: credentials and host-key confirmation move into a modal, while progress and results use a separate compact operation modal. Source and implementation were reviewed together in one comparison input; differences caused by the intentional state change were not treated as fidelity defects.
 
 ## Full-view comparison evidence
 
-The revised new-training screen preserves the established single-page flow and right-hand real-resource overview. GPU cards remain in the existing four-column grid instead of changing the page composition. The model editor retains its left form/right sticky command layout, while the basic configuration rows now share a consistent input baseline. The training parameter area returns to the original compact two-column form.
+- The modal creates one clear foreground task and removes the prior split attention between the left progress card and right inline credential form.
+- Page geometry remains stable behind the overlay; opening and closing the dialog does not move the training-node cards.
+- Desktop dialog width (576 CSS px) supports the two-column server fields without excessive line length.
+- Mobile layout collapses to one column and scrolls inside the dialog while retaining the close control and footer actions.
 
-## Focused-region comparison evidence
+## Focused-region evidence
 
-- GPU cards now pair exact utilization and memory values with independent progress bars. High utilization and memory are immediately visible on GPU 6/7 without removing temperature or platform-lease status.
-- Model basic-configuration controls align at their input/select bottom edges even when only one label in the row contains helper copy.
-- Boolean parameters are again native compact checkboxes on the field heading row. Integer and floating-point parameters use their original numeric inputs without secondary range sliders.
-- Focused regions were required because the important changes are dense form controls and 8-card resource metrics that are not legible in a full-page capture.
+- Typography: existing console font, weights, labels, and helper-copy hierarchy are preserved; no unexpected wrapping was found at desktop or mobile widths.
+- Spacing/layout: field groups use consistent gaps; footer is visually separated and remains reachable at 390 px width.
+- Colors/tokens: the implementation reuses existing panel, border, cyan focus, disabled, and muted-text tokens. No new decorative palette was introduced.
+- Image quality/assets: this workflow contains no content imagery. Existing Lucide icons remain sharp and consistent.
+- Copy/content: the dialog states what will happen, that SSH credentials are temporary, and that host fingerprint confirmation follows registration.
+- Accessibility/interaction: semantic dialog title and description are present; initial focus lands on “节点名称”; Escape and the explicit close button close the modal; focus-visible is retained; loading uses `aria-busy`; reduced-motion classes remain supported.
 
 ## Findings and comparison history
 
-1. P2: the prior GPU cards exposed exact values only, making high utilization and memory pressure slow to scan.
-   - Fix: added separate utilization and memory progress bars with warning/danger thresholds while retaining exact values.
-   - Post-fix evidence: `/private/tmp/training-gpu-card-bars-active.png`.
-2. P2: helper text in one column pushed its control down while the neighboring control stayed high.
-   - Fix: bottom-aligned the two-column basic-configuration grid at desktop widths.
-   - Post-fix evidence: `/private/tmp/training-model-basic-config-aligned.png`.
-3. P1: large boolean cards and numeric sliders changed the established parameter-form density and made long configurations harder to scan.
-   - Fix: restored compact boolean checkboxes and number inputs, retaining labels, field names, tooltips, validation, dependencies, and keyboard focus.
-   - Post-fix evidence: `/private/tmp/training-parameters-compact-restored.png`.
+1. Initial responsive pass — P2: the floating DataPilot launcher could show through the translucent mobile dialog footer and visually overlap its cancel action.
+   - Fix: raised shared Dialog/AlertDialog layers above floating controls and suppress the DataPilot launcher while `body[data-scroll-locked]` is active, with a reduced-motion override.
+   - Post-fix evidence: `/private/tmp/training-modal-mobile.png`; footer actions are unobstructed and the modal remains scrollable.
 
-No actionable P0, P1, or P2 findings remain.
-
-## Required fidelity surfaces
-
-- Typography: existing product font stack, weights, field-name monospace text, and label hierarchy are retained.
-- Spacing/layout: resource cards keep the four-column rhythm; model inputs align consistently; compact parameter density is restored.
-- Colors/tokens: existing cyan/info, amber/warning, rose/danger, emerald availability, muted text, and panel tokens are reused.
-- Image quality/assets: no bitmap assets were introduced; existing Lucide icons and native form controls remain sharp.
-- Copy/content: GPU metrics distinguish utilization from memory occupation, while lease status remains a separate platform fact.
+No actionable P0, P1, or P2 findings remain. No focused-region issue required another implementation iteration.
 
 ## Primary interactions tested
 
-- Open New Training from Training Tasks.
-- Inspect real Worker CPU, memory, disk, and all eight GPU snapshots.
-- Select and deselect GPU 0.
-- Open Model Registration and edit an existing model family.
-- Return to Training Tasks and reopen New Training.
-- Inspect compact numeric, enum, boolean, dependency, and grouped parameter states.
-- Browser testing surfaced no page-level error state or blocking console error during these flows.
+- Open registration dialog from “登记新节点”.
+- Initial keyboard focus and visible focus ring.
+- Escape closes the dialog and restores access to the page trigger.
+- Desktop and mobile responsive layouts.
+- Browser console errors checked: none.
+- Unit coverage verifies manual close during loading and automatic close after success.
+
+## Residual test gap
+
+The browser pass did not submit SSH credentials or mutate the registered training node. Deployment, removal, error, retry, and success transitions are covered with mocked API integration tests instead.
 
 final result: passed

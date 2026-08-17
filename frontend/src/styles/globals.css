@@ -575,3 +575,16 @@ textarea {
   visibility: hidden;
   pointer-events: none;
 }
+
+/* Modal work owns the foreground; keep the assistant launcher from covering dialog actions. */
+body[data-scroll-locked] button[aria-label="Open DataPilot"] {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(0.5rem);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-scroll-locked] button[aria-label="Open DataPilot"] {
+    transform: none;
+  }
+}

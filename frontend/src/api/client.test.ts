@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createSession,
+  deleteTrainingNode,
   getSession,
   getNavigationDatasetDate,
   getNavigationDatasetSummary,
@@ -177,6 +178,25 @@ describe("api client", () => {
     mockFetchJson({ detail: "Session not found" }, false);
 
     await expect(getSession("missing")).rejects.toMatchObject({ message: "Session not found" });
+  });
+
+  it("accepts an empty 204 response when deleting a training node", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 204,
+      statusText: "No Content",
+      text: () => Promise.resolve(""),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(deleteTrainingNode("node/with space", 7)).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/training/nodes/node%2Fwith%20space?expected_revision=7",
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+      },
+    );
   });
 
   it("falls back to plain text for non-ok responses", async () => {
