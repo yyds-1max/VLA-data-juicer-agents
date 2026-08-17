@@ -1045,6 +1045,24 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("NaVILA v2-20260806")).toBeVisible();
   });
 
+  it("groups scheduling states under the user-facing training status", async () => {
+    const queuedRun: TrainingRun = { ...runningRun, run_ref: "run-queued", status: "queued", version_label: "v3-20260806" };
+    const cancelledRun: TrainingRun = { ...runningRun, run_ref: "run-cancelled", status: "cancelled", version_label: "v4-20260806" };
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([queuedRun, runningRun, cancelledRun]);
+    renderPlatform();
+
+    const filter = await screen.findByLabelText("状态筛选");
+    expect(within(filter).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "全部状态", "训练中", "已取消", "失败", "已完成", "状态丢失",
+    ]);
+    fireEvent.change(filter, { target: { value: "active" } });
+    expect(screen.getByText("NaVILA v3-20260806")).toBeVisible();
+    expect(screen.getByText("NaVILA v1-20260806")).toBeVisible();
+    expect(screen.queryByText("NaVILA v4-20260806")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("table")).getAllByText("训练中")).toHaveLength(2);
+  });
+
   it("presents training runs as a searchable operations table", async () => {
     mockApi(readonlyCapabilities);
     vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([runningRun, succeededRun]);
@@ -1053,7 +1071,7 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByRole("table")).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "任务 / 模型" })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "训练进度" })).toBeVisible();
-    expect(screen.getByRole("region", { name: "训练概览" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "训练概览" })).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("搜索训练任务"), { target: { value: "run-succeeded" } });
     expect(screen.queryByText("NaVILA v1-20260806")).not.toBeInTheDocument();

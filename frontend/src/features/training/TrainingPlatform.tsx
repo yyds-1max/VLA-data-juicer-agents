@@ -108,9 +108,22 @@ function TrainingServerSelect({ servers, value, disabled, ariaLabel, onValueChan
 
 const activeStatuses = new Set<TrainingRun["status"]>(["queued", "preparing", "running", "stop_requested"]);
 const statusMeta: Record<TrainingRun["status"], { label: string; tone: StatusTone }> = {
-  queued: { label: "排队中", tone: "neutral" }, preparing: { label: "准备中", tone: "info" }, running: { label: "模拟训练中", tone: "purple" },
-  stop_requested: { label: "停止中", tone: "warning" }, succeeded: { label: "已完成", tone: "success" }, failed: { label: "失败", tone: "danger" }, cancelled: { label: "已取消", tone: "neutral" }, lost: { label: "状态丢失", tone: "danger" },
+  queued: { label: "训练中", tone: "purple" }, preparing: { label: "训练中", tone: "purple" }, running: { label: "训练中", tone: "purple" },
+  stop_requested: { label: "训练中", tone: "purple" }, succeeded: { label: "已完成", tone: "success" }, failed: { label: "失败", tone: "danger" }, cancelled: { label: "已取消", tone: "neutral" }, lost: { label: "状态丢失", tone: "danger" },
 };
+type TrainingRunStatusFilter = "all" | "active" | "cancelled" | "failed" | "succeeded" | "lost";
+const runStatusFilterOptions: Array<{ value: Exclude<TrainingRunStatusFilter, "all">; label: string }> = [
+  { value: "active", label: "训练中" },
+  { value: "cancelled", label: "已取消" },
+  { value: "failed", label: "失败" },
+  { value: "succeeded", label: "已完成" },
+  { value: "lost", label: "状态丢失" },
+];
+function matchesRunStatusFilter(status: TrainingRun["status"], filter: TrainingRunStatusFilter) {
+  if (filter === "all") return true;
+  if (filter === "active") return activeStatuses.has(status);
+  return status === filter;
+}
 const modelStatusMeta: Record<TrainingModel["status"], { label: string; tone: StatusTone }> = {
   draft: { label: "草稿", tone: "warning" },
   verified: { label: "已验证", tone: "success" },
@@ -182,30 +195,6 @@ function TrainingSectionTabs({ value, onChange }: { value: TrainingTab; onChange
         })}
       </div>
     </div>
-  );
-}
-
-function TrainingOverviewMetrics({ runs, gpus }: { runs: TrainingRun[]; gpus: TrainingGpuResource[] }) {
-  // 总览只从现有任务与资源投影派生，避免展示层维护另一套训练状态口径。
-  const metrics = [
-    { label: "运行中", value: runs.filter((run) => activeStatuses.has(run.status)).length, hint: "含排队与准备任务" },
-    { label: "排队中", value: runs.filter((run) => run.status === "queued").length, hint: "等待资源调度" },
-    { label: "已完成", value: runs.filter((run) => run.status === "succeeded").length, hint: "当前任务总览" },
-    { label: "可用 GPU", value: gpus.filter((gpu) => !gpu.externally_occupied && !gpu.lease_run_ref).length, hint: `共 ${gpus.length} 张已纳管` },
-  ];
-
-  return (
-    <section aria-label="训练概览" className="grid border-y border-console-line sm:grid-cols-2 xl:grid-cols-4">
-      {metrics.map((metric, index) => (
-        <article key={metric.label} className={cn("min-w-0 px-5 py-4", index > 0 && "sm:border-l sm:border-console-line", index === 2 && "sm:border-l-0 xl:border-l", index > 1 && "border-t border-console-line xl:border-t-0")}>
-          <p className="text-xs font-medium text-console-muted">{metric.label}</p>
-          <div className="mt-1 flex items-end gap-2">
-            <strong className="text-2xl font-semibold tabular-nums text-console-text">{metric.value}</strong>
-            <span className="pb-0.5 text-xs text-console-muted">{metric.hint}</span>
-          </div>
-        </article>
-      ))}
-    </section>
   );
 }
 
@@ -449,12 +438,12 @@ function RunDetail({ run, canStop, onRunChange }: { run: TrainingRun; canStop: b
 }
 
 function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; canCreate: boolean; onCreate: () => void; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
-  const [statusFilter, setStatusFilter] = useState<"all" | TrainingRun["status"]>("all");
+  const [statusFilter, setStatusFilter] = useState<TrainingRunStatusFilter>("all");
   const [query, setQuery] = useState("");
   const normalizedQuery = query.trim().toLocaleLowerCase();
   // 搜索和筛选只改变当前表格的呈现，完整任务投影仍用于状态统计和深链详情。
   const filteredRuns = runs.filter((run) => {
-    if (statusFilter !== "all" && run.status !== statusFilter) return false;
+    if (!matchesRunStatusFilter(run.status, statusFilter)) return false;
     if (!normalizedQuery) return true;
     return [runModelDisplayName(run), run.family_name, run.version_ref, run.run_ref, run.server_ref]
       .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
@@ -499,10 +488,10 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
               aria-label="状态筛选"
               className="h-9 w-full rounded-md border border-console-line bg-console-panel px-3 text-sm text-console-text outline-none focus-visible:border-console-cyan focus-visible:ring-2 focus-visible:ring-console-cyan/15 sm:w-36"
               value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value as "all" | TrainingRun["status"])}
+              onChange={(event) => setStatusFilter(event.target.value as TrainingRunStatusFilter)}
             >
               <option value="all">全部状态</option>
-              {Object.entries(statusMeta).map(([status, meta]) => <option key={status} value={status}>{meta.label}</option>)}
+              {runStatusFilterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
         </div>
@@ -933,7 +922,6 @@ export function TrainingPlatform() {
       navigate("/model");
     }
   }, [deepRunRef, navigate]);
-  const allGpus = useMemo(() => Object.values(resourcesByServer).flatMap((resources) => resources.gpus), [resourcesByServer]);
   if (!capabilities && !error) return <LoadingCard />;
   return (
     <section className="w-full space-y-5 px-4 py-3 md:px-6 xl:px-8">
@@ -948,7 +936,6 @@ export function TrainingPlatform() {
       {eventStreamDisconnected ? <div role="status" className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-800"><AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />事件流已断开，正在使用轮询恢复。</div> : null}
       {error ? <div className="flex flex-col gap-3 rounded-md border border-rose-200 bg-rose-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><p role="alert" className="text-sm text-rose-700">{error}</p><ConsoleButton className="shrink-0" onClick={() => void load()}><RefreshCw className="h-4 w-4" />重新加载</ConsoleButton></div> : null}
 
-      {tab === "runs" && !selectedRun ? <TrainingOverviewMetrics runs={runs} gpus={allGpus} /> : null}
 
       <div id="training-platform-panel-runs" role="tabpanel" aria-labelledby="training-platform-tab-runs" hidden={tab !== "runs"}>
         <RunsPanel runs={runs} selectedRun={selectedRun} canStop={can(capabilities, "training:stop_runs")} canCreate={can(capabilities, "training:create_runs")} onCreate={() => changeTab("new")} onSelect={selectRun} onRunChange={updateRun} />
