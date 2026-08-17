@@ -112,10 +112,9 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "选择 GPU 0" }));
     expect(resourcePanel).toHaveTextContent("1/1");
     expect(resourcePanel).toHaveTextContent("80 GiB 显存");
-    const frameSlider = screen.getByRole("slider", { name: "视频帧数 快速调整" });
-    expect(frameSlider).toHaveValue("4");
-    fireEvent.change(frameSlider, { target: { value: "8" } });
-    expect(screen.getByLabelText("视频帧数")).toHaveValue(8);
+    expect(screen.getByRole("progressbar", { name: "GPU 0 利用率" })).toBeVisible();
+    expect(screen.getByRole("progressbar", { name: "GPU 0 显存占用" })).toBeVisible();
+    expect(screen.queryByRole("slider", { name: "视频帧数 快速调整" })).not.toBeInTheDocument();
   });
 
   it("registers a node then automatically deploys a Worker with one-time SSH credentials", async () => {

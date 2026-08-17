@@ -7,6 +7,7 @@ type ProgressBarProps = {
   value: number;
   tone?: Extract<StatusTone, "success" | "info" | "warning" | "danger" | "purple" | "neutral">;
   label?: string;
+  showLabel?: boolean;
   className?: string;
 };
 
@@ -19,12 +20,12 @@ const fillClasses: Record<NonNullable<ProgressBarProps["tone"]>, string> = {
   neutral: "bg-console-muted",
 };
 
-export function ProgressBar({ value, tone = "success", label, className }: ProgressBarProps) {
+export function ProgressBar({ value, tone = "success", label, showLabel = true, className }: ProgressBarProps) {
   const normalizedValue = Math.min(100, Math.max(0, value));
 
   return (
     <div className={cn("space-y-1.5", className)}>
-      {label ? <div className="text-xs text-console-muted">{label}</div> : null}
+      {label && showLabel ? <div className="text-xs text-console-muted">{label}</div> : null}
       <Progress
         className="h-2 bg-slate-100"
         indicatorClassName={fillClasses[tone]}

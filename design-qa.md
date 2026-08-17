@@ -1,62 +1,62 @@
 # Training UI design QA
 
 - Source visual truth:
-  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-96815b60-2754-4d63-a8dc-90b2c1e9486f.png`
-  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-b1c69ff6-280c-4c8a-8040-04c70daaf09f.png`
+  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-43ff94a6-957c-4e78-bc34-3e120527bff1.png`
+  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-85cbb3ee-768e-494b-bb5c-fef16ce78576.png`
+  - `/var/folders/80/bg0v0z7n3jd43rr470zsfjmr0000gn/T/codex-clipboard-afaeda8e-8fb6-4720-ad88-e00764dd48ce.png`
 - Implementation screenshots:
-  - `/private/tmp/training-model-editor-viewport.png`
-  - `/private/tmp/training-model-editor-sticky.png`
-  - `/private/tmp/training-new-run-resources-final.png`
-  - `/private/tmp/training-parameter-controls.png`
-- Viewport: 1600 × 900 CSS px; device pixel ratio 1.
+  - `/private/tmp/training-gpu-card-bars-active.png`
+  - `/private/tmp/training-model-basic-config-aligned.png`
+  - `/private/tmp/training-parameters-compact-restored.png`
+- Browser-rendered viewport: 1265 × 712 CSS px; device pixel ratio 1.
 - Pixel dimensions:
-  - Model registration source: 1634 × 846.
-  - Resource-panel source: 1663 × 905.
-  - Implementation captures: 1585 × 892 (browser content viewport after scrollbar/chrome allocation).
-- Density normalization: all compared at DPR 1 and fitted to their native width; no density conversion was required.
-- State: new model editor before and after loading the NaVILA preset; sticky command summary after 720 px page scroll; new training with a real Worker resource snapshot; first-stage parameter controls.
+  - GPU source: 1630 × 507; implementation: 1265 × 712.
+  - Model basic-config source: 1169 × 919; implementation: 1265 × 712.
+  - Parameter-layout source: 1659 × 998; implementation: 1265 × 712.
+- Density normalization: all artifacts are DPR 1. Comparisons use focused content regions because the supplied images use different crops and viewport widths.
+- State: real Worker resource snapshot; GPU 6/7 under high utilization; editing a verified NaVILA family; first-stage common parameters.
 
 ## Full-view comparison evidence
 
-The model editor retains the existing page hierarchy and visual tokens while using the previously empty horizontal space for a right-hand command summary. The new-training resource panel follows the reference screen's restrained card, label, progress-bar, and right-rail treatment without copying its placeholder data.
+The revised new-training screen preserves the established single-page flow and right-hand real-resource overview. GPU cards remain in the existing four-column grid instead of changing the page composition. The model editor retains its left form/right sticky command layout, while the basic configuration rows now share a consistent input baseline. The training parameter area returns to the original compact two-column form.
 
 ## Focused-region comparison evidence
 
-- The command summary now keeps one executable/argument pair per physical row, scrolls internally on both axes, and remains at `top: 16px` after the page is scrolled 720 px.
-- The preset button has no initial focus ring; focus moves to the editor heading when the screen opens. Keyboard-triggered focus styling remains available.
-- The new-training resource panel uses the selected Worker's real CPU, memory, GPU, disk, and sample-time fields.
-- Bounded numeric parameters keep the exact number input and add a synchronized range control. Boolean parameters use a full-card selected/unselected state while retaining the native checkbox.
-- At 900 px viewport width the command summary returns to normal document flow below the form, and the document has no horizontal overflow.
+- GPU cards now pair exact utilization and memory values with independent progress bars. High utilization and memory are immediately visible on GPU 6/7 without removing temperature or platform-lease status.
+- Model basic-configuration controls align at their input/select bottom edges even when only one label in the row contains helper copy.
+- Boolean parameters are again native compact checkboxes on the field heading row. Integer and floating-point parameters use their original numeric inputs without secondary range sliders.
+- Focused regions were required because the important changes are dense form controls and 8-card resource metrics that are not legible in a full-page capture.
 
 ## Findings and comparison history
 
-1. P2: the first resource-panel implementation was tall enough to meet the fixed assistant control at the lower-right edge.
-   - Fix: condensed the resource metrics into four compact rows and removed redundant explanatory copy.
-   - Post-fix evidence: `/private/tmp/training-new-run-resources-final.png`; all four metrics fit above the assistant control.
-2. P2: long command values wrapped across visual rows, weakening the requested one-parameter-per-line structure.
-   - Fix: changed the command area to preserved, non-wrapping whitespace with internal horizontal scrolling.
-   - Post-fix evidence: sticky positioning is visible in `/private/tmp/training-model-editor-sticky.png`; the final non-wrapping and overflow contract is covered by the TrainingPlatform DOM regression test.
-3. P2: entering the editor could leave an apparent blue focus ring on the preset action.
-   - Fix: move initial focus to the screen heading without removing keyboard focus styles from the button.
-   - Post-fix evidence: browser inspection reported the active element as `H2 登记新模型`; `/private/tmp/training-model-editor-viewport.png` shows no button ring.
+1. P2: the prior GPU cards exposed exact values only, making high utilization and memory pressure slow to scan.
+   - Fix: added separate utilization and memory progress bars with warning/danger thresholds while retaining exact values.
+   - Post-fix evidence: `/private/tmp/training-gpu-card-bars-active.png`.
+2. P2: helper text in one column pushed its control down while the neighboring control stayed high.
+   - Fix: bottom-aligned the two-column basic-configuration grid at desktop widths.
+   - Post-fix evidence: `/private/tmp/training-model-basic-config-aligned.png`.
+3. P1: large boolean cards and numeric sliders changed the established parameter-form density and made long configurations harder to scan.
+   - Fix: restored compact boolean checkboxes and number inputs, retaining labels, field names, tooltips, validation, dependencies, and keyboard focus.
+   - Post-fix evidence: `/private/tmp/training-parameters-compact-restored.png`.
 
 No actionable P0, P1, or P2 findings remain.
 
 ## Required fidelity surfaces
 
-- Typography: existing product font stack, weights, label sizes, and mono command text are retained.
-- Spacing/layout: wide-screen two-column editor and compact right resource rail align with the existing grid rhythm; narrow screens collapse without overflow.
-- Colors/tokens: existing console borders, muted text, cyan focus/selection, emerald availability, and slate command surface are reused.
-- Image quality/assets: no new bitmap assets were introduced; existing Lucide icons remain sharp and consistent.
-- Copy/content: labels describe live summaries, selected resources, and default-value semantics without implying that preview actions execute training.
+- Typography: existing product font stack, weights, field-name monospace text, and label hierarchy are retained.
+- Spacing/layout: resource cards keep the four-column rhythm; model inputs align consistently; compact parameter density is restored.
+- Colors/tokens: existing cyan/info, amber/warning, rose/danger, emerald availability, muted text, and panel tokens are reused.
+- Image quality/assets: no bitmap assets were introduced; existing Lucide icons and native form controls remain sharp.
+- Copy/content: GPU metrics distinguish utilization from memory occupation, while lease status remains a separate platform fact.
 
 ## Primary interactions tested
 
-- Open model registration and enter new-model mode.
-- Load the NaVILA preset and inspect the generated command rows.
-- Scroll the editor and confirm the summary remains sticky.
-- Open new training and inspect real Worker resources.
-- Verify narrow-screen stacking at 900 px.
-- Check browser console for blocking errors; none were observed in the tested flow.
+- Open New Training from Training Tasks.
+- Inspect real Worker CPU, memory, disk, and all eight GPU snapshots.
+- Select and deselect GPU 0.
+- Open Model Registration and edit an existing model family.
+- Return to Training Tasks and reopen New Training.
+- Inspect compact numeric, enum, boolean, dependency, and grouped parameter states.
+- Browser testing surfaced no page-level error state or blocking console error during these flows.
 
 final result: passed
