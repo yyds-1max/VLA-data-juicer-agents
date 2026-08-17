@@ -313,6 +313,51 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByText("尚未登记训练节点。")).toBeVisible();
   });
 
+  it("lets the user retry deleting a node when Worker removal succeeded but record deletion failed", async () => {
+    const installedNode: TrainingNode = {
+      ...pendingNode,
+      ssh_username: "trainer",
+      status: "online",
+      state_revision: 7,
+      deployment_status: "succeeded",
+      installed_worker_version: "0.1.0",
+      worker_version: "0.1.0",
+      enrolled_at: "2026-08-12T00:00:00Z",
+    };
+    const removedNode: TrainingNode = {
+      ...installedNode,
+      status: "pending_enrollment",
+      state_revision: 9,
+      deployment_status: "not_started",
+      installed_worker_version: null,
+      worker_version: null,
+      enrolled_at: null,
+    };
+    mockApi(adminCapabilities);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([installedNode]);
+    vi.mocked(trainingApi.removeTrainingNodeWorker).mockResolvedValue({ node: removedNode, removal: { status: "succeeded", message: "Worker removed." } });
+    vi.mocked(trainingApi.deleteTrainingNode)
+      .mockRejectedValueOnce(new Error("temporary failure"))
+      .mockResolvedValueOnce(undefined);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "训练节点" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
+    fireEvent.change(await screen.findByLabelText("SSH 登录密码"), { target: { value: "one-time-removal-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "继续删除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认删除训练节点" }));
+
+    expect(await screen.findByText(/Worker 已卸载，但节点记录删除失败/)).toBeVisible();
+    expect(trainingApi.removeTrainingNodeWorker).toHaveBeenCalledTimes(1);
+    expect(trainingApi.deleteTrainingNode).toHaveBeenCalledWith("node-test", 9);
+    fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认删除训练节点" }));
+
+    await waitFor(() => expect(trainingApi.deleteTrainingNode).toHaveBeenCalledTimes(2));
+    expect(trainingApi.removeTrainingNodeWorker).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("尚未登记训练节点。")).toBeVisible();
+  });
+
   it("clearly reports an insufficient deployment account without suggesting manual setup", async () => {
     mockApi(adminCapabilities);
     vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([pendingNode]);

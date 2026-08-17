@@ -254,6 +254,7 @@ export function TrainingNodesPanel({
     const removalHasInstalledWorker = nodeHasInstalledWorker(removalNode);
     if (removalHasInstalledWorker && (!removalSshUsername.trim() || !removalSshPassword || (removalSudoPasswordMode === "separate" && !removalSudoPassword))) return;
     setBusy(true); setMessage(null);
+    let workerWasRemoved = false;
     try {
       let currentNode = removalNode;
       if (removalHasInstalledWorker) {
@@ -265,6 +266,7 @@ export function TrainingNodesPanel({
           ...(removalSudoPasswordMode === "separate" ? { sudo_password: removalSudoPassword } : {}),
         });
         currentNode = result.node;
+        workerWasRemoved = true;
         onChanged(currentNode);
       }
       if (removalPurpose === "node") {
@@ -279,12 +281,13 @@ export function TrainingNodesPanel({
       setRemovalNodeRef(null);
       resetRemoval(null);
     } catch (error) {
-      setMessage(errorText(error));
+      setMessage(workerWasRemoved && removalPurpose === "node"
+        ? `Worker 已卸载，但节点记录删除失败：${errorText(error)}。请重新点击删除按钮重试。`
+        : errorText(error));
       setRemovalConfirmOpen(false);
-      setRemovalSshPassword("");
-      setRemovalSshPasswordVisible(false);
-      setRemovalSudoPassword("");
-      setRemovalSudoPasswordVisible(false);
+      setRemovalOpen(false);
+      setRemovalNodeRef(null);
+      resetRemoval(null);
     } finally { setBusy(false); }
   };
 

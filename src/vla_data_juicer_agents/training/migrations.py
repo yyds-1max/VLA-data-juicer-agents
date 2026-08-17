@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 7
+LATEST_TRAINING_SCHEMA_VERSION = 8
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -71,6 +71,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(7,?,?)",
             ("training_workflows_m7", applied_at),
+        )
+        connection.commit()
+        versions.append(7)
+    if 8 not in versions:
+        connection.executescript(_MIGRATION_008)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(8,?,?)",
+            ("training_node_deletion_history_m8", applied_at),
         )
         connection.commit()
 
@@ -437,5 +445,52 @@ CREATE TABLE training_artifacts (
   FOREIGN KEY(stage_id) REFERENCES training_stages(id)
 );
 CREATE INDEX idx_training_artifacts_version ON training_artifacts(version_id,id);
+COMMIT;
+"""
+
+
+_MIGRATION_008 = """
+BEGIN IMMEDIATE;
+ALTER TABLE model_verification_requests
+  RENAME TO model_verification_requests_m7;
+CREATE TABLE model_verification_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  verification_ref TEXT NOT NULL UNIQUE,
+  model_id INTEGER NOT NULL,
+  model_revision_id INTEGER NOT NULL,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed')),
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  worker_instance_id TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(model_id) REFERENCES registered_models(id),
+  FOREIGN KEY(model_revision_id) REFERENCES model_revisions(id),
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL
+);
+INSERT INTO model_verification_requests(
+  id,verification_ref,model_id,model_revision_id,node_id,node_ref_snapshot,
+  status,request_json,result_json,worker_instance_id,lease_expires_at,
+  created_at,started_at,finished_at,updated_at
+)
+SELECT
+  verification.id,verification.verification_ref,verification.model_id,
+  verification.model_revision_id,verification.node_id,node.node_ref,
+  verification.status,verification.request_json,verification.result_json,
+  verification.worker_instance_id,verification.lease_expires_at,
+  verification.created_at,verification.started_at,verification.finished_at,
+  verification.updated_at
+FROM model_verification_requests_m7 AS verification
+JOIN training_nodes AS node ON node.id=verification.node_id;
+DROP TABLE model_verification_requests_m7;
+CREATE INDEX idx_model_verification_node_status
+  ON model_verification_requests(node_id,status,id);
+CREATE INDEX idx_model_verification_model
+  ON model_verification_requests(model_id,id DESC);
 COMMIT;
 """

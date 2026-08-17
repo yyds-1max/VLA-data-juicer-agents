@@ -214,7 +214,7 @@ def test_existing_m1_database_is_upgraded_without_recreating_training_data(
             """SELECT name FROM sqlite_master
             WHERE type='table' AND name='training_nodes'"""
         ).fetchone()
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
     assert model_name == "Existing"
     assert node_table == ("training_nodes",)
 

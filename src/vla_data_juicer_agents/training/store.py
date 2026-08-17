@@ -283,6 +283,30 @@ class TrainingStore:
                     "An enrolled node cannot be deleted; disable it instead.",
                     current=self._safe_node(row),
                 )
+            db.execute(
+                """UPDATE model_verification_requests SET
+                status='failed',
+                result_json=?,worker_instance_id=NULL,lease_expires_at=NULL,
+                finished_at=?,updated_at=?
+                WHERE node_id=? AND status IN ('queued','running')""",
+                (
+                    canonical_json(
+                        {
+                            "checks": [
+                                {
+                                    "code": "training_node_deleted",
+                                    "label": "训练节点",
+                                    "status": "failed",
+                                    "detail": "训练节点已删除，配置验证未完成。",
+                                }
+                            ]
+                        }
+                    ),
+                    timestamp,
+                    timestamp,
+                    row["id"],
+                ),
+            )
             self._audit(db, actor, "node.deleted", node_ref, {}, timestamp)
             db.execute("DELETE FROM training_nodes WHERE id=?", (row["id"],))
 
@@ -862,14 +886,15 @@ class TrainingStore:
             }
             db.execute(
                 """INSERT INTO model_verification_requests(
-                verification_ref,model_id,model_revision_id,node_id,status,
+                verification_ref,model_id,model_revision_id,node_id,node_ref_snapshot,status,
                 request_json,created_at,updated_at)
-                VALUES(?,?,?,?,'queued',?,?,?)""",
+                VALUES(?,?,?,?,?,'queued',?,?,?)""",
                 (
                     verification_ref,
                     model["id"],
                     revision["id"],
                     node["id"],
+                    node["node_ref"],
                     canonical_json(request),
                     timestamp,
                     timestamp,
