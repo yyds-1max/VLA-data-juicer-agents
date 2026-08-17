@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, Plus, Settings2, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, Plus, Search, Settings2, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import type { TrainingArgumentStyle, TrainingParameterDefinition, TrainingParameterType } from "../../api/types";
@@ -217,7 +217,8 @@ function EnumChoiceEditor({ parameter, disabled, onChange }: { parameter: Traini
   </fieldset>;
 }
 
-function ParameterCard({ parameter, definitions, groups, disabled, onChange, onDelete, onRequestNewGroup }: { parameter: TrainingParameterDefinition; definitions: TrainingParameterDefinition[]; groups: TrainingParameterGroup[]; disabled: boolean; onChange: (parameter: TrainingParameterDefinition) => void; onDelete: () => void; onRequestNewGroup: () => void }) {
+function ParameterCard({ parameter, definitions, groups, disabled, initiallyOpen = false, onChange, onDelete, onRequestNewGroup }: { parameter: TrainingParameterDefinition; definitions: TrainingParameterDefinition[]; groups: TrainingParameterGroup[]; disabled: boolean; initiallyOpen?: boolean; onChange: (parameter: TrainingParameterDefinition) => void; onDelete: () => void; onRequestNewGroup: () => void }) {
+  const [expanded, setExpanded] = useState(initiallyOpen);
   const update = <K extends keyof TrainingParameterDefinition>(key: K, value: TrainingParameterDefinition[K]) => onChange({ ...parameter, [key]: value });
   const changeKey = (key: string) => onChange({
     ...parameter,
@@ -239,7 +240,6 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
       ...defaultForType(type),
     });
   };
-  const dependencySummary = parameterDependencySummary(definitions, parameter);
   const selectedGroup = trainingParameterGroupFor(parameter);
   const numericDefault = typeof parameter.default === "number" && Number.isFinite(parameter.default) ? parameter.default : null;
   const minimum = typeof parameter.minimum === "number" && Number.isFinite(parameter.minimum) ? parameter.minimum : null;
@@ -263,8 +263,14 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
   const stringDefaultError = Number.isInteger(stringMinimum) && Number.isInteger(stringMaximum) && stringMinimum >= 0 && stringMaximum >= 0 && stringMinimum <= stringMaximum
     ? stringDefault.length < stringMinimum ? "默认值短于最短字符数" : stringDefault.length > stringMaximum ? "默认值超过最长字符数" : null
     : null;
-  return <div className="rounded-md border border-console-line bg-console-panel2 p-3">
-    <div className="flex items-start justify-between gap-3"><div><p className="font-mono text-sm font-medium text-console-text">{parameter.key || "未命名参数"}</p><p className="text-xs text-console-muted">{dependencySummary ?? "用户可在创建训练时修改"}</p></div><ConsoleButton variant="ghost" disabled={disabled} aria-label={`删除参数 ${parameter.key || "未命名"}`} onClick={onDelete}><Trash2 className="h-4 w-4" />删除</ConsoleButton></div>
+  return <details className="group overflow-hidden rounded-md border border-console-line bg-console-panel2" open={expanded} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-3 outline-none transition-[background-color] duration-150 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-console-cyan/30 motion-reduce:transition-none">
+      <ChevronDown className="h-4 w-4 shrink-0 text-console-muted transition-transform duration-150 group-open:rotate-180 motion-reduce:transition-none" aria-hidden="true" />
+      <span className="min-w-0 flex-1"><span className="flex flex-wrap items-baseline gap-x-2"><span className="font-medium text-console-text">{parameter.label || "未命名参数"}</span><span className="truncate font-mono text-xs text-console-muted">{parameter.key || "未命名字段"}</span></span><span className="mt-1 block truncate text-xs text-console-muted">{parameter.type} · 默认值 {parameter.sensitive ? "已遮蔽" : String(parameter.default)}</span></span>
+      <span className="shrink-0 rounded-full bg-white px-2 py-1 text-[11px] text-console-muted">展开编辑</span>
+    </summary>
+    <div className="border-t border-console-line p-3">
+    <div className="flex items-start justify-between gap-3"><div><p className="font-mono text-sm font-medium text-console-text">{parameter.key || "未命名参数"}</p><p className="text-xs text-console-muted">在新建训练时可设置该参数。</p></div><ConsoleButton variant="ghost" disabled={disabled} aria-label={`删除参数 ${parameter.key || "未命名"}`} onClick={onDelete}><Trash2 className="h-4 w-4" />删除</ConsoleButton></div>
     <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
       <label className="text-xs text-console-muted">参数字段名<input aria-label={`${parameter.key || "未命名参数"} 参数字段名`} className={inputClass} value={parameter.key} maxLength={100} disabled={disabled} placeholder="num_video_frames" onChange={(event) => changeKey(event.target.value)} /></label>
       <label className="text-xs text-console-muted">页面显示名称<input aria-label={`${parameter.key || "未命名参数"} 显示名称`} className={inputClass} value={parameter.label} maxLength={200} disabled={disabled} placeholder="视频帧数" onChange={(event) => update("label", event.target.value)} /></label>
@@ -298,7 +304,8 @@ function ParameterCard({ parameter, definitions, groups, disabled, onChange, onD
       }}>{groups.map((group) => <option key={group.key} value={group.key}>{group.label}{group.key === "common" ? "（常驻）" : ""}</option>)}<option value="__new_group__">＋ 新建分组…</option></select></label>
     </div>
     <div className="mt-3 flex flex-wrap gap-5 text-sm text-console-muted"><label><input type="checkbox" className="mr-2 accent-console-cyan" checked={Boolean(parameter.sensitive)} disabled={disabled} onChange={(event) => update("sensitive", event.target.checked)} />敏感值（输入和预览遮蔽）</label></div>
-  </div>;
+    </div>
+  </details>;
 }
 
 export function ParameterDefinitionEditor({ definitions, disabled = false, onChange }: Props) {
@@ -309,6 +316,7 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
   const [manageGroupsOpen, setManageGroupsOpen] = useState(false);
   const [deleteGroupKey, setDeleteGroupKey] = useState<string | null>(null);
   const [dependencyError, setDependencyError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const groupOptions = availableTrainingParameterGroups(definitions);
   const usedGroups = usedTrainingParameterGroups(definitions);
   const deleteGroup = usedGroups.find((group) => group.key === deleteGroupKey);
@@ -401,10 +409,16 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
     setDependencyError(null);
     onChange(nextDefinitions);
   };
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleDefinitions = normalizedQuery ? definitions.filter((parameter) => [parameter.key, parameter.label, parameter.cli_flag ?? "", parameter.description ?? ""].some((value) => value.toLocaleLowerCase().includes(normalizedQuery))) : definitions;
+  const dependencySummaries = definitions.map((parameter) => parameterDependencySummary(definitions, parameter)).filter((summary): summary is string => Boolean(summary));
   return <div className="space-y-4">
-    <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="font-medium text-console-text">训练脚本参数</h3><p className="text-xs text-console-muted">无需填写参数数量。逐项添加字段、类型、默认值、CLI flag 与展示分组，平台会生成结构化 argv。</p></div><div className="flex flex-wrap gap-2"><ParameterDependencyDialog definitions={definitions} disabled={disabled} onChange={updateDependencies} /><ConsoleButton variant="ghost" disabled={disabled || !definitions.length} onClick={() => setManageGroupsOpen(true)}><Settings2 className="h-4 w-4" />管理参数分组</ConsoleButton><ConsoleButton variant="ghost" disabled={disabled} onClick={add}><Plus className="h-4 w-4" />添加参数</ConsoleButton></div></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="font-medium text-console-text">训练脚本参数</h3><p className="text-xs text-console-muted">参数默认折叠显示，按名称或字段搜索后再展开编辑，避免长指令把页面无限拉长。</p></div><div className="flex flex-wrap gap-2"><ParameterDependencyDialog definitions={definitions} disabled={disabled} onChange={updateDependencies} /><ConsoleButton variant="ghost" disabled={disabled || !definitions.length} onClick={() => setManageGroupsOpen(true)}><Settings2 className="h-4 w-4" />管理参数分组</ConsoleButton><ConsoleButton variant="ghost" disabled={disabled} onClick={add}><Plus className="h-4 w-4" />添加参数</ConsoleButton></div></div>
+    <label className="relative block"><span className="sr-only">搜索训练参数</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" aria-hidden="true" /><input type="search" aria-label="搜索训练参数" className={`${inputClass} mt-0 pl-9`} value={query} placeholder="搜索参数名称、字段名或 CLI flag" onChange={(event) => setQuery(event.target.value)} /></label>
+    {dependencySummaries.length ? <section aria-label="参数依赖摘要" className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2"><p className="text-xs font-medium text-sky-900">已设置 {dependencySummaries.length} 条参数依赖</p><ul className="mt-1 space-y-1 text-xs text-sky-800">{dependencySummaries.map((summary) => <li key={summary}>{summary}</li>)}</ul></section> : null}
     {dependencyError ? <p role="alert" className="text-sm text-rose-700">{dependencyError}</p> : null}
-    {usedGroups.map((group) => { const items = definitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key); return <section key={group.key} aria-label={group.label}><details className="rounded-md border border-console-line bg-console-panel p-3" open={openGroups[group.key] ?? !group.collapsed} onToggle={(event) => { const open = event.currentTarget.open; setOpenGroups((current) => current[group.key] === open ? current : { ...current, [group.key]: open }); }}><summary className="cursor-pointer"><span className="text-sm font-semibold text-console-text">{group.label} <span className="font-normal text-console-muted">({items.length})</span></span><span className="ml-2 text-xs text-console-muted">{group.hint}</span></summary><div className="mt-3 space-y-2">{items.map((parameter) => <ParameterCard key={definitions.indexOf(parameter)} parameter={parameter} definitions={definitions} groups={groupOptions} disabled={disabled} onChange={(next) => replace(parameter, next)} onDelete={() => remove(parameter)} onRequestNewGroup={() => requestNewGroup(parameter)} />)}</div></details></section>; })}
+    {usedGroups.map((group) => { const allItems = definitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key); const items = visibleDefinitions.filter((parameter) => trainingParameterGroupFor(parameter).key === group.key); if (normalizedQuery && !items.length) return null; return <section key={group.key} aria-label={group.label}><details className="rounded-md border border-console-line bg-console-panel p-3" open={normalizedQuery ? true : openGroups[group.key] ?? !group.collapsed} onToggle={(event) => { if (normalizedQuery) return; const open = event.currentTarget.open; setOpenGroups((current) => current[group.key] === open ? current : { ...current, [group.key]: open }); }}><summary className="cursor-pointer"><span className="text-sm font-semibold text-console-text">{group.label} <span className="font-normal text-console-muted">({normalizedQuery ? `${items.length}/${allItems.length}` : allItems.length})</span></span><span className="ml-2 text-xs text-console-muted">{group.hint}</span></summary><div className="mt-3 space-y-2">{items.map((parameter) => <ParameterCard key={definitions.indexOf(parameter)} parameter={parameter} definitions={definitions} groups={groupOptions} disabled={disabled} initiallyOpen={parameter.key.startsWith("parameter_") && parameter === definitions.at(-1)} onChange={(next) => replace(parameter, next)} onDelete={() => remove(parameter)} onRequestNewGroup={() => requestNewGroup(parameter)} />)}</div></details></section>; })}
+    {normalizedQuery && !visibleDefinitions.length ? <p className="rounded-md border border-dashed border-console-line py-8 text-center text-sm text-console-muted">没有匹配的训练参数。</p> : null}
     <Dialog open={newGroupTargetKey !== null} onOpenChange={(open) => { if (!open) { setNewGroupTargetKey(null); setNewGroupError(null); } }}>
       <DialogContent className="sm:max-w-md"><DialogHeader><DialogTitle>新建参数分组</DialogTitle><DialogDescription>新分组会作为折叠区显示，并自动接收当前参数。</DialogDescription></DialogHeader><label className="text-sm text-console-muted">分组名称<input autoFocus aria-label="新分组名称" className={inputClass} value={newGroupName} maxLength={30} placeholder="例如：LoRA 配置" onChange={(event) => { setNewGroupName(event.target.value); setNewGroupError(null); }} /></label><p className="text-xs text-console-muted">{newGroupName.length}/30，至少 2 个字符</p>{newGroupError ? <p role="alert" className="text-sm text-rose-700">{newGroupError}</p> : null}<DialogFooter><ConsoleButton onClick={() => setNewGroupTargetKey(null)}>取消</ConsoleButton><ConsoleButton variant="primary" onClick={createGroup}>创建并移入</ConsoleButton></DialogFooter></DialogContent>
     </Dialog>

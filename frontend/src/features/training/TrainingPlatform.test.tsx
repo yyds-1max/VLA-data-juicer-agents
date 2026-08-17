@@ -52,6 +52,12 @@ function renderPlatform(path = "/model") {
   return render(<MemoryRouter initialEntries={[path]}><TrainingPlatform /><LocationProbe /></MemoryRouter>);
 }
 
+async function openNewTraining() {
+  fireEvent.click(await screen.findByRole("tab", { name: "训练任务" }));
+  const buttons = await screen.findAllByRole("button", { name: "新建训练任务" });
+  fireEvent.click(buttons[0]);
+}
+
 function mockApi(capabilities = readonlyCapabilities, models: TrainingModel[] = []) {
   vi.mocked(trainingApi.getTrainingCapabilities).mockResolvedValue(capabilities);
   vi.mocked(trainingApi.listTrainingModels).mockResolvedValue(models);
@@ -70,8 +76,20 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByText("真实训练未启用")).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
     expect(await screen.findByRole("button", { name: "登记模型" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
-    expect(await screen.findByRole("button", { name: "启动模拟训练" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("tab", { name: "训练任务" }));
+    expect((await screen.findAllByRole("button", { name: "新建训练任务" }))[0]).toBeDisabled();
+  });
+
+  it("opens new training from the task page instead of exposing a peer navigation tab", async () => {
+    mockApi(adminCapabilities, [model]);
+    renderPlatform();
+    expect(await screen.findByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: "新建训练" })).not.toBeInTheDocument();
+    fireEvent.click((await screen.findAllByRole("button", { name: "新建训练任务" }))[0]);
+    expect(await screen.findByRole("heading", { name: "新建训练任务" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "← 返回训练任务" }));
+    expect(await screen.findByRole("heading", { name: "训练任务" })).toBeVisible();
   });
 
   it("registers a node then automatically deploys a Worker with one-time SSH credentials", async () => {
@@ -87,12 +105,12 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("节点名称"), { target: { value: "测试训练节点" } });
     fireEvent.change(screen.getByLabelText("主机地址"), { target: { value: "10.0.0.12" } });
     fireEvent.change(screen.getByLabelText("SSH 端口"), { target: { value: "2222" } });
-    expect(screen.queryByLabelText("SSH 登录用户名")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
+    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
     fireEvent.click(screen.getByRole("button", { name: "登记并部署 Worker" }));
     expect((await screen.findAllByText("待部署 Worker"))[0]).toBeVisible();
     expect(trainingApi.createTrainingNode).toHaveBeenCalledWith({ name: "测试训练节点", address: "10.0.0.12", ssh_port: 2222, description: undefined });
     expect(await screen.findByText(hostKey.sha256_fingerprint)).toBeVisible();
-    fireEvent.change(screen.getByLabelText("SSH 登录用户名"), { target: { value: "trainer" } });
     const sshPasswordInput = screen.getByLabelText("SSH 登录密码");
     expect(sshPasswordInput).toHaveAttribute("type", "password");
     expect(sshPasswordInput).toHaveClass("training-password-input");
@@ -105,14 +123,13 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("button", { name: "隐藏 SSH 登录密码" }));
     expect(sshPasswordInput).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByLabelText("我已确认该主机指纹正确"));
-    fireEvent.change(screen.getByLabelText("SSH 登录密码"), { target: { value: "one-time-password" } });
     expect(screen.queryByLabelText("Worker 部署提权方式")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "自动部署 Worker" })).toBeEnabled();
     expect(screen.getByText(/系统会先只读确认 SSH 登录/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "自动部署 Worker" }));
     await waitFor(() => expect(trainingApi.preflightTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ ssh_username: "trainer", ssh_password: "one-time-password" })));
     await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledWith("node-test", expect.objectContaining({ expected_revision: 1, ssh_username: "trainer", confirmed_host_key: hostKey, host_key_confirmed: true, ssh_password: "one-time-password", sudo_password_mode: "same_as_ssh" })));
-    expect(await screen.findByText("Worker 已自动部署并完成注册，正在等待稳定心跳。")).toBeVisible();
+    expect(await screen.findByRole("status")).toHaveTextContent("节点登记与 Worker 部署均已完成。");
     expect(screen.queryByLabelText("SSH 登录密码")).not.toBeInTheDocument();
   }, 20_000);
 
@@ -397,7 +414,7 @@ describe("TrainingPlatform", () => {
     ] } };
     mockApi(adminCapabilities, [datasetModel]);
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     expect(await screen.findByRole("region", { name: "训练数据集" })).toBeVisible();
     expect(within(screen.getByRole("region", { name: "训练数据集" })).getByLabelText("数据混合配置")).toHaveValue("rxr");
   });
@@ -434,6 +451,7 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText(/--master_port=<自动分配>/)).toBeVisible();
     fireEvent.click(await screen.findByRole("button", { name: "登记模型" }));
     await waitFor(() => expect(trainingApi.createTrainingModel).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(trainingApi.verifyTrainingModel).toHaveBeenCalledWith(model.family_ref, model.edit_revision));
     expect(trainingApi.createTrainingModel).toHaveBeenCalledWith(expect.objectContaining({
       family_name: "NaVILA 轨迹训练",
       configuration: expect.objectContaining({ launch_template: expect.objectContaining({ server_ref: "fake-local", launcher_kind: "torchrun", executable: "torchrun", entrypoint: "llava/train/train_mem.py", fixed_argv: [], output_flag: "--output_dir", runtime_environment: { kind: "system" }, monitoring: { source: "stdout", format: "transformers" } }),
@@ -450,8 +468,10 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("启动方式 · Launcher"), { target: { value: "direct" } });
     fireEvent.change(screen.getByLabelText("启动程序 · Executable"), { target: { value: "python" } });
 
-    const commandSummary = screen.getByText((content) => content.startsWith("python llava/train/train_mem.py"));
+    const commandSummary = screen.getByRole("heading", { name: "实时结构化命令摘要（默认值）" }).parentElement!;
     expect(commandSummary).toBeVisible();
+    expect(commandSummary).toHaveTextContent("python");
+    expect(commandSummary).toHaveTextContent("llava/train/train_mem.py");
     expect(commandSummary).not.toHaveTextContent("--master_port");
     expect(commandSummary).not.toHaveTextContent("--nproc_per_node");
     expect(screen.getByText("GPU 和产物输出目录由平台管理；单进程启动不会注入 Torchrun 分布式参数。")).toBeVisible();
@@ -513,10 +533,11 @@ describe("TrainingPlatform", () => {
     renderPlatform();
 
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑模型配置" }));
     const registrationServer = screen.getByLabelText("训练节点 · Server");
     expect(registrationServer).toHaveTextContent("NaVILA 训练节点在线");
     expect(within(registrationServer).getByText("在线")).toHaveClass("text-emerald-600");
-    fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     expect(screen.getByRole("combobox", { name: "训练节点" })).toHaveTextContent("NaVILA 训练节点在线");
     expect(screen.getByText(/开发预览模式/)).toBeVisible();
     expect(screen.getByText(/当前不会占用或租用 GPU/)).toBeVisible();
@@ -692,7 +713,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
     renderPlatform();
     await screen.findByRole("tab", { name: "训练任务" });
-    fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
     const frames = screen.getByLabelText("视频帧数");
     const parameterCard = frames.closest<HTMLElement>('[data-parameter-field="num_video_frames"]');
@@ -742,7 +763,7 @@ describe("TrainingPlatform", () => {
     ] });
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
     fireEvent.change(screen.getByLabelText("学习率"), { target: { value: "0.0002" } });
     fireEvent.click(screen.getByRole("button", { name: "添加训练阶段" }));
@@ -785,7 +806,7 @@ describe("TrainingPlatform", () => {
       { stage_number: 2, stage_name: "第二阶段", command_preview: "python train.py", output_directory: "/workspace/outputs/navila-family/preview/stage-02", run_spec: runSpec, preflight: [{ ok: true, message: "资源可用" }] },
     ] });
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
     fireEvent.click(screen.getByRole("button", { name: "添加训练阶段" }));
     expect(screen.getByText("模型族未登记“阶段输入参数”，各阶段的加载路径需要手动填写。")).toBeVisible();
@@ -813,7 +834,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py --test_argv 6", output_directory: "/workspace/outputs/preview/stage-01", run_spec: { ...runSpec, parameters: { test_argv: 6 }, argv: ["python", "train.py", "--test_argv", "6"] }, preflight: [{ ok: true, message: "资源可用" }] }] });
 
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
     const testArgument = screen.getByLabelText("测试参数");
     fireEvent.change(testArgument, { target: { value: "6" } });
@@ -841,7 +862,7 @@ describe("TrainingPlatform", () => {
     mockApi(adminCapabilities, [conditionalModel]);
     vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py --bf16 True --learning_rate 0.00002", output_directory: "/workspace/outputs/preview/stage-01", run_spec: { ...runSpec, parameters: { bf16: true, learning_rate: 0.00002 } }, preflight: [{ ok: true, message: "资源可用" }] }] });
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
 
     expect(screen.getByLabelText("启用 BF16")).not.toBeChecked();
@@ -880,7 +901,7 @@ describe("TrainingPlatform", () => {
     };
     mockApi(adminCapabilities, [constrainedModel]);
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
 
     expect(screen.getByLabelText("访问令牌")).toHaveAttribute("type", "password");
@@ -907,7 +928,7 @@ describe("TrainingPlatform", () => {
     mockApi(adminCapabilities, [maskedModel]);
     vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py", output_directory: "/workspace/outputs/preview/stage-01", run_spec: runSpec, preflight: [{ ok: true, message: "资源可用" }] }] });
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
 
     const tokenInput = screen.getByLabelText("访问令牌");
@@ -952,7 +973,7 @@ describe("TrainingPlatform", () => {
     mockApi(adminCapabilities, [groupedModel]);
     renderPlatform();
     await screen.findByRole("tab", { name: "训练任务" });
-    fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
 
     expect(await screen.findByRole("heading", { name: "常用参数 (17)" })).toBeVisible();
     expect(screen.getByRole("region", { name: "训练数据集" })).toBeVisible();
@@ -1033,7 +1054,7 @@ describe("TrainingPlatform", () => {
     vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, secondaryServer]);
     vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === secondaryServer.server_ref ? secondaryResources : resources);
     renderPlatform();
-    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+    await openNewTraining();
 
     expect(screen.getByRole("checkbox", { name: "选择 GPU 0" })).toBeVisible();
     expect(screen.getByRole("combobox", { name: "训练节点" })).toBeDisabled();
@@ -1279,6 +1300,8 @@ describe("TrainingPlatform", () => {
     expect(Array.from((screen.getByLabelText(`${firstAddedKey} 展示分组`) as HTMLSelectElement).options, (option) => option.textContent)).toEqual(["常用参数（常驻）", "其他参数", "＋ 新建分组…"]);
     fireEvent.click(screen.getByRole("button", { name: `删除参数 ${firstAddedKey}` }));
     fireEvent.click(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" }));
+    expect(screen.getByLabelText("搜索训练参数")).toBeVisible();
+    expect(screen.getByText("视频帧数").closest("details")).not.toHaveAttribute("open");
     expect(screen.getByRole("region", { name: "性能与显存" })).toBeVisible();
     expect(screen.queryByLabelText("创建训练时可编辑")).not.toBeInTheDocument();
     expect(navilaTrajectoryParameters.every((parameter) => parameter.editable)).toBe(true);

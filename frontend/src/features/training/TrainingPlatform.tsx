@@ -54,10 +54,11 @@ import { navilaTrajectoryLaunchTemplate, navilaTrajectoryParameters } from "./na
 import { trainingParameterGroupFor, usedTrainingParameterGroups } from "./parameterGroups";
 import { enabledTrainingParameters } from "./parameterAvailability";
 import { TrainingNodesPanel } from "./TrainingNodesPanel";
+import { TrainingOperationFeedback, type TrainingOperationState } from "./TrainingOperationFeedback";
 
 type TrainingTab = "runs" | "new" | "models" | "nodes" | "resources";
 const tabs = [
-  { id: "runs", label: "训练任务" }, { id: "new", label: "新建训练" },
+  { id: "runs", label: "训练任务" },
   { id: "models", label: "模型注册" }, { id: "nodes", label: "训练节点" }, { id: "resources", label: "服务器资源" },
 ] satisfies Array<TabItem<TrainingTab>>;
 
@@ -294,10 +295,11 @@ function GpuPicker({ gpus, selected, onChange, disabled }: { gpus: TrainingGpuRe
   return <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">{gpus.map((gpu) => {
     const unavailable = gpu.externally_occupied || Boolean(gpu.lease_run_ref);
     const checked = selected.includes(gpu.gpu_uuid);
-    return <label key={gpu.gpu_uuid} className={cn("rounded-md border p-3", checked ? "border-console-cyan bg-sky-50" : "border-console-line bg-console-panel2", unavailable && "opacity-55")}>
+    return <label key={gpu.gpu_uuid} className={cn("rounded-md border p-3 outline-none transition-[border-color,background-color,box-shadow,opacity] duration-150 focus-within:ring-2 focus-within:ring-console-cyan/30 motion-reduce:transition-none", checked ? "border-console-cyan bg-sky-50" : "border-console-line bg-console-panel2 hover:border-console-cyan/40", unavailable && "opacity-55")}>
       <div className="flex items-center justify-between gap-2"><span className="font-medium text-console-text">GPU {gpu.index}</span><input aria-label={`选择 GPU ${gpu.index}`} type="checkbox" checked={checked} disabled={disabled || unavailable} onChange={() => onChange(checked ? selected.filter((id) => id !== gpu.gpu_uuid) : [...selected, gpu.gpu_uuid])} /></div>
       <p className="mt-1 text-xs text-console-muted">{gpu.name} · {Math.round(gpu.used_memory_mib / 1024)}/{Math.round(gpu.total_memory_mib / 1024)} GiB</p>
-      <p className="mt-1 text-xs text-console-muted">{unavailable ? (gpu.lease_run_ref ? "平台已租用" : "外部占用") : "可用"}</p>
+      <p className="mt-1 text-xs text-console-muted">利用率 {gpu.utilization_percent}% · {gpu.temperature_c}°C</p>
+      <p className={cn("mt-1 text-xs font-medium", unavailable ? "text-amber-700" : "text-emerald-700")}>{unavailable ? (gpu.lease_run_ref ? "平台已租用" : "检测到外部占用") : "平台未租用"}</p>
     </label>;
   })}</div>;
 }
@@ -305,8 +307,9 @@ function GpuPicker({ gpus, selected, onChange, disabled }: { gpus: TrainingGpuRe
 type NewRunStage = { parameters: Record<string, string | number | boolean>; stage_input_source: TrainingStageInputSource };
 const stageNames = ["第一阶段", "第二阶段", "第三阶段", "第四阶段", "第五阶段", "第六阶段", "第七阶段", "第八阶段", "第九阶段", "第十阶段"];
 
-function NewRunPanel({ models, servers, resourcesByServer, canCreate, onCreated }: { models: TrainingModel[]; servers: TrainingServer[]; resourcesByServer: Record<string, TrainingServerResources>; canCreate: boolean; onCreated: (run: TrainingRun) => void }) {
+function NewRunPanel({ models, servers, resourcesByServer, canCreate, onCancel, onCreated }: { models: TrainingModel[]; servers: TrainingServer[]; resourcesByServer: Record<string, TrainingServerResources>; canCreate: boolean; onCancel: () => void; onCreated: (run: TrainingRun) => void }) {
   const availableModels = useMemo(() => models.filter((item) => item.status !== "disabled"), [models]);
+  const duplicateFamilyNames = useMemo(() => new Set(availableModels.filter((item, index, all) => all.findIndex((candidate) => candidate.family_name === item.family_name) !== index).map((item) => item.family_name)), [availableModels]);
   const [familyRef, setFamilyRef] = useState("");
   const [serverRef, setServerRef] = useState("");
   const [gpuIds, setGpuIds] = useState<string[]>([]);
@@ -315,6 +318,7 @@ function NewRunPanel({ models, servers, resourcesByServer, canCreate, onCreated 
   const [preview, setPreview] = useState<TrainingRunPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [operation, setOperation] = useState<TrainingOperationState | null>(null);
   const selectedFamilyRef = availableModels.some((item) => item.family_ref === familyRef) ? familyRef : availableModels[0]?.family_ref ?? "";
   const model = availableModels.find((item) => item.family_ref === selectedFamilyRef);
   const definitions = model?.configuration?.parameter_definitions ?? [];
@@ -374,24 +378,25 @@ function NewRunPanel({ models, servers, resourcesByServer, canCreate, onCreated 
   const doPreview = async () => {
     if (!selectedFamilyRef || !selectedServer || !gpuIds.length) return setMessage("请选择模型、服务器和至少一张可用 GPU。");
     if (hasParameterErrors) return setMessage("请先修正各训练阶段中标红的参数。");
-    setBusy(true); setMessage(null);
-    try { setPreview(await previewTrainingRun(previewPayload())); } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
+    setBusy(true); setMessage(null); setOperation({ status: "loading", title: "正在生成训练预览", detail: `逐项校验 ${stages.length} 个训练阶段并生成安全 argv。`, steps: ["校验资源", "校验参数", "生成 RunSpec"], activeStep: 1 });
+    try { setPreview(await previewTrainingRun(previewPayload())); setOperation({ status: "success", title: "训练预览已生成", detail: "请核对各阶段命令和输出目录；预览不会启动任何进程。" }); } catch (error) { const detail = errorText(error); setMessage(detail); setOperation({ status: "error", title: "生成训练预览失败", detail }); } finally { setBusy(false); }
   };
   const start = async () => {
     if (!preview || !simulationTarget) return;
-    setBusy(true); setMessage(null);
-    try { onCreated(await createTrainingRun(simulationPayload())); } catch (error) { setMessage(errorText(error)); } finally { setBusy(false); }
+    setBusy(true); setMessage(null); setOperation({ status: "loading", title: "正在创建训练任务", detail: `创建一个模型版本并准备顺序执行 ${stages.length} 个阶段。`, steps: ["校验资源", "创建模型版本", "提交训练任务"], activeStep: 1 });
+    try { onCreated(await createTrainingRun(simulationPayload())); } catch (error) { const detail = errorText(error); setMessage(detail); setOperation({ status: "error", title: "创建训练任务失败", detail }); } finally { setBusy(false); }
   };
   const activeStage = stages[activeStageIndex];
   const activeValidation = stageValidation[activeStageIndex];
   const previousOutputPreview = activeStageIndex > 0 ? preview?.stages[activeStageIndex - 1]?.output_directory : null;
 
   return <div className="space-y-4">
-    <header className="flex flex-col gap-3 border-b border-console-line pb-5 lg:flex-row lg:items-end lg:justify-between"><div><h2 className="text-xl font-semibold text-console-text">新建训练任务</h2><p className="mt-1 text-sm text-console-muted">一次任务生成一个模型版本；可添加多个阶段并按顺序执行。</p></div><ol className="flex max-w-full flex-wrap items-center justify-end gap-2 text-xs text-console-muted" aria-label="创建训练步骤">{['选择模型', '配置资源', '分阶段参数', '预检启动'].map((label, index) => <li key={label} className="flex items-center gap-2"><span className={cn("flex h-6 w-6 items-center justify-center rounded-full border text-[11px] font-semibold", index === 0 ? "border-console-cyan bg-blue-50 text-console-cyan" : "border-console-line bg-console-panel text-console-muted")}>{index + 1}</span><span>{label}</span>{index < 3 ? <ArrowRight className="h-3.5 w-3.5 text-slate-300" aria-hidden="true" /> : null}</li>)}</ol></header>
+    <header className="flex flex-col gap-3 border-b border-console-line pb-5 lg:flex-row lg:items-end lg:justify-between"><div><button type="button" className="mb-2 text-sm font-medium text-console-cyan hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/30" onClick={onCancel}>← 返回训练任务</button><h2 className="text-xl font-semibold text-console-text">新建训练任务</h2><p className="mt-1 text-sm text-console-muted">一次任务生成一个模型版本；可添加多个阶段并按顺序执行。</p></div><ol className="flex max-w-full flex-wrap items-center gap-2 text-xs text-console-muted lg:justify-end" aria-label="创建训练步骤">{['选择模型', '配置资源', '分阶段参数', '预检启动'].map((label, index) => <li key={label} className="flex items-center gap-2"><span className={cn("flex h-6 w-6 items-center justify-center rounded-full border text-[11px] font-semibold", index === 0 ? "border-console-cyan bg-blue-50 text-console-cyan" : "border-console-line bg-console-panel text-console-muted")}>{index + 1}</span><span>{label}</span>{index < 3 ? <ArrowRight className="h-3.5 w-3.5 text-slate-300" aria-hidden="true" /> : null}</li>)}</ol></header>
     <div className="flex items-start gap-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" /><span>{simulationTarget ? "真实训练未启用。当前只会创建可重复的多阶段模拟任务。" : "开发预览模式：可选择真实 GPU 并生成 RunSpec；不会启动进程、申请租约、创建任务或模型版本。"}</span></div>
-    <ConsoleCard className="shadow-none"><div className="mb-4 flex items-center gap-2"><Play className="h-5 w-5 text-console-cyan" /><div><h2 className="font-semibold text-console-text">1. 选择模型和资源</h2><p className="text-sm text-console-muted">模型族的当前训练定义决定节点、入口和可设置参数。</p></div></div><div className="grid gap-3 md:grid-cols-2"><label className="text-sm text-console-muted">模型族<select aria-label="模型族" className="mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text" value={selectedFamilyRef} onChange={(event) => { setFamilyRef(event.target.value); setGpuIds([]); invalidatePreview(); }}>{availableModels.map((item) => <option key={item.family_ref} value={item.family_ref}>{item.family_name}（已训练 {item.trained_version_count} 个版本）</option>)}</select></label><label className="text-sm text-console-muted">训练节点<TrainingServerSelect ariaLabel="训练节点" servers={selectedServerRecord ? [selectedServerRecord] : []} value={selectedServer} disabled onValueChange={() => undefined} /></label></div><h3 className="mb-2 mt-5 text-sm font-medium text-console-text">选择 GPU（{gpuIds.length} 张）</h3><GpuPicker gpus={gpus} selected={gpuIds} onChange={(ids) => { setGpuIds(ids); invalidatePreview(); }} disabled={!canCreate} />{!simulationTarget ? <p className="mt-3 text-xs text-console-muted">GPU 选择仅用于生成真实训练预览；当前不会占用或租用 GPU。</p> : null}</ConsoleCard>
+    <TrainingOperationFeedback operation={operation} />
+    <ConsoleCard className="shadow-none"><div className="mb-4 flex items-center gap-2"><Play className="h-5 w-5 text-console-cyan" /><div><h2 className="font-semibold text-console-text">1. 选择模型和资源</h2><p className="text-sm text-console-muted">模型族的当前训练定义决定节点、入口和可设置参数。</p></div></div><div className="grid gap-3 md:grid-cols-2"><label className="text-sm text-console-muted">模型族<select aria-label="模型族" className="mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text" value={selectedFamilyRef} onChange={(event) => { setFamilyRef(event.target.value); setGpuIds([]); invalidatePreview(); }}>{availableModels.map((item) => <option key={item.family_ref} value={item.family_ref}>{`${item.family_name}${duplicateFamilyNames.has(item.family_name) ? ` · ${item.family_ref.slice(-6)}` : ""}（已训练 ${item.trained_version_count} 个版本）`}</option>)}</select></label><label className="text-sm text-console-muted">训练节点<TrainingServerSelect ariaLabel="训练节点" servers={selectedServerRecord ? [selectedServerRecord] : []} value={selectedServer} disabled onValueChange={() => undefined} /></label></div><h3 className="mb-2 mt-5 text-sm font-medium text-console-text">选择 GPU（{gpuIds.length} 张）</h3><GpuPicker gpus={gpus} selected={gpuIds} onChange={(ids) => { setGpuIds(ids); invalidatePreview(); }} disabled={!canCreate} />{!simulationTarget ? <p className="mt-3 text-xs text-console-muted">GPU 选择仅用于生成真实训练预览；当前不会占用或租用 GPU。</p> : null}</ConsoleCard>
     <ConsoleCard><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold text-console-text">2. 配置训练阶段</h2><p className="text-sm text-console-muted">新增阶段会复制前一阶段全部参数；每个阶段仍使用同一份参数定义。</p></div><ConsoleButton variant="ghost" disabled={!canCreate || stages.length >= 10} onClick={addStage}><Plus className="h-4 w-4" />添加训练阶段</ConsoleButton></div>{!stageInput && stages.length > 1 ? <div className="mb-4 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-800">模型族未登记“阶段输入参数”，各阶段的加载路径需要手动填写。</div> : null}<div className="mb-4 flex flex-wrap gap-2" role="tablist" aria-label="训练阶段">{stages.map((_, index) => <div key={index} className="flex items-center"><button type="button" role="tab" aria-selected={activeStageIndex === index} className={cn("h-9 rounded-l-md border px-3 text-sm", activeStageIndex === index ? "border-console-cyan bg-blue-50 text-console-cyan" : "border-console-line bg-console-panel text-console-muted")} onClick={() => setActiveStageIndex(index)}>{stageNames[index]}</button>{index > 0 ? <button type="button" aria-label={`删除${stageNames[index]}`} className="flex h-9 w-8 items-center justify-center rounded-r-md border border-l-0 border-console-line text-console-muted hover:text-rose-600" onClick={() => removeStage(index)}><Trash2 className="h-3.5 w-3.5" /></button> : <span className="h-9 w-1" />}</div>)}</div>{activeStage && activeValidation ? <section aria-label={`${stageNames[activeStageIndex]}参数`} className="rounded-md border border-console-line p-4"><div className="mb-4 flex items-center justify-between"><div><h3 className="font-medium text-console-text">{stageNames[activeStageIndex]}</h3><p className="text-xs text-console-muted">阶段 {activeStageIndex + 1} / {stages.length}</p></div>{activeValidation.errors.length ? <StatusTag tone="danger">{activeValidation.errors.length} 项待修正</StatusTag> : <StatusTag tone="success">参数有效</StatusTag>}</div>{stageInput && activeStageIndex > 0 ? <div className="mb-4 rounded-md border border-console-line bg-console-panel2 p-3"><p className="text-sm font-medium text-console-text">{stageInput.label} <span className="font-mono text-xs text-console-muted">{stageInput.key}</span></p><div className="mt-2 flex flex-wrap gap-4 text-sm"><label><input type="radio" className="mr-2 accent-console-cyan" checked={activeStage.stage_input_source === "previous_stage_output"} onChange={() => updateStage(activeStageIndex, (stage) => ({ ...stage, stage_input_source: "previous_stage_output" }))} />使用上一阶段输出目录</label><label><input type="radio" className="mr-2 accent-console-cyan" checked={activeStage.stage_input_source === "manual"} onChange={() => updateStage(activeStageIndex, (stage) => ({ ...stage, stage_input_source: "manual" }))} />手动填写</label></div>{activeStage.stage_input_source === "previous_stage_output" ? <input aria-label="上一阶段输出目录" className="mt-2 h-9 w-full cursor-not-allowed rounded-md border border-console-line bg-slate-100 px-2 font-mono text-sm text-console-muted" disabled value={previousOutputPreview ?? "生成预览后显示上一阶段输出目录"} /> : null}</div> : null}<GroupedParameterFields definitions={activeStage.stage_input_source === "previous_stage_output" && activeStageIndex > 0 ? definitions.filter((item) => item.key !== stageInput?.key) : definitions} values={activeStage.parameters} onChange={(key, value) => updateStage(activeStageIndex, (stage) => ({ ...stage, parameters: { ...stage.parameters, [key]: value } }))} enabledParameterKeys={activeValidation.enabledKeys} disabled={!canCreate} /></section> : null}</ConsoleCard>
-    <ConsoleCard><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-console-text">3. 校验并预览 RunSpec</h2><p className="text-sm text-console-muted">逐阶段显示安全 argv 和输出目录；预览不创建模型版本。</p></div><ConsoleButton variant="ghost" onClick={() => void doPreview()} disabled={!canCreate || busy || !models.length || hasParameterErrors}><RefreshCw className="h-4 w-4" />生成预览</ConsoleButton></div>{message ? <p role="alert" className="mt-3 text-sm text-rose-700">{message}</p> : null}{preview ? <div className="mt-4 space-y-2">{preview.stages.map((stage) => <details key={stage.stage_number} className="rounded-md border border-console-line bg-console-panel2 px-3 py-2" open={stage.stage_number === 1}><summary className="cursor-pointer text-sm font-medium text-console-text">{stage.stage_name} · {stage.output_directory}</summary><div className="mt-3 rounded-md bg-slate-950 p-3 font-mono text-xs leading-6 text-slate-100 break-all">{stage.command_preview}</div><div className="mt-3 grid gap-2 md:grid-cols-3"><span className="text-sm text-console-muted">nproc_per_node：<b className="text-console-text">{stage.run_spec.nproc_per_node}</b></span><span className="text-sm text-console-muted">GPU：<b className="text-console-text">{stage.run_spec.gpu_uuids.length}</b></span><span className="text-sm text-console-muted">端口：<b className="text-console-text">{stage.run_spec.master_port ?? "不需要"}</b></span></div>{stage.preflight.map((item, index) => <p key={index} className={cn("mt-2 text-sm", item.ok ? "text-emerald-700" : "text-rose-700")}>{item.ok ? "✓" : "×"} {item.message}</p>)}</details>)}</div> : null}</ConsoleCard>
+    <ConsoleCard><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-console-text">3. 校验并预览 RunSpec</h2><p className="text-sm text-console-muted">逐阶段显示安全 argv 和输出目录；预览不创建模型版本。</p></div><ConsoleButton variant="ghost" aria-busy={busy} onClick={() => void doPreview()} disabled={!canCreate || busy || !models.length || hasParameterErrors}>{busy ? <RefreshCw className="h-4 w-4 animate-spin motion-reduce:animate-none" /> : <RefreshCw className="h-4 w-4" />}{busy ? "正在生成…" : "生成预览"}</ConsoleButton></div>{message && !operation ? <p role="alert" className="mt-3 text-sm text-rose-700">{message}</p> : null}{preview ? <div className="mt-4 space-y-2">{preview.stages.map((stage) => <details key={stage.stage_number} className="rounded-md border border-console-line bg-console-panel2 px-3 py-2" open={stage.stage_number === 1}><summary className="cursor-pointer text-sm font-medium text-console-text">{stage.stage_name} · {stage.output_directory}</summary><div className="mt-3 rounded-md bg-slate-950 p-3 font-mono text-xs leading-6 text-slate-100 break-all">{stage.command_preview}</div><div className="mt-3 grid gap-2 md:grid-cols-3"><span className="text-sm text-console-muted">nproc_per_node：<b className="text-console-text">{stage.run_spec.nproc_per_node}</b></span><span className="text-sm text-console-muted">GPU：<b className="text-console-text">{stage.run_spec.gpu_uuids.length}</b></span><span className="text-sm text-console-muted">端口：<b className="text-console-text">{stage.run_spec.master_port ?? "不需要"}</b></span></div>{stage.preflight.map((item, index) => <p key={index} className={cn("mt-2 text-sm", item.ok ? "text-emerald-700" : "text-rose-700")}>{item.ok ? "✓" : "×"} {item.message}</p>)}</details>)}</div> : null}</ConsoleCard>
     <ConsoleCard><div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-console-text">4. {simulationTarget ? "启动模拟训练" : "启动真实训练"}</h2><p className="text-sm text-console-muted">{simulationTarget ? `将创建一个模型版本，并顺序执行 ${stages.length} 个训练阶段；GPU 与端口会覆盖整个任务周期。` : "真实 Runner 接入后才会创建任务、模型版本和资源租约；当前预览不会执行任何训练命令。"}</p></div><ConsoleButton variant="primary" onClick={() => void start()} disabled={!canCreate || busy || !preview || !simulationTarget}><Play className="h-4 w-4" />{simulationTarget ? "启动模拟训练" : "真实训练未启用"}</ConsoleButton></div></ConsoleCard>
   </div>;
 }
@@ -419,7 +424,7 @@ function RunDetail({ run, canStop, onRunChange }: { run: TrainingRun; canStop: b
   </div>;
 }
 
-function RunsPanel({ runs, selectedRun, canStop, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
+function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; canCreate: boolean; onCreate: () => void; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
   const [statusFilter, setStatusFilter] = useState<"all" | TrainingRun["status"]>("all");
   const [query, setQuery] = useState("");
   const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -451,6 +456,7 @@ function RunsPanel({ runs, selectedRun, canStop, onSelect, onRunChange }: { runs
           <p className="mt-1 text-sm text-console-muted">统一查看任务调度、训练进度与最近指标；状态会自动刷新。</p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <ConsoleButton variant="primary" disabled={!canCreate} onClick={onCreate}><Plus className="h-4 w-4" />新建训练任务</ConsoleButton>
           <label className="relative min-w-0 sm:w-64">
             <span className="sr-only">搜索训练任务</span>
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" aria-hidden="true" />
@@ -530,8 +536,8 @@ function RunsPanel({ runs, selectedRun, canStop, onSelect, onRunChange }: { runs
       {!filteredRuns.length ? (
         <div className="border-t border-console-line py-16 text-center">
           <FileText className="mx-auto h-8 w-8 text-console-muted" aria-hidden="true" />
-          <p className="mt-3 text-sm font-medium text-console-text">{runs.length ? "没有符合筛选条件的任务" : "还没有训练任务。请从“新建训练”开始模拟运行。"}</p>
-          {runs.length ? <p className="mt-1 text-sm text-console-muted">请调整搜索内容或状态筛选。</p> : null}
+          <p className="mt-3 text-sm font-medium text-console-text">{runs.length ? "没有符合筛选条件的任务" : "还没有训练任务"}</p>
+          {runs.length ? <p className="mt-1 text-sm text-console-muted">请调整搜索内容或状态筛选。</p> : <><p className="mt-1 text-sm text-console-muted">选择已登记模型和 GPU，创建第一项训练。</p>{canCreate ? <ConsoleButton className="mt-4" variant="primary" onClick={onCreate}><Plus className="h-4 w-4" />新建训练任务</ConsoleButton> : null}</>}
         </div>
       ) : null}
     </section>
@@ -546,10 +552,12 @@ function ModelFamilyCard({ model, servers, canManage, verifying, onEdit, onVerif
   const verification = model.verification;
   const verificationActive = verification?.status === "queued" || verification?.status === "running";
   const verificationLabel = verification?.status === "queued" ? "等待 Worker" : verification?.status === "running" ? "正在验证" : verification?.status === "succeeded" ? "验证通过" : verification?.status === "failed" ? "验证未通过" : null;
-  return <div className="rounded border border-console-line bg-console-panel p-3">
+  const parameterCount = model.configuration?.parameter_definitions.length ?? 0;
+  const template = model.configuration?.launch_template;
+  return <article className="rounded-lg border border-console-line bg-console-panel p-4 transition-[border-color,box-shadow] duration-150 hover:border-console-cyan/30 hover:shadow-sm motion-reduce:transition-none">
     <div className="flex items-center justify-between gap-2"><p className="font-medium text-console-text">{model.family_name}</p><StatusTag tone={modelStatusMeta[model.status].tone}>{modelStatusMeta[model.status].label}</StatusTag></div>
     <p className="mt-1 text-sm text-console-muted">已训练 {model.trained_version_count} 个模型版本 · 当前训练定义</p>
-    <p className="mt-2 line-clamp-2 text-xs text-console-muted">参数：{model.configuration?.parameter_definitions.map((parameter) => parameter.key).join("、") || "加载详情后显示"}</p>
+    <dl className="mt-3 grid grid-cols-2 gap-2 rounded-md bg-console-panel2 p-3 text-xs"><div><dt className="text-console-muted">训练参数</dt><dd className="mt-1 font-medium text-console-text">{parameterCount} 个</dd></div><div><dt className="text-console-muted">运行环境</dt><dd className="mt-1 truncate font-medium text-console-text">{template?.runtime_environment?.kind === "conda" ? `Conda · ${template.runtime_environment.conda_environment}` : "Worker 系统环境"}</dd></div><div className="col-span-2"><dt className="text-console-muted">训练入口</dt><dd className="mt-1 truncate font-mono text-console-text" title={template?.entrypoint}>{template?.entrypoint ?? "--"}</dd></div></dl>
     {verificationLabel ? <div className={cn("mt-2 rounded-md border px-2.5 py-2 text-xs", verification?.status === "succeeded" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : verification?.status === "failed" ? "border-rose-200 bg-rose-50 text-rose-800" : "border-sky-200 bg-sky-50 text-sky-800")}><p className="font-medium">{verificationLabel}</p>{verification?.checks?.length ? <ul className="mt-1 space-y-1">{verification.checks.map((check) => <li key={check.code}><span className="font-medium">{check.label}：</span>{check.detail}</li>)}</ul> : null}</div> : null}
     <div className="mt-2 flex flex-wrap gap-2">
       {canManage ? <ConsoleButton variant="ghost" onClick={onEdit}>编辑模型配置</ConsoleButton> : null}
@@ -557,10 +565,11 @@ function ModelFamilyCard({ model, servers, canManage, verifying, onEdit, onVerif
     </div>
     {canManage && !usesRealWorker ? <p className="mt-1 text-xs text-console-muted">只有绑定已部署 Worker 的真实训练节点后才能验证。</p> : null}
     {canManage && usesRealWorker && !nodeOnline ? <p className="mt-1 text-xs text-console-muted">训练节点在线后才能验证。</p> : null}
-  </div>;
+  </article>;
 }
 
 function ModelsPanel({ models, servers, canManage, onSaved }: { models: TrainingModel[]; servers: TrainingServer[]; canManage: boolean; onSaved: (model: TrainingModel) => void }) {
+  const [editorOpen, setEditorOpen] = useState(models.length === 0);
   const [editingFamilyRef, setEditingFamilyRef] = useState<string | null>(null);
   const [familyName, setFamilyName] = useState("");
   const [domain, setDomain] = useState(emptyLaunchTemplate.domain); const [serverRef, setServerRef] = useState(servers[0]?.server_ref ?? "");
@@ -573,6 +582,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
   const [parameterDefinitions, setParameterDefinitions] = useState<TrainingParameterDefinition[]>([]);
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [verifyingFamilyRef, setVerifyingFamilyRef] = useState<string | null>(null);
+  const [operation, setOperation] = useState<TrainingOperationState | null>(null);
   const textInput = "mt-1 h-9 w-full rounded-md border border-console-line bg-console-panel px-2 text-console-text placeholder:text-slate-400 placeholder:opacity-100";
   useEffect(() => {
     if (!editingFamilyRef && servers.length && !servers.some((server) => server.server_ref === serverRef)) {
@@ -585,6 +595,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
     setEntrypoint(emptyLaunchTemplate.entrypoint); setFixedArgv(""); setOutputRoot(emptyLaunchTemplate.output_root); setOutputFlag(emptyLaunchTemplate.output_flag);
     setRuntimeKind(emptyLaunchTemplate.runtime_environment.kind); setCondaEnvironment(""); setMonitoringFormat(emptyLaunchTemplate.monitoring.format); setParameterDefinitions([]); setError(null);
   };
+  const openCreateMode = () => { resetCreateMode(); setEditorOpen(true); setOperation(null); };
   const populateFromModel = (model: TrainingModel) => {
     const template = model.configuration?.launch_template;
     if (!template || !model.configuration) { setError("该模型族缺少可编辑的 launch template，请重新加载管理员投影。"); return false; }
@@ -598,6 +609,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
   const edit = (model: TrainingModel) => {
     if (!populateFromModel(model)) return;
     setEditingFamilyRef(model.family_ref);
+    setEditorOpen(true);
   };
   const save = async () => {
     if (!workingDirectory.trim().startsWith("/")) { setError("工作目录必须填写训练节点上的绝对路径。"); return; }
@@ -615,7 +627,7 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
     if (duplicateFixedFlag) { setError(`额外固定 argv 与训练参数重复声明了 ${duplicateFixedFlag}。`); return; }
     const normalizedCondaEnvironment = condaEnvironment.trim();
     if (runtimeKind === "conda" && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(normalizedCondaEnvironment)) { setError("Conda 环境名只能包含字母、数字、点、下划线和短横线，且不能为空。"); return; }
-    setBusy(true); setError(null);
+    setBusy(true); setError(null); setOperation({ status: "loading", title: editingFamilyRef ? "正在保存模型配置" : "正在登记模型", detail: "保存训练入口、运行环境和参数定义。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 0 });
     try {
       const launchTemplate = {
         domain, server_ref: serverRef, working_directory: workingDirectory, launcher_kind: launcherKind, executable, entrypoint,
@@ -630,8 +642,20 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
         ? await updateTrainingModel(editingModel.family_ref, { expected_revision: editingModel.edit_revision ?? 0, configuration })
         : await createTrainingModel({ family_name: familyName.trim(), configuration });
       onSaved(saved);
-      if (editingModel) edit(saved); else resetCreateMode();
-    } catch (caught) { setError(errorText(caught)); } finally { setBusy(false); }
+      setOperation({ status: "loading", title: "配置已保存，正在请求 Worker 验证", detail: "系统会在模型绑定的训练节点上检查目录、入口和运行环境。", steps: ["保存配置", "请求 Worker 验证", "等待验证结果"], activeStep: 1 });
+      try {
+        const verifying = await verifyTrainingModel(saved.family_ref, saved.edit_revision ?? 0);
+        if (verifying) onSaved(verifying);
+        setOperation({ status: "success", title: "模型配置已保存，验证任务已提交", detail: "Worker 会继续执行检查；验证结果会自动刷新到模型列表。" });
+        setEditorOpen(false);
+        resetCreateMode();
+      } catch (verifyError) {
+        const detail = errorText(verifyError);
+        setError(`模型配置已保存，但验证未能启动：${detail}`);
+        setOperation({ status: "error", title: "配置已保存，验证未完成", detail: "模型仍保留为草稿，可返回列表后重新验证。" });
+        if (editingModel) edit(saved);
+      }
+    } catch (caught) { const detail = errorText(caught); setError(detail); setOperation({ status: "error", title: editingFamilyRef ? "保存模型配置失败" : "登记模型失败", detail }); } finally { setBusy(false); }
   };
   const loadNavilaPreset = () => {
     setFamilyName("NaVILA 轨迹训练");
@@ -642,45 +666,80 @@ function ModelsPanel({ models, servers, canManage, onSaved }: { models: Training
     setParameterDefinitions(structuredClone(navilaTrajectoryParameters)); setError(null);
   };
   const verify = async (model: TrainingModel) => {
-    setVerifyingFamilyRef(model.family_ref); setError(null);
-    try { onSaved(await verifyTrainingModel(model.family_ref, model.edit_revision ?? 0)); }
-    catch (caught) { setError(errorText(caught)); }
+    setVerifyingFamilyRef(model.family_ref); setError(null); setOperation({ status: "loading", title: `正在验证 ${model.family_name}`, detail: "已请求 Worker 检查模型配置。" });
+    try { const verifying = await verifyTrainingModel(model.family_ref, model.edit_revision ?? 0); if (verifying) onSaved(verifying); setOperation({ status: "success", title: "验证任务已提交", detail: "结果会自动刷新到模型列表。" }); }
+    catch (caught) { const detail = errorText(caught); setError(detail); setOperation({ status: "error", title: "验证请求失败", detail }); }
     finally { setVerifyingFamilyRef(null); }
   };
   const defaultParameterValues = Object.fromEntries(parameterDefinitions.map((parameter) => [parameter.key, parameter.default]));
   const defaultEnabledParameters = enabledTrainingParameters(parameterDefinitions, defaultParameterValues);
-  const commandTokens = [
-    executable.trim(),
+  const commandSummaryReady = Boolean(executable.trim() && entrypoint.trim() && outputFlag.trim());
+  const renderCommandToken = (token: string) => /\s/.test(token) ? JSON.stringify(token) : token;
+  const summaryFixedTokens = fixedArgv.split("\n").map((item) => item.trim()).filter(Boolean);
+  const summaryFixedLines = summaryFixedTokens.reduce<string[]>((lines, token, index, all) => {
+    if (!token.startsWith("--") && index > 0 && all[index - 1]?.startsWith("--")) return lines;
+    const next = token.startsWith("--") && all[index + 1] && !all[index + 1].startsWith("--") ? ` ${renderCommandToken(all[index + 1])}` : "";
+    lines.push(`${renderCommandToken(token)}${next}`);
+    return lines;
+  }, []);
+  const commandLines = commandSummaryReady ? [
+    renderCommandToken(executable.trim()),
     ...(launcherKind === "torchrun" ? ["--nnodes=1", "--nproc_per_node=<所选 GPU 数>", "--master_port=<自动分配>", "--master_addr=127.0.0.1", "--node_rank=0"] : []),
     entrypoint.trim(),
-    ...fixedArgv.split("\n").map((item) => item.trim()).filter(Boolean),
+    ...summaryFixedLines,
     ...defaultEnabledParameters.flatMap((parameter) => {
       const flag = parameter.cli_flag || `--${parameter.key}`;
       if (parameter.argument_style === "flag_when_true") return parameter.default ? [flag] : [];
       const rendered = parameter.sensitive ? "********" : parameter.type === "boolean" ? (parameter.default ? "True" : "False") : String(parameter.default);
-      return [flag, rendered];
+      return [`${renderCommandToken(flag)} ${renderCommandToken(rendered)}`];
     }),
-    ...(outputFlag.trim() ? [outputFlag.trim(), "<平台生成输出目录>"] : []),
-  ].filter(Boolean);
-  const commandSummaryReady = Boolean(executable.trim() && entrypoint.trim() && outputFlag.trim());
+    `${renderCommandToken(outputFlag.trim())} <平台生成输出目录>`,
+  ].filter(Boolean) : [];
   const formTitle = editingFamilyRef ? `编辑 ${models.find((model) => model.family_ref === editingFamilyRef)?.family_name ?? "模型"}` : "登记新模型";
-  return <div className="space-y-5"><header className="border-b border-console-line pb-5"><h2 className="text-xl font-semibold text-console-text">模型注册</h2><p className="mt-1 text-sm text-console-muted">每个模型族只保存一份当前训练定义；训练任务创建时会自动生成模型版本并保留不可变快照。</p></header><div className="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,.65fr)]"><div><ConsoleCard className="shadow-none"><div className="mb-4 flex items-start justify-between gap-3"><div className="flex items-center gap-2"><Plus className="h-5 w-5 text-console-cyan" /><div><h2 className="font-semibold text-console-text">{formTitle}</h2><p className="text-sm text-console-muted">{editingFamilyRef ? "修改只影响之后创建的训练，历史模型版本保留原配置快照。" : "登记模型族的训练入口、参数定义和输出规则；此时不会创建模型版本。"}</p></div></div>{editingFamilyRef ? <ConsoleButton variant="ghost" onClick={resetCreateMode}>登记新模型</ConsoleButton> : null}</div>
-    <div className="mb-4 rounded-md border border-sky-200 bg-sky-50 p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-medium text-sky-900">不知道从哪里开始？</p><p className="text-xs text-sky-800">载入同事命令对应的完整参数结构，再按部署环境修改占位路径。</p></div><ConsoleButton variant="ghost" disabled={!canManage} onClick={loadNavilaPreset}>一键载入 NaVILA 轨迹训练模板</ConsoleButton></div></div>
-    <label className="block text-sm text-console-muted">模型族名称<input className={textInput} value={familyName} placeholder="例如 NaVILA 轨迹训练" disabled={!canManage || Boolean(editingFamilyRef)} onChange={(event) => setFamilyName(event.target.value)} /></label>
-    <div className="mt-3 grid gap-3 sm:grid-cols-2">
-      <label className="text-sm text-console-muted">领域 · Domain<input aria-label="领域 · Domain" className={textInput} value={domain} placeholder="例如 vla" disabled={!canManage} onChange={(e) => setDomain(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">训练节点 · Server<TrainingServerSelect ariaLabel="训练节点 · Server" servers={servers} value={serverRef} disabled={!canManage} onValueChange={setServerRef} /></label>
-      <label className="text-sm text-console-muted">工作目录 · Working directory<span className="block text-[11px] leading-4">绝对路径。填写训练节点上的模型工程目录。</span><input aria-label="工作目录 · Working directory" className={textInput} value={workingDirectory} placeholder="例如 /data/project/NaVILA" disabled={!canManage} onChange={(e) => setWorkingDirectory(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">启动方式 · Launcher<select aria-label="启动方式 · Launcher" className={textInput} value={launcherKind} disabled={!canManage} onChange={(e) => setLauncherKind(e.target.value as "torchrun" | "direct")}><option value="torchrun">PyTorch Torchrun</option><option value="direct">单进程启动（不使用 Torchrun）</option></select></label>
-      <label className="text-sm text-console-muted">启动程序 · Executable<input aria-label="启动程序 · Executable" className={textInput} value={executable} placeholder={launcherKind === "torchrun" ? "例如 torchrun" : "例如 python"} disabled={!canManage} onChange={(e) => setExecutable(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">训练入口 · Entrypoint<span className="block text-[11px] leading-4">相对路径。以工作目录为起点，且必须位于工作目录内。</span><input aria-label="训练入口 · Entrypoint" className={textInput} value={entrypoint} placeholder="例如 llava/train/train_mem.py" disabled={!canManage} onChange={(e) => setEntrypoint(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">输出根目录 · Output root<span className="block text-[11px] leading-4">绝对路径。平台会在此目录下生成模型版本和训练阶段目录。</span><input aria-label="输出根目录 · Output root" className={textInput} value={outputRoot} placeholder="例如 /data/training_outputs" disabled={!canManage} onChange={(e) => setOutputRoot(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">产物输出参数 · Output flag<span className="block text-[11px] leading-4">填写训练脚本接收输出目录的 CLI flag。</span><input aria-label="产物输出参数 · Output flag" className={textInput} value={outputFlag} placeholder="例如 --output_dir" disabled={!canManage} onChange={(e) => setOutputFlag(e.target.value)} /></label>
-      <label className="text-sm text-console-muted">运行环境 · Runtime environment<select aria-label="运行环境 · Runtime environment" className={textInput} value={runtimeKind} disabled={!canManage} onChange={(e) => setRuntimeKind(e.target.value as "system" | "conda")}><option value="system">Worker 系统环境</option><option value="conda">Conda 环境</option></select></label>
-      {runtimeKind === "conda" ? <label className="text-sm text-console-muted">Conda 环境名<input className={textInput} value={condaEnvironment} disabled={!canManage} maxLength={128} placeholder="例如 navila" onChange={(e) => setCondaEnvironment(e.target.value)} /></label> : null}
-      <label className="text-sm text-console-muted">指标日志格式 · Metrics format<select aria-label="指标日志格式 · Metrics format" className={textInput} value={monitoringFormat} disabled={!canManage} onChange={(e) => setMonitoringFormat(e.target.value as "plain" | "transformers" | "jsonl")}><option value="plain">普通文本（仅日志）</option><option value="transformers">Transformers Trainer 日志</option><option value="jsonl">JSON Lines 指标</option></select></label>
-    </div>
-    <label className="mt-3 block text-sm text-console-muted">额外固定 argv（每行一个 token）<textarea className="mt-1 min-h-16 w-full rounded-md border border-console-line bg-console-panel p-2 font-mono text-xs text-console-text placeholder:text-slate-400 placeholder:opacity-100" value={fixedArgv} placeholder={"例如：\n--deepspeed\n./scripts/zero3.json"} disabled={!canManage} onChange={(e) => setFixedArgv(e.target.value)} /></label><div className="mt-5"><ParameterDefinitionEditor definitions={parameterDefinitions} disabled={!canManage} onChange={setParameterDefinitions} /></div><p className="mt-3 text-xs text-console-muted">{launcherKind === "torchrun" ? "GPU、nnodes、nproc_per_node、master 地址/端口、node rank 和产物输出目录由平台管理，不注册为普通参数。" : "GPU 和产物输出目录由平台管理；单进程启动不会注入 Torchrun 分布式参数。"}</p><div className="mt-4 rounded-md border border-console-line bg-slate-950 p-3"><p className="mb-2 text-xs font-semibold text-slate-300">实时结构化命令摘要（默认值）</p><p className={cn("text-xs leading-6", commandSummaryReady ? "font-mono text-slate-100 break-all" : "text-slate-400")}>{commandSummaryReady ? commandTokens.map((token) => /\s/.test(token) ? JSON.stringify(token) : token).join(" ") : "填写启动程序、训练入口和产物输出参数后显示命令摘要。"}</p></div>{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<ConsoleButton className="mt-4" variant="primary" disabled={!canManage || busy || !familyName.trim() || !domain.trim() || !serverRef.trim() || !workingDirectory.trim() || !executable.trim() || !entrypoint.trim() || !outputRoot.trim() || !outputFlag.trim()} onClick={() => void save()}><Plus className="h-4 w-4" />{editingFamilyRef ? "保存模型配置" : "登记模型"}</ConsoleButton></ConsoleCard></div><ConsoleCard className="h-fit shadow-none"><div className="mb-4 flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h2 className="font-semibold text-console-text">已登记模型族</h2></div><div className="space-y-3">{models.map((model) => <ModelFamilyCard key={model.family_ref} model={model} servers={servers} canManage={canManage} verifying={verifyingFamilyRef === model.family_ref} onEdit={() => edit(model)} onVerify={() => void verify(model)} />)}{!models.length ? <p className="py-8 text-center text-sm text-console-muted">尚未登记模型。</p> : null}</div></ConsoleCard></div></div>;
+  if (!editorOpen) return <div className="space-y-5">
+    <header className="flex flex-col gap-3 border-b border-console-line pb-5 sm:flex-row sm:items-end sm:justify-between">
+      <div><h2 className="text-xl font-semibold text-console-text">模型注册</h2><p className="mt-1 text-sm text-console-muted">管理模型族当前训练定义。每次训练会保留当时的完整配置快照。</p></div>
+      {canManage ? <ConsoleButton variant="primary" onClick={openCreateMode}><Plus className="h-4 w-4" />登记新模型</ConsoleButton> : null}
+    </header>
+    <TrainingOperationFeedback operation={operation} />
+    {error ? <p role="alert" className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</p> : null}
+    <section aria-labelledby="registered-models-title">
+      <div className="mb-3 flex items-center justify-between"><div className="flex items-center gap-2"><BookOpen className="h-5 w-5 text-console-cyan" /><h3 id="registered-models-title" className="font-semibold text-console-text">已登记模型族</h3></div><span className="text-xs text-console-muted">共 {models.length} 个</span></div>
+      {models.length ? <div className="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">{models.map((model) => <ModelFamilyCard key={model.family_ref} model={model} servers={servers} canManage={canManage} verifying={verifyingFamilyRef === model.family_ref} onEdit={() => { setOperation(null); edit(model); }} onVerify={() => void verify(model)} />)}</div> : <div className="rounded-xl border border-dashed border-console-line py-16 text-center"><BookOpen className="mx-auto h-8 w-8 text-console-muted" /><p className="mt-3 text-sm font-medium text-console-text">尚未登记模型</p><p className="mt-1 text-sm text-console-muted">登记训练入口和参数定义后即可创建训练。</p>{canManage ? <ConsoleButton className="mt-4" variant="primary" onClick={openCreateMode}><Plus className="h-4 w-4" />登记第一个模型</ConsoleButton> : null}</div>}
+    </section>
+  </div>;
+
+  return <div className="mx-auto max-w-6xl space-y-5">
+    <header className="flex flex-col gap-3 border-b border-console-line pb-5 sm:flex-row sm:items-start sm:justify-between">
+      <div><button type="button" className="mb-2 text-sm font-medium text-console-cyan hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/30" onClick={() => { setEditorOpen(false); setError(null); }}>← 返回模型列表</button><h2 className="text-xl font-semibold text-console-text">{formTitle}</h2><p className="mt-1 text-sm text-console-muted">{editingFamilyRef ? "修改只影响之后创建的训练，历史模型版本保留原配置快照。" : "登记训练入口、参数定义和输出规则；保存后系统会自动发起验证。"}</p></div>
+      {!editingFamilyRef ? <ConsoleButton variant="ghost" disabled={!canManage || busy} onClick={loadNavilaPreset}>一键载入 NaVILA 轨迹训练模板</ConsoleButton> : null}
+    </header>
+    <TrainingOperationFeedback operation={operation} />
+    <ConsoleCard className="shadow-none">
+      <section aria-labelledby="model-basic-config-title"><h3 id="model-basic-config-title" className="font-semibold text-console-text">基础配置</h3><p className="mt-1 text-xs text-console-muted">灰色文字仅为填写示例，不会作为真实配置保存。</p>
+        <label className="mt-4 block text-sm text-console-muted">模型族名称<input className={textInput} value={familyName} placeholder="例如 NaVILA 轨迹训练" disabled={!canManage || Boolean(editingFamilyRef)} onChange={(event) => setFamilyName(event.target.value)} /></label>
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <label className="text-sm text-console-muted">领域 · Domain<input aria-label="领域 · Domain" className={textInput} value={domain} placeholder="例如 vla" disabled={!canManage} onChange={(e) => setDomain(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">训练节点 · Server<TrainingServerSelect ariaLabel="训练节点 · Server" servers={servers} value={serverRef} disabled={!canManage} onValueChange={setServerRef} /></label>
+          <label className="text-sm text-console-muted">工作目录 · Working directory<span className="block text-[11px] leading-4">绝对路径。填写训练节点上的模型工程目录。</span><input aria-label="工作目录 · Working directory" className={textInput} value={workingDirectory} placeholder="例如 /data/project/NaVILA" disabled={!canManage} onChange={(e) => setWorkingDirectory(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">启动方式 · Launcher<select aria-label="启动方式 · Launcher" className={textInput} value={launcherKind} disabled={!canManage} onChange={(e) => setLauncherKind(e.target.value as "torchrun" | "direct")}><option value="torchrun">PyTorch Torchrun（多 GPU）</option><option value="direct">单进程启动（不使用 Torchrun）</option></select></label>
+          <label className="text-sm text-console-muted">启动程序 · Executable<input aria-label="启动程序 · Executable" className={textInput} value={executable} placeholder={launcherKind === "torchrun" ? "例如 torchrun" : "例如 python"} disabled={!canManage} onChange={(e) => setExecutable(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">训练入口 · Entrypoint<span className="block text-[11px] leading-4">相对路径。以工作目录为起点，且必须位于工作目录内。</span><input aria-label="训练入口 · Entrypoint" className={textInput} value={entrypoint} placeholder="例如 llava/train/train_mem.py" disabled={!canManage} onChange={(e) => setEntrypoint(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">输出根目录 · Output root<span className="block text-[11px] leading-4">绝对路径。平台会在此目录下生成模型版本和训练阶段目录。</span><input aria-label="输出根目录 · Output root" className={textInput} value={outputRoot} placeholder="例如 /data/training_outputs" disabled={!canManage} onChange={(e) => setOutputRoot(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">产物输出参数 · Output flag<span className="block text-[11px] leading-4">训练脚本接收输出目录的 CLI flag。</span><input aria-label="产物输出参数 · Output flag" className={textInput} value={outputFlag} placeholder="例如 --output_dir" disabled={!canManage} onChange={(e) => setOutputFlag(e.target.value)} /></label>
+          <label className="text-sm text-console-muted">运行环境 · Runtime environment<select aria-label="运行环境 · Runtime environment" className={textInput} value={runtimeKind} disabled={!canManage} onChange={(e) => setRuntimeKind(e.target.value as "system" | "conda")}><option value="system">Worker 系统环境</option><option value="conda">Conda 环境</option></select></label>
+          {runtimeKind === "conda" ? <label className="text-sm text-console-muted">Conda 环境名<input className={textInput} value={condaEnvironment} disabled={!canManage} maxLength={128} placeholder="例如 navila" onChange={(e) => setCondaEnvironment(e.target.value)} /></label> : null}
+          <label className="text-sm text-console-muted">指标日志格式 · Metrics format<select aria-label="指标日志格式 · Metrics format" className={textInput} value={monitoringFormat} disabled={!canManage} onChange={(e) => setMonitoringFormat(e.target.value as "plain" | "transformers" | "jsonl")}><option value="plain">普通文本（仅日志）</option><option value="transformers">Transformers Trainer 日志</option><option value="jsonl">JSON Lines 指标</option></select></label>
+        </div>
+        <label className="mt-3 block text-sm text-console-muted">额外固定 argv（每行一个 token）<textarea className="mt-1 min-h-20 w-full rounded-md border border-console-line bg-console-panel p-2 font-mono text-xs text-console-text placeholder:text-slate-400" value={fixedArgv} placeholder={"例如：\n--deepspeed\n./scripts/zero3.json"} disabled={!canManage} onChange={(e) => setFixedArgv(e.target.value)} /></label>
+      </section>
+      <div className="mt-6 border-t border-console-line pt-6"><ParameterDefinitionEditor definitions={parameterDefinitions} disabled={!canManage} onChange={setParameterDefinitions} /></div>
+      <p className="mt-3 text-xs text-console-muted">{launcherKind === "torchrun" ? "GPU、分布式参数和产物输出目录由平台管理，不注册为普通参数。" : "GPU 和产物输出目录由平台管理；单进程启动不会注入 Torchrun 分布式参数。"}</p>
+      <section className="mt-5 rounded-lg border border-slate-800 bg-slate-950 p-4" aria-labelledby="command-summary-title"><h3 id="command-summary-title" className="text-xs font-semibold text-slate-300">实时结构化命令摘要（默认值）</h3>{commandSummaryReady ? <pre className="console-soft-scrollbar mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-all font-mono text-xs leading-6 text-slate-100"><code>{commandLines.join("\n")}</code></pre> : <p className="mt-3 text-xs text-slate-400">填写启动程序、训练入口和产物输出参数后显示命令摘要。</p>}</section>
+      {error ? <p role="alert" className="mt-4 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p> : null}
+      <div className="sticky bottom-3 mt-5 flex flex-wrap justify-end gap-2 rounded-lg border border-console-line bg-white/95 p-3 shadow-lg backdrop-blur"><ConsoleButton disabled={busy} onClick={() => { setEditorOpen(false); setError(null); }}>取消</ConsoleButton><ConsoleButton variant="primary" aria-busy={busy} disabled={!canManage || busy || !familyName.trim() || !domain.trim() || !serverRef.trim() || !workingDirectory.trim() || !executable.trim() || !entrypoint.trim() || !outputRoot.trim() || !outputFlag.trim()} onClick={() => void save()}>{busy ? <RefreshCw className="h-4 w-4 animate-spin motion-reduce:animate-none" /> : <Plus className="h-4 w-4" />}{busy ? "正在保存并验证…" : editingFamilyRef ? "保存模型配置" : "登记模型"}</ConsoleButton></div>
+    </ConsoleCard>
+  </div>;
 }
 
 function ResourcesPanel({ servers, resourcesByServer, resourceErrors, onRefresh }: { servers: TrainingServer[]; resourcesByServer: Record<string, TrainingServerResources>; resourceErrors: Record<string, string>; onRefresh: () => void }) {
@@ -839,7 +898,7 @@ export function TrainingPlatform() {
   return (
     <section className="w-full space-y-5 px-4 py-3 md:px-6 xl:px-8">
       <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-2 border-b border-console-line">
-        <TrainingSectionTabs value={tab} onChange={changeTab} />
+        <TrainingSectionTabs value={tab === "new" ? "runs" : tab} onChange={changeTab} />
         <div className="flex shrink-0 items-center gap-2 pb-2">
           <StatusTag tone="warning">真实训练未启用</StatusTag>
           <StatusTag tone={capabilities?.simulation_enabled ? "success" : "danger"}>{capabilities?.simulation_enabled ? "模拟模式" : "模拟不可用"}</StatusTag>
@@ -852,10 +911,10 @@ export function TrainingPlatform() {
       {tab === "runs" && !selectedRun ? <TrainingOverviewMetrics runs={runs} gpus={allGpus} /> : null}
 
       <div id="training-platform-panel-runs" role="tabpanel" aria-labelledby="training-platform-tab-runs" hidden={tab !== "runs"}>
-        <RunsPanel runs={runs} selectedRun={selectedRun} canStop={can(capabilities, "training:stop_runs")} onSelect={selectRun} onRunChange={updateRun} />
+        <RunsPanel runs={runs} selectedRun={selectedRun} canStop={can(capabilities, "training:stop_runs")} canCreate={can(capabilities, "training:create_runs")} onCreate={() => changeTab("new")} onSelect={selectRun} onRunChange={updateRun} />
       </div>
       <div id="training-platform-panel-new" role="tabpanel" aria-labelledby="training-platform-tab-new" hidden={tab !== "new"}>
-        <NewRunPanel models={models} servers={servers} resourcesByServer={resourcesByServer} canCreate={can(capabilities, "training:create_runs")} onCreated={(run) => { setModels((current) => current.map((model) => model.family_ref === run.family_ref ? { ...model, trained_version_count: model.trained_version_count + 1 } : model)); updateRun(run); setTab("runs"); selectRun(run); }} />
+        <NewRunPanel models={models} servers={servers} resourcesByServer={resourcesByServer} canCreate={can(capabilities, "training:create_runs")} onCancel={() => changeTab("runs")} onCreated={(run) => { setModels((current) => current.map((model) => model.family_ref === run.family_ref ? { ...model, trained_version_count: model.trained_version_count + 1 } : model)); updateRun(run); setTab("runs"); selectRun(run); }} />
       </div>
       <div id="training-platform-panel-models" role="tabpanel" aria-labelledby="training-platform-tab-models" hidden={tab !== "models"}>
         <ModelsPanel models={models} servers={servers} canManage={can(capabilities, "training:manage_models")} onSaved={(model) => setModels((current) => [model, ...current.filter((item) => item.family_ref !== model.family_ref)])} />

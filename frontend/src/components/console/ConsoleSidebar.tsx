@@ -5,10 +5,13 @@ import {
   Database,
   FlaskConical,
   GitBranch,
+  Menu,
   PanelLeftClose,
   PanelLeftOpen,
   PenTool,
+  X,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import type { ConsolePageId, NavItem } from "../../features/console/consoleTypes";
@@ -39,13 +42,21 @@ const dataManagementSubpages = [
 export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: ConsoleSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  useEffect(() => { setMobileOpen(false); }, [location.pathname]);
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setMobileOpen(false); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileOpen]);
 
   return (
     <aside
       data-testid="console-sidebar"
       data-collapsed={collapsed ? "true" : "false"}
       className={cn(
-        "fixed inset-x-0 top-0 z-20 overflow-hidden border-b border-[#e4e7ee] bg-[#f4f5f8]/95 px-4 shadow-xs backdrop-blur-sm md:inset-y-0 md:left-0 md:right-auto md:border-b-0 md:border-r md:px-0 md:shadow-none md:transition-[width] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+        "fixed inset-x-0 top-0 z-20 overflow-visible border-b border-[#e4e7ee] bg-[#f4f5f8]/95 px-4 shadow-xs backdrop-blur-sm md:inset-y-0 md:left-0 md:right-auto md:overflow-hidden md:border-b-0 md:border-r md:px-0 md:shadow-none md:transition-[width] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
         collapsed ? "md:w-20" : "md:w-64",
       )}
     >
@@ -72,15 +83,18 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
             <div className="truncate text-base font-semibold tracking-normal text-[#1d2433]">智瀚星途</div>
             <div className="mt-0.5 truncate text-[10px] font-medium uppercase tracking-[0.34em] text-[#5f687b]">WISEXPLORE</div>
           </div>
+          <button type="button" aria-label={mobileOpen ? "关闭主导航" : "打开主导航"} aria-controls="console-primary-navigation" aria-expanded={mobileOpen} className="ml-auto flex h-10 w-10 items-center justify-center rounded-lg border border-[#dfe3eb] bg-white text-[#35415a] shadow-sm transition-[background-color,border-color] duration-150 hover:border-[#cbd2df] hover:bg-[#f9fafc] active:bg-[#eef1f6] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:hidden" onClick={() => setMobileOpen((current) => !current)}>
+            {mobileOpen ? <X className="h-5 w-5" aria-hidden="true" /> : <Menu className="h-5 w-5" aria-hidden="true" />}
+          </button>
         </div>
 
         <nav
           id="console-primary-navigation"
-          className="min-w-0 flex-1 overflow-x-auto border-t border-[#e4e7ee] py-2 md:overflow-y-auto md:border-t-0 md:px-3 md:py-2"
+          className={cn("min-w-0 flex-1 border-t border-[#e4e7ee] bg-[#f4f5f8] px-2 py-3 shadow-lg md:block md:overflow-y-auto md:border-t-0 md:bg-transparent md:px-3 md:py-2 md:shadow-none", mobileOpen ? "block" : "hidden")}
           aria-label="系统主导航"
         >
           <TooltipProvider delayDuration={180}>
-            <ul className="flex gap-2 md:block md:space-y-1">
+            <ul className="grid grid-cols-2 gap-2 md:block md:space-y-1">
               {consoleNavItems.map((item, index) => (
                 <li key={item.id} className="md:space-y-1">
                   <div
@@ -118,7 +132,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                         type="button"
                         aria-current={activePage === item.id && item.id !== "data" ? "page" : undefined}
                         className={cn(
-                          "flex h-11 w-max min-w-32 shrink-0 items-center gap-3 overflow-hidden rounded-xl border border-transparent bg-transparent px-3 text-left text-sm font-medium text-[#647089] transition-[color,background-color,border-color,box-shadow,padding] duration-[240ms] ease-[cubic-bezier(0.2,0,0,1)] hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:w-full md:min-w-0 md:justify-start",
+                          "flex h-11 w-full min-w-0 shrink-0 items-center gap-3 overflow-hidden rounded-xl border border-transparent bg-transparent px-3 text-left text-sm font-medium text-[#647089] transition-[color,background-color,border-color,box-shadow,padding] duration-[240ms] ease-[cubic-bezier(0.2,0,0,1)] hover:bg-white/75 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none md:justify-start",
                           collapsed && "md:pl-[19px] md:pr-0",
                           activePage === item.id &&
                             "border-[#e3e7f0] bg-white text-[#3156c8] shadow-[0_4px_14px_rgba(40,58,112,0.06)] hover:bg-white hover:text-[#2849ad] active:bg-[#f8f9fc]",
@@ -142,7 +156,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                     <ul
                       aria-label="数据管理子页面"
                       className={cn(
-                        "mt-1 flex gap-1 md:ml-5 md:max-h-20 md:translate-x-0 md:flex-col md:overflow-hidden md:border-l md:border-[#dfe3eb] md:pl-3 md:opacity-100 md:transition-[max-height,opacity,transform,margin,border-color] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+                        "col-span-2 mt-1 grid grid-cols-2 gap-1 md:ml-5 md:max-h-20 md:translate-x-0 md:flex md:flex-col md:overflow-hidden md:border-l md:border-[#dfe3eb] md:pl-3 md:opacity-100 md:transition-[max-height,opacity,transform,margin,border-color] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
                         collapsed && "md:pointer-events-none md:mt-0 md:max-h-0 md:-translate-x-1 md:border-transparent md:opacity-0",
                       )}
                     >
@@ -154,7 +168,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                               type="button"
                               aria-current={isActive ? "page" : undefined}
                               className={cn(
-                                "relative flex h-8 w-max min-w-24 items-center whitespace-nowrap rounded-md px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 before:absolute before:-left-[13px] before:inset-y-2 before:w-0.5 before:scale-y-0 before:rounded-full before:bg-[#3156c8] before:transition-transform before:duration-150 hover:bg-white/65 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none motion-reduce:before:transition-none md:w-full md:min-w-0",
+                                "relative flex h-8 w-full min-w-0 items-center whitespace-nowrap rounded-md px-3 text-left text-xs font-medium text-[#748097] transition-[color,background-color] duration-150 before:absolute before:-left-[13px] before:inset-y-2 before:w-0.5 before:scale-y-0 before:rounded-full before:bg-[#3156c8] before:transition-transform before:duration-150 hover:bg-white/65 hover:text-[#25324b] active:bg-[#e8ebf2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none motion-reduce:before:transition-none md:min-w-0",
                                 isActive && "bg-white/55 font-semibold text-[#3156c8] before:scale-y-100 hover:bg-white/70 hover:text-[#2849ad]",
                               )}
                               onClick={() => navigate(subpage.path)}

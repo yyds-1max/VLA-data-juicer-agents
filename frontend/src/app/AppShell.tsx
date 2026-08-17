@@ -165,7 +165,7 @@ export function AppShell({ children }: AppShellProps) {
       <main
         data-testid="console-main"
         className={cn(
-          "relative z-10 pt-[124px] md:pt-0 md:transition-[margin-left] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+          "relative z-10 pt-16 md:pt-0 md:transition-[margin-left] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
           annotationWorkbench && "md:h-dvh md:overflow-hidden",
           sidebarCollapsed ? "md:ml-20" : "md:ml-64",
         )}

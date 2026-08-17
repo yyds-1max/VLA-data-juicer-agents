@@ -1309,7 +1309,8 @@ test("model iteration page renders the simulation-only training platform", async
   fireEvent.click(screen.getByRole("button", { name: "模型训练" }));
   expect(await screen.findByText("真实训练未启用")).toBeVisible();
   expect(screen.getByRole("tab", { name: "训练任务" })).toBeVisible();
-  expect(screen.getByText("还没有训练任务。请从“新建训练”开始模拟运行。")).toBeVisible();
+  expect(screen.getByText("还没有训练任务")).toBeVisible();
+  expect(screen.getByText("选择已登记模型和 GPU，创建第一项训练。")).toBeVisible();
 
   fireEvent.click(screen.getByRole("tab", { name: "服务器资源" }));
   expect(screen.getByRole("heading", { name: "服务器资源" })).toBeVisible();
