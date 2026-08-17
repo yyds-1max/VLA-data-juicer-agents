@@ -92,6 +92,32 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByRole("heading", { name: "训练任务" })).toBeVisible();
   });
 
+  it("summarizes the selected node resources beside the GPU picker", async () => {
+    const gib = 1024 ** 3;
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.getTrainingServerResources).mockResolvedValue({
+      ...resources,
+      cpu: { logical_cores: 64, load_1m: 8.25 },
+      memory: { available_bytes: 96 * gib, total_bytes: 128 * gib },
+      disks: [{ mount: "/data", available_bytes: 640 * gib, total_bytes: 1024 * gib }],
+    });
+    renderPlatform();
+    await openNewTraining();
+
+    const resourcePanel = await screen.findByRole("complementary", { name: "训练资源概览" });
+    expect(resourcePanel).toHaveTextContent("64 核");
+    expect(resourcePanel).toHaveTextContent("75%");
+    expect(resourcePanel).toHaveTextContent("640 GiB");
+    expect(resourcePanel).toHaveTextContent("0/1");
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择 GPU 0" }));
+    expect(resourcePanel).toHaveTextContent("1/1");
+    expect(resourcePanel).toHaveTextContent("80 GiB 显存");
+    const frameSlider = screen.getByRole("slider", { name: "视频帧数 快速调整" });
+    expect(frameSlider).toHaveValue("4");
+    fireEvent.change(frameSlider, { target: { value: "8" } });
+    expect(screen.getByLabelText("视频帧数")).toHaveValue(8);
+  });
+
   it("registers a node then automatically deploys a Worker with one-time SSH credentials", async () => {
     mockApi(adminCapabilities);
     vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([]);
@@ -425,6 +451,8 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     await screen.findByRole("tab", { name: "训练任务" });
     fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "登记新模型" })).toHaveFocus());
+    expect(screen.getByRole("button", { name: "一键载入 NaVILA 轨迹训练模板" })).not.toHaveFocus();
     expect(screen.getByLabelText("领域 · Domain")).toBeVisible();
     expect(screen.getByLabelText("训练节点 · Server")).toBeVisible();
     expect(screen.getByLabelText("工作目录 · Working directory")).toBeVisible();
@@ -468,8 +496,11 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("启动方式 · Launcher"), { target: { value: "direct" } });
     fireEvent.change(screen.getByLabelText("启动程序 · Executable"), { target: { value: "python" } });
 
-    const commandSummary = screen.getByRole("heading", { name: "实时结构化命令摘要（默认值）" }).parentElement!;
+    const commandSummaryHeading = screen.getByRole("heading", { name: "实时结构化命令摘要（默认值）" });
+    const commandSummary = commandSummaryHeading.closest("section")!;
     expect(commandSummary).toBeVisible();
+    expect(commandSummary.closest("aside")).toHaveClass("xl:sticky", "xl:top-4");
+    expect(commandSummary.querySelector("pre")).toHaveClass("whitespace-pre", "overflow-auto");
     expect(commandSummary).toHaveTextContent("python");
     expect(commandSummary).toHaveTextContent("llava/train/train_mem.py");
     expect(commandSummary).not.toHaveTextContent("--master_port");
