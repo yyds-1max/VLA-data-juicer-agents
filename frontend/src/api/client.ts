@@ -26,6 +26,11 @@ import type {
   TrainingNodeHostKey,
   TrainingNodePreflightResult,
   TrainingNodeResourceSnapshot,
+  TrainingDatasetRelease,
+  TrainingDatasetReplica,
+  TrainingDirectoryListing,
+  TrainingDatasetTransfer,
+  TrainingDatasetSelection,
   TrainingParameterDefinition,
   TrainingLaunchTemplate,
 } from "./types";
@@ -61,7 +66,11 @@ async function responseError(response: Response): Promise<ApiResponseError> {
     const parsed = JSON.parse(text) as unknown;
     if (parsed && typeof parsed === "object" && "detail" in parsed) {
       const detail = (parsed as { detail: unknown }).detail;
-      const message = typeof detail === "string" ? detail : JSON.stringify(detail);
+      const message = typeof detail === "string"
+        ? detail
+        : detail && typeof detail === "object" && "message" in detail && typeof detail.message === "string"
+          ? detail.message
+          : JSON.stringify(detail);
       return new ApiResponseError(message, response.status, parsed);
     }
     return new ApiResponseError(text, response.status, parsed);
@@ -314,6 +323,7 @@ export async function getTrainingModel(familyRef: string): Promise<TrainingModel
 }
 
 export type TrainingModelConfigurationInput = {
+  data_access_mode: "datapilot_managed" | "self_managed";
   parameter_definitions: TrainingParameterDefinition[];
   launch_template: TrainingLaunchTemplate;
 };
@@ -342,6 +352,8 @@ type TrainingRunPayload = {
   family_ref: string;
   server_ref: string;
   gpu_uuids: string[];
+  version_description?: string;
+  dataset_selection?: TrainingDatasetSelection;
   stages: Array<{ parameters: Record<string, string | number | boolean>; stage_input_source: TrainingStageInputSource }>;
 };
 
@@ -391,6 +403,73 @@ export async function getTrainingRunMetrics(runRef: string, afterSeq = 0, stageR
   return data.metrics;
 }
 
+export async function listTrainingDatasetReleases(): Promise<TrainingDatasetRelease[]> {
+  const data = await requestJson<{ releases: TrainingDatasetRelease[] }>(`${trainingPath}/dataset-releases`);
+  return data.releases;
+}
+
+export async function listTrainingDatasetReplicas(nodeRef: string): Promise<TrainingDatasetReplica[]> {
+  const data = await requestJson<{ replicas: TrainingDatasetReplica[] }>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/dataset-replicas`);
+  return data.replicas;
+}
+
+export async function requestTrainingDirectoryListing(nodeRef: string, path: string): Promise<TrainingDirectoryListing> {
+  const data = await requestJson<{ listing: TrainingDirectoryListing }>(`${trainingPath}/nodes/${encodeURIComponent(nodeRef)}/directory-listings`, {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  return data.listing;
+}
+
+export async function getTrainingDirectoryListing(listingRef: string): Promise<TrainingDirectoryListing> {
+  const data = await requestJson<{ listing: TrainingDirectoryListing }>(`${trainingPath}/directory-listings/${encodeURIComponent(listingRef)}`);
+  return data.listing;
+}
+
+export async function createTrainingDatasetTransfers(payload: { node_ref: string; release_refs: string[]; target_parent_directory: string }): Promise<TrainingDatasetTransfer[]> {
+  const data = await requestJson<{ transfers: TrainingDatasetTransfer[] }>(`${trainingPath}/dataset-transfers`, {
+    method: "POST",
+    headers: { "Idempotency-Key": requestIdempotencyKey() },
+    body: JSON.stringify(payload),
+  });
+  return data.transfers;
+}
+
+export async function listTrainingDatasetTransfers(nodeRef?: string): Promise<TrainingDatasetTransfer[]> {
+  const query = nodeRef ? `?node_ref=${encodeURIComponent(nodeRef)}` : "";
+  const data = await requestJson<{ transfers: TrainingDatasetTransfer[] }>(`${trainingPath}/dataset-transfers${query}`);
+  return data.transfers;
+}
+
+export async function getTrainingDatasetTransfer(transferRef: string): Promise<TrainingDatasetTransfer> {
+  const data = await requestJson<{ transfer: TrainingDatasetTransfer }>(`${trainingPath}/dataset-transfers/${encodeURIComponent(transferRef)}`);
+  return data.transfer;
+}
+
+export async function cancelTrainingDatasetTransfer(transferRef: string): Promise<TrainingDatasetTransfer> {
+  const data = await requestJson<{ transfer: TrainingDatasetTransfer }>(`${trainingPath}/dataset-transfers/${encodeURIComponent(transferRef)}/cancel`, { method: "POST", body: "{}" });
+  return data.transfer;
+}
+
+export async function pauseTrainingDatasetTransfer(transferRef: string): Promise<TrainingDatasetTransfer> {
+  const data = await requestJson<{ transfer: TrainingDatasetTransfer }>(`${trainingPath}/dataset-transfers/${encodeURIComponent(transferRef)}/pause`, { method: "POST", body: "{}" });
+  return data.transfer;
+}
+
+export async function retryTrainingDatasetTransfer(transferRef: string): Promise<TrainingDatasetTransfer> {
+  const data = await requestJson<{ transfer: TrainingDatasetTransfer }>(`${trainingPath}/dataset-transfers/${encodeURIComponent(transferRef)}/retry`, { method: "POST", headers: { "Idempotency-Key": requestIdempotencyKey() }, body: "{}" });
+  return data.transfer;
+}
+
+export async function removeTrainingDatasetReplica(replicaRef: string): Promise<TrainingDatasetReplica> {
+  const data = await requestJson<{ replica: TrainingDatasetReplica }>(`${trainingPath}/dataset-replicas/${encodeURIComponent(replicaRef)}/remove`, {
+    method: "POST",
+    headers: { "Idempotency-Key": requestIdempotencyKey() },
+    body: "{}",
+  });
+  return data.replica;
+}
+
 export function openTrainingEvents(
   onEvent: (event: TrainingEvent) => void,
   afterSeq = 0,
@@ -404,7 +483,7 @@ export function openTrainingEvents(
       console.error("Failed to parse training event", error);
     }
   };
-  for (const eventName of ["run.updated", "run.log.appended", "run.metric.appended"]) {
+  for (const eventName of ["run.updated", "run.log.appended", "run.metric.appended", "dataset.transfer.updated", "dataset.replica.ready", "dataset.replica.removed"]) {
     source.addEventListener(eventName, handleEvent as EventListener);
   }
   if (onError) source.addEventListener("error", onError);

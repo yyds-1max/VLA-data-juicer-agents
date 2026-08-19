@@ -203,13 +203,14 @@ test("annotation workspace hides the list switcher on the Fix workbench route", 
   expect(screen.queryByRole("tab", { name: "人工复核" })).not.toBeInTheDocument();
 });
 
-test("review list groups complete outer-clip reviews and moves clip details into the popover", async () => {
+test("review list aggregates all clips for a date and moves clip details into the popover", async () => {
   apiMocks.listTrajectoryReviews.mockResolvedValue([
     review,
     {
       ...review,
       review_ref: "review_11111111111111111111111111111111",
       segment_ref: "segment_11111111111111111111111111111111",
+      source_clip: "20260605_170102",
       segment_ordinal: 1,
       status: "returned",
     },
@@ -232,11 +233,12 @@ test("review list groups complete outer-clip reviews and moves clip details into
   expect(screen.queryByRole("heading", { name: "复核任务" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "进入人工 Fix" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", {
-    name: /查看 20270605 20260605_160904 复核详情/,
+    name: /查看 20270605 20260605_160904、20260605_170102 复核详情/,
   }));
   const popover = await screen.findByRole("dialog");
   expect(within(popover).getByText("2 个复核单元")).toBeVisible();
   expect(within(popover).getByText("20260605_160904")).toBeVisible();
+  expect(within(popover).getByText("20260605_170102")).toBeVisible();
   expect(within(popover).getByText("尚未选择")).toBeVisible();
   expect(screen.queryByRole("button", { name: /交给 DataPilot 复核/ })).not.toBeInTheDocument();
 });
@@ -518,7 +520,13 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     name: "第 1 帧原后处理投影",
   });
   expect(projection).toHaveAttribute(
-    "src",
+    "data-evidence-layout",
+    "legacy-composite-camera",
+  );
+  expect(projection).toHaveAttribute("viewBox", "1920 0 1920 1536");
+  expect(projection).toHaveAttribute("preserveAspectRatio", "xMidYMid meet");
+  expect(projection.querySelector("image")).toHaveAttribute(
+    "href",
     `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/projection`,
   );
   expect(screen.getByText(/原后处理投影；生成 Fix 预览后更新/)).toBeVisible();

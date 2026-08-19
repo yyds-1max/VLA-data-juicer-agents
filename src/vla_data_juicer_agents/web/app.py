@@ -51,8 +51,13 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
+from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
+from vla_data_juicer_agents.training.datasets import (
+    DatasetManifestPreparationWorker,
+    PublishedDatasetCatalog,
+)
 from vla_data_juicer_agents.training.node_deployment import (
     AutomatedNodeDeploymentManager,
 )
@@ -126,6 +131,7 @@ def create_app(
     annotation_catalog: Any | None = None,
     training_db_path: str | Path | None = None,
     training_tick_seconds: float | None = None,
+    training_dataset_catalog: Any | None = None,
 ) -> FastAPI:
     if agentscope_runtime is None:
         raise RuntimeError(
@@ -188,6 +194,17 @@ def create_app(
         training_settings = TrainingSettings.from_env()
         training_store = TrainingStore(training_database_path)
         training_provider = TrainingResourceProvider(training_store)
+        resolved_training_dataset_catalog = (
+            training_dataset_catalog
+            or PublishedDatasetCatalog(
+                annotation_database_path,
+                NavigationSettings().finish_data_root,
+            )
+        )
+        training_dataset_manifest_worker = DatasetManifestPreparationWorker(
+            training_store,
+            resolved_training_dataset_catalog,
+        )
         node_deployment_manager = (
             AutomatedNodeDeploymentManager(
                 center_base_url=training_settings.center_base_url,
@@ -204,6 +221,7 @@ def create_app(
             training_provider,
             simulation_enabled=training_settings.simulation_enabled,
             node_deployment_manager=node_deployment_manager,
+            dataset_catalog=resolved_training_dataset_catalog,
         )
         training_worker = TrainingWorker(
             training_store,
@@ -293,6 +311,7 @@ def create_app(
                     else None
                 )
                 try:
+                    training_dataset_manifest_worker.start()
                     annotation_worker_task = asyncio.create_task(
                         annotation_worker.run_forever(),
                         name="annotation-worker",
@@ -312,6 +331,7 @@ def create_app(
                     try:
                         yield
                     finally:
+                        training_dataset_manifest_worker.stop()
                         await training_worker.stop()
                         with suppress(asyncio.CancelledError):
                             await training_worker_task
@@ -365,6 +385,10 @@ def create_app(
         app.state.training_provider = training_provider
         app.state.training_service = training_service
         app.state.training_worker = training_worker
+        app.state.training_dataset_catalog = resolved_training_dataset_catalog
+        app.state.training_dataset_manifest_worker = (
+            training_dataset_manifest_worker
+        )
         app.state.training_settings = training_settings
         app.mount(
             agentscope_runtime.config.agentscope_mount_path,

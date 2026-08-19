@@ -6,6 +6,13 @@ import time
 from typing import Callable
 
 from .client import CenterClientError, OfflineCenterClient, WorkerCenterClient
+from .datasets import (
+    DatasetCommandError,
+    DatasetTransferManager,
+    discard_partial_dataset,
+    list_directories,
+    remove_dataset_replica,
+)
 from .identity import WorkerIdentity
 from .ledger import WorkerLedger
 from .resources import ResourceCollector
@@ -13,7 +20,7 @@ from .model_verification import verify_model_configuration
 
 
 class TrainingWorkerDaemon:
-    """Inventory and reconciliation loop; v1 has no execution capability."""
+    """Node inventory, reconciliation, and managed dataset command loop."""
 
     def __init__(
         self,
@@ -37,6 +44,12 @@ class TrainingWorkerDaemon:
         self._sequence = 0
         self._stop_event = threading.Event()
         self._reconciled = False
+        self._command_thread: threading.Thread | None = None
+        self._transfer_manager = DatasetTransferManager(
+            source_client=self.center_client,
+            publish_result=self._publish_dataset_result,
+            monotonic_clock=monotonic_clock,
+        )
 
     def run_once(self) -> dict[str, object]:
         reconciliation_payload: list[dict[str, str]] = []
@@ -63,6 +76,8 @@ class TrainingWorkerDaemon:
             "capabilities": {
                 "resource_inventory": True,
                 "restart_reconciliation": True,
+                "directory_browser_v1": True,
+                "dataset_transfer_v1": True,
                 "training_execution": False,
                 "arbitrary_command_execution": False,
             },
@@ -77,13 +92,109 @@ class TrainingWorkerDaemon:
 
     def _handle_command(self, command: dict[str, object]) -> None:
         command_ref = command.get("command_ref")
+        claim_token = command.get("claim_token")
         kind = command.get("kind")
         command_payload = command.get("payload")
         if (
             not isinstance(command_ref, str)
-            or kind != "verify_model_configuration"
             or not isinstance(command_payload, dict)
         ):
+            return
+        if kind != "verify_model_configuration" and (
+            not isinstance(claim_token, str)
+            or not claim_token.startswith("claim_")
+        ):
+            return
+        if kind == "list_directories":
+            try:
+                result = {
+                    "status": "succeeded",
+                    **list_directories(command_payload.get("path")),
+                }
+            except DatasetCommandError as exc:
+                result = _command_failure(exc)
+            self.center_client.publish_command_result(
+                self.identity,
+                command_ref,
+                {"claim_token": claim_token, **result},
+            )
+            return
+        if kind == "transfer_dataset":
+            try:
+                self._transfer_manager.start(
+                    command_ref,
+                    command_payload,
+                    claim_token=claim_token,
+                )
+            except DatasetCommandError as exc:
+                self.center_client.publish_command_result(
+                    self.identity,
+                    command_ref,
+                    {"claim_token": claim_token, **_command_failure(exc)},
+                )
+            return
+        if kind == "cancel_dataset_transfer":
+            action = command_payload.get("action", "pause")
+            discard_partial = action == "cancel"
+            try:
+                self._transfer_manager.cancel(
+                    command_payload.get("transfer_ref"),
+                    discard_partial=discard_partial,
+                )
+                if not self._transfer_manager.wait(60):
+                    raise DatasetCommandError(
+                        "dataset_transfer_stop_timeout",
+                        "The dataset transfer did not stop in time.",
+                    )
+                result = {
+                    "status": "succeeded",
+                    "transfer_ref": command_payload.get("transfer_ref"),
+                }
+            except DatasetCommandError as exc:
+                if exc.code == "dataset_transfer_not_active" and discard_partial:
+                    try:
+                        result = discard_partial_dataset(command_payload)
+                    except DatasetCommandError as cleanup_exc:
+                        result = _command_failure(cleanup_exc)
+                    except OSError:
+                        result = _command_failure(
+                            DatasetCommandError(
+                                "dataset_partial_remove_failed",
+                                "The Worker could not remove the partial dataset.",
+                            )
+                        )
+                elif exc.code == "dataset_transfer_not_active":
+                    result = {
+                        "status": "succeeded",
+                        "transfer_ref": command_payload.get("transfer_ref"),
+                    }
+                else:
+                    result = _command_failure(exc)
+            self.center_client.publish_command_result(
+                self.identity,
+                command_ref,
+                {"claim_token": claim_token, **result},
+            )
+            return
+        if kind == "remove_dataset_replica":
+            try:
+                result = remove_dataset_replica(command_payload)
+            except DatasetCommandError as exc:
+                result = _command_failure(exc)
+            except OSError:
+                result = _command_failure(
+                    DatasetCommandError(
+                        "dataset_replica_remove_failed",
+                        "The Worker could not remove the dataset replica.",
+                    )
+                )
+            self.center_client.publish_command_result(
+                self.identity,
+                command_ref,
+                {"claim_token": claim_token, **result},
+            )
+            return
+        if kind != "verify_model_configuration":
             return
         try:
             result = verify_model_configuration(command_payload)
@@ -103,7 +214,47 @@ class TrainingWorkerDaemon:
             self.identity, command_ref, result
         )
 
+    def _publish_dataset_result(
+        self, command_ref: str, payload: object
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            self.center_client.publish_command_result(
+                self.identity, command_ref, payload
+            )
+        except CenterClientError:
+            # The center owns transfer reconciliation. A transient result upload
+            # failure must not make the node-local file operation unsafe.
+            pass
+
+    def _poll_commands_forever(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                response = self.center_client.poll_commands(
+                    self.identity, wait_seconds=25, limit=1
+                )
+                raw_commands = response.get("commands")
+                commands = raw_commands if isinstance(raw_commands, list) else []
+                singular = response.get("command")
+                if isinstance(singular, dict):
+                    commands.append(singular)
+                for command in commands:
+                    if isinstance(command, dict):
+                        self._handle_command(command)
+                if not commands:
+                    self._stop_event.wait(0.25)
+            except CenterClientError:
+                self._stop_event.wait(min(self.interval_seconds, 5.0))
+
     def run_forever(self) -> None:
+        if self._command_thread is None:
+            self._command_thread = threading.Thread(
+                target=self._poll_commands_forever,
+                name="datapilot-worker-command-poll",
+                daemon=True,
+            )
+            self._command_thread.start()
         while not self._stop_event.is_set():
             try:
                 self.run_once()
@@ -116,3 +267,10 @@ class TrainingWorkerDaemon:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+
+def _command_failure(error: DatasetCommandError) -> dict[str, object]:
+    return {
+        "status": "failed",
+        "error": {"code": error.code, "message": error.message},
+    }

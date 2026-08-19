@@ -199,7 +199,7 @@ function latestRevision(review: TrajectoryReview) {
   return review.fix_revisions.at(-1) ?? null;
 }
 
-function GridmapEvidenceView({
+export function GridmapEvidenceView({
   gridmap,
   target,
   editable,
@@ -356,7 +356,7 @@ function GridmapEvidenceView({
         className="absolute inset-0 h-full w-full object-contain [image-rendering:pixelated]"
       />
       <svg
-        aria-label="可拖动的当前帧 Gridmap 与轨迹"
+        aria-label={editable ? "可拖动的当前帧 Gridmap 与轨迹" : "当前帧 Gridmap 与轨迹"}
         className="absolute inset-0 h-full w-full touch-none select-none"
         viewBox={`0 0 ${gridmap.width} ${gridmap.height}`}
         preserveAspectRatio="xMidYMid meet"
@@ -416,7 +416,7 @@ function GridmapEvidenceView({
             vectorEffect="non-scaling-stroke"
           />
         )}
-        {directionEnd && directionGeometry && (
+        {editable && directionEnd && directionGeometry && (
           <polygon
             points={directionGeometry.arrowPoints}
             fill="#f97316"
@@ -461,8 +461,8 @@ function GridmapEvidenceView({
             strokeWidth="1.5"
             vectorEffect="non-scaling-stroke"
             className={editable ? "cursor-grab active:cursor-grabbing" : ""}
-            aria-label="拖动目标位置"
-            onPointerDown={(event) => startDrag(event, "position")}
+            aria-label={editable ? "拖动目标位置" : undefined}
+            onPointerDown={editable ? (event) => startDrag(event, "position") : undefined}
           />
         )}
       </svg>
@@ -470,12 +470,13 @@ function GridmapEvidenceView({
   );
 }
 
-function CameraEvidenceView({
+export function CameraEvidenceView({
   frameIndex,
   camera,
   projection,
   target,
   fixRevision,
+  authoritativeProjection = false,
   fill = false,
 }: {
   frameIndex: number;
@@ -483,9 +484,12 @@ function CameraEvidenceView({
   projection: TrajectoryReviewEvidence["frames"][number]["projection"];
   target: ProjectedTrajectoryTarget | null;
   fixRevision: boolean;
+  authoritativeProjection?: boolean;
   fill?: boolean;
 }) {
-  const source = fixRevision ? camera : projection ?? camera;
+  const source = authoritativeProjection
+    ? projection ?? camera
+    : fixRevision ? camera : projection ?? camera;
   if (!cameraCanRender(source)) {
     return (
       <div className={cn(
@@ -498,13 +502,13 @@ function CameraEvidenceView({
   }
   const renderOverlay = (
     fixRevision
+    && !authoritativeProjection
     && cameraCanRender(camera)
     && camera.width !== null
     && camera.height !== null
   );
-  const projectionContainsBev = Boolean(
-    !fixRevision
-    && projection !== null
+  const compositeProjection = Boolean(
+    projection !== null
     && source === projection
     && source.width !== null
     && source.height !== null
@@ -512,6 +516,7 @@ function CameraEvidenceView({
   );
   const trajectory = target?.camera_trajectory_points ?? [];
   const position = target?.camera_position ?? null;
+  const imageLabel = `第 ${frameIndex + 1} 帧${fixRevision ? "Fix 结果" : "原后处理"}投影`;
   return (
     <div
       className={cn(
@@ -519,22 +524,37 @@ function CameraEvidenceView({
         fill ? "h-full" : "rounded-xl",
       )}
       style={fill ? undefined : {
-        aspectRatio: projectionContainsBev
-          ? "5 / 4"
+        aspectRatio: compositeProjection
+          ? `${(source.width ?? 2) / 2} / ${source.height ?? 1}`
           : `${source.width ?? 16} / ${source.height ?? 9}`,
       }}
     >
-      <img
-        src={source.url}
-        width={source.width ?? undefined}
-        height={source.height ?? undefined}
-        alt={`第 ${frameIndex + 1} 帧${fixRevision ? "Fix 结果" : "原后处理"}投影`}
-        className={
-          projectionContainsBev
-            ? "absolute inset-y-0 left-0 h-full w-[200%] max-w-none -translate-x-1/2 object-fill"
-            : "absolute inset-0 h-full w-full object-contain"
-        }
-      />
+      {compositeProjection && source.width !== null && source.height !== null ? (
+        <svg
+          role="img"
+          aria-label={imageLabel}
+          data-evidence-layout="legacy-composite-camera"
+          className="absolute inset-0 h-full w-full"
+          viewBox={`${source.width / 2} 0 ${source.width / 2} ${source.height}`}
+          preserveAspectRatio="xMidYMid meet"
+        >
+          <title>{imageLabel}</title>
+          <image
+            href={source.url}
+            width={source.width}
+            height={source.height}
+            preserveAspectRatio="none"
+          />
+        </svg>
+      ) : (
+        <img
+          src={source.url}
+          width={source.width ?? undefined}
+          height={source.height ?? undefined}
+          alt={imageLabel}
+          className="absolute inset-0 h-full w-full object-contain"
+        />
+      )}
       {renderOverlay && (
         <svg
           aria-hidden="true"

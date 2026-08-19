@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 8
+LATEST_TRAINING_SCHEMA_VERSION = 11
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -79,6 +79,30 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(8,?,?)",
             ("training_node_deletion_history_m8", applied_at),
+        )
+        connection.commit()
+        versions.append(8)
+    if 9 not in versions:
+        connection.executescript(_MIGRATION_009)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(9,?,?)",
+            ("training_datasets_m9", applied_at),
+        )
+        connection.commit()
+        versions.append(9)
+    if 10 not in versions:
+        connection.executescript(_MIGRATION_010)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(10,?,?)",
+            ("training_node_command_claim_tokens_m10", applied_at),
+        )
+        connection.commit()
+        versions.append(10)
+    if 11 not in versions:
+        connection.executescript(_MIGRATION_011)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(11,?,?)",
+            ("dataset_transfer_pause_cancel_m11", applied_at),
         )
         connection.commit()
 
@@ -492,5 +516,188 @@ CREATE INDEX idx_model_verification_node_status
   ON model_verification_requests(node_id,status,id);
 CREATE INDEX idx_model_verification_model
   ON model_verification_requests(model_id,id DESC);
+COMMIT;
+"""
+
+
+_MIGRATION_009 = """
+BEGIN IMMEDIATE;
+
+ALTER TABLE model_revisions ADD COLUMN data_access_mode TEXT NOT NULL
+  DEFAULT 'self_managed'
+  CHECK(data_access_mode IN ('datapilot_managed','self_managed'));
+ALTER TABLE model_versions ADD COLUMN description TEXT;
+
+CREATE TABLE dataset_source_manifests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  manifest_ref TEXT NOT NULL UNIQUE,
+  release_ref TEXT NOT NULL UNIQUE,
+  domain TEXT NOT NULL,
+  dataset_date TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('preparing','building','ready','failed')),
+  source_root TEXT,
+  inventory_json TEXT,
+  inventory_sha256 TEXT,
+  file_count INTEGER NOT NULL DEFAULT 0 CHECK(file_count >= 0),
+  total_bytes INTEGER NOT NULL DEFAULT 0 CHECK(total_bytes >= 0),
+  error_code TEXT,
+  error_message TEXT,
+  preparation_lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_dataset_source_manifests_date
+  ON dataset_source_manifests(dataset_date, id);
+
+CREATE TABLE dataset_source_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  manifest_id INTEGER NOT NULL,
+  file_ref TEXT NOT NULL UNIQUE,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  relative_path TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+  sha256 TEXT NOT NULL,
+  FOREIGN KEY(manifest_id) REFERENCES dataset_source_manifests(id) ON DELETE CASCADE,
+  UNIQUE(manifest_id,ordinal),
+  UNIQUE(manifest_id,relative_path)
+);
+CREATE INDEX idx_dataset_source_files_page
+  ON dataset_source_files(manifest_id,ordinal);
+
+CREATE TABLE training_node_commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  command_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'list_directories','transfer_dataset','cancel_dataset_transfer',
+    'remove_dataset_replica'
+  )),
+  status TEXT NOT NULL CHECK(status IN (
+    'queued','running','succeeded','failed','cancelled'
+  )),
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  worker_instance_id TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL
+);
+CREATE INDEX idx_training_node_commands_claim
+  ON training_node_commands(node_id,status,id);
+
+CREATE TABLE dataset_transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  transfer_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  source_manifest_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'preparing','queued','running','cancel_requested','succeeded','failed','cancelled'
+  )),
+  target_parent_directory TEXT NOT NULL,
+  final_directory TEXT NOT NULL,
+  bytes_transferred INTEGER NOT NULL DEFAULT 0 CHECK(bytes_transferred >= 0),
+  files_completed INTEGER NOT NULL DEFAULT 0 CHECK(files_completed >= 0),
+  error_code TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL,
+  FOREIGN KEY(source_manifest_id) REFERENCES dataset_source_manifests(id)
+);
+CREATE INDEX idx_dataset_transfers_node_status
+  ON dataset_transfers(node_id,status,id DESC);
+
+CREATE TABLE dataset_replicas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  replica_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  source_manifest_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('ready','removing','failed')),
+  local_root TEXT NOT NULL,
+  inventory_sha256 TEXT NOT NULL,
+  file_count INTEGER NOT NULL CHECK(file_count >= 0),
+  total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL,
+  FOREIGN KEY(source_manifest_id) REFERENCES dataset_source_manifests(id),
+  UNIQUE(node_id,source_manifest_id)
+);
+CREATE INDEX idx_dataset_replicas_node_status
+  ON dataset_replicas(node_id,status,id DESC);
+
+CREATE TABLE dataset_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_ref TEXT NOT NULL UNIQUE,
+  run_id INTEGER NOT NULL UNIQUE,
+  manifest_json TEXT NOT NULL,
+  manifest_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES training_runs(id)
+);
+
+COMMIT;
+"""
+
+
+_MIGRATION_010 = """
+BEGIN IMMEDIATE;
+ALTER TABLE training_node_commands ADD COLUMN claim_token_sha256 TEXT;
+COMMIT;
+"""
+
+
+_MIGRATION_011 = """
+BEGIN IMMEDIATE;
+ALTER TABLE dataset_transfers RENAME TO dataset_transfers_m10;
+CREATE TABLE dataset_transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  transfer_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  source_manifest_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'preparing','queued','running','pause_requested','paused',
+    'cancel_requested','succeeded','failed','cancelled'
+  )),
+  target_parent_directory TEXT NOT NULL,
+  final_directory TEXT NOT NULL,
+  bytes_transferred INTEGER NOT NULL DEFAULT 0 CHECK(bytes_transferred >= 0),
+  files_completed INTEGER NOT NULL DEFAULT 0 CHECK(files_completed >= 0),
+  error_code TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL,
+  FOREIGN KEY(source_manifest_id) REFERENCES dataset_source_manifests(id)
+);
+INSERT INTO dataset_transfers(
+  id,transfer_ref,node_id,node_ref_snapshot,source_manifest_id,status,
+  target_parent_directory,final_directory,bytes_transferred,files_completed,
+  error_code,error_message,created_at,updated_at,started_at,finished_at
+)
+SELECT
+  id,transfer_ref,node_id,node_ref_snapshot,source_manifest_id,
+  CASE status
+    WHEN 'cancel_requested' THEN 'pause_requested'
+    WHEN 'cancelled' THEN 'paused'
+    ELSE status
+  END,
+  target_parent_directory,final_directory,bytes_transferred,files_completed,
+  error_code,error_message,created_at,updated_at,started_at,finished_at
+FROM dataset_transfers_m10;
+DROP TABLE dataset_transfers_m10;
+CREATE INDEX idx_dataset_transfers_node_status
+  ON dataset_transfers(node_id,status,id DESC);
 COMMIT;
 """

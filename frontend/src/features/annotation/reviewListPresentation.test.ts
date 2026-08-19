@@ -58,7 +58,7 @@ function publication(
 }
 
 describe("trajectory review list presentation", () => {
-  test("builds complete outer-clip groups with real completion and all eight status presentations", () => {
+  test("builds complete date groups with real completion and all eight status presentations", () => {
     const reviews = [
       reviewFixture("1", "pending"),
       reviewFixture("2", "in_progress", {
@@ -146,6 +146,54 @@ describe("trajectory review list presentation", () => {
       ["approved_failed", 0],
       ["verified", 1],
       ["discarded", 0],
+    ]);
+  });
+
+  test("aggregates every outer clip from the same date into one Segment progress group", () => {
+    const clipA = reviewFixture("1", "approved", {
+      source_clip: "outer-clip-a",
+      segment_ordinal: 1,
+      latest_publication: publication("1", "published"),
+    });
+    const clipBPending = reviewFixture("2", "pending", {
+      source_clip: "outer-clip-b",
+      segment_ordinal: 1,
+    });
+    const clipBVerified = reviewFixture("3", "approved", {
+      source_clip: "outer-clip-b",
+      segment_ordinal: 2,
+      latest_publication: publication("3", "published"),
+    });
+
+    const groups = buildReviewGroups([clipBPending, clipBVerified, clipA]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].key).toBe("20260804");
+    expect(groups[0].sourceClips).toEqual(["outer-clip-a", "outer-clip-b"]);
+    expect(groups[0].reviews.map((item) => [item.source_clip, item.segment_ordinal])).toEqual([
+      ["outer-clip-a", 1],
+      ["outer-clip-b", 1],
+      ["outer-clip-b", 2],
+    ]);
+    expect(groups[0].progress).toMatchObject({ resolved: 2, total: 3 });
+    expect(groups[0].progress.value).toBeCloseTo(200 / 3);
+  });
+
+  test("orders date groups by their real latest update instead of the dataset date", () => {
+    const newerDatasetDate = reviewFixture("1", "pending", {
+      dataset_date: "20260814",
+      updated_at: "2026-08-15T09:00:00Z",
+    });
+    const recentlyUpdatedOlderDate = reviewFixture("2", "pending", {
+      dataset_date: "20260813",
+      updated_at: "2026-08-16T09:00:00Z",
+    });
+
+    const groups = buildReviewGroups([newerDatasetDate, recentlyUpdatedOlderDate]);
+
+    expect(groups.map((group) => group.datasetDate)).toEqual([
+      "20260813",
+      "20260814",
     ]);
   });
 

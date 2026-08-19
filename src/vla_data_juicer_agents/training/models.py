@@ -113,10 +113,13 @@ class ParameterDefinition(BaseModel):
             for choice in value
         ]
 
+    @field_validator("semantic_role", mode="before")
+    @classmethod
+    def normalize_legacy_dataset_role(cls, value: Any) -> Any:
+        return "hyperparameter" if value == "dataset" else value
+
     @model_validator(mode="after")
     def validate_definition(self) -> "ParameterDefinition":
-        if self.semantic_role == "dataset" and self.kind not in {"string", "enum"}:
-            raise ValueError("dataset parameters must be strings or enums")
         if self.semantic_role == "stage_input" and self.kind != "string":
             raise ValueError("stage input parameters must be strings")
         if self.semantic_role == "stage_input" and self.visible_when is not None:
@@ -181,6 +184,7 @@ class ModelRevisionInput(BaseModel):
     fixed_argv: list[str] = Field(default_factory=list, max_length=64)
     output_template: str = Field(default="outputs/{run_ref}", min_length=1, max_length=1024)
     parameter_definitions: list[ParameterDefinition] = Field(default_factory=list, max_length=128)
+    data_access_mode: Literal["datapilot_managed", "self_managed"] = "self_managed"
 
     @field_validator("working_directory", "entrypoint", "output_template")
     @classmethod
@@ -203,11 +207,11 @@ class ModelRevisionInput(BaseModel):
         flags = [item.cli_flag for item in self.parameter_definitions]
         if len(names) != len(set(names)) or len(flags) != len(set(flags)):
             raise ValueError("parameter names and CLI flags must be unique")
-        if sum(
-            item.semantic_role == "dataset"
-            for item in self.parameter_definitions
-        ) > 1:
-            raise ValueError("a model family can declare at most one dataset parameter")
+        if self.data_access_mode == "datapilot_managed" and (
+            "--dataset_manifest" in flags
+            or any(token.split("=", 1)[0] == "--dataset_manifest" for token in self.fixed_argv)
+        ):
+            raise ValueError("--dataset_manifest is reserved for DataPilot managed data")
         if sum(
             item.semantic_role == "stage_input"
             for item in self.parameter_definitions
@@ -238,6 +242,8 @@ class RunRequest(BaseModel):
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
     mode: Literal["simulation"] = "simulation"
+    version_description: str = Field(default="", max_length=500)
+    dataset_selection: dict[str, list[str]] | None = None
 
     @field_validator("gpu_uuids")
     @classmethod

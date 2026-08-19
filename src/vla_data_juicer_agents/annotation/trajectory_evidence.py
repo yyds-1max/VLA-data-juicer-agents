@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import binascii
+import hashlib
 from collections import Counter
 from dataclasses import dataclass
 from math import hypot, isclose, isfinite
@@ -182,8 +183,8 @@ def _gridmap_payload(content: bytes) -> GridmapPayload:
     if (
         x_range[0] >= x_range[1]
         or y_range[0] >= y_range[1]
-        or not isclose(x_cells, width, rel_tol=1e-9, abs_tol=1e-6)
-        or not isclose(y_cells, height, rel_tol=1e-9, abs_tol=1e-6)
+        or not isclose(x_cells, width, rel_tol=1e-9, abs_tol=1e-4)
+        or not isclose(y_cells, height, rel_tol=1e-9, abs_tol=1e-4)
         or width < 1
         or height < 1
         or width > _MAX_GRID_SIDE
@@ -194,10 +195,13 @@ def _gridmap_payload(content: bytes) -> GridmapPayload:
             "The gridmap evidence dimensions are invalid.",
         )
     # Production gridmaps use a scalar side length.  Some historical test
-    # fixtures use the legacy [height, width] form.  The frozen Fix editor
-    # derives the matrix dimensions from ranges and resolution, so both
-    # metadata shapes must agree with those derived dimensions.
-    if isinstance(raw_grid_size, int) and not isinstance(raw_grid_size, bool):
+    # fixtures use the legacy [height, width] form, while older production
+    # exports omit this redundant field.  The matrix dimensions are already
+    # determined by ranges and resolution, and the flat data length is
+    # checked below.
+    if raw_grid_size is None:
+        grid_size_matches = True
+    elif isinstance(raw_grid_size, int) and not isinstance(raw_grid_size, bool):
         grid_size_matches = (
             width == height == raw_grid_size
         )
@@ -380,6 +384,31 @@ def _target_label(target_type: str) -> str:
     return f"Other {target_type.removeprefix('other')}"
 
 
+def _historical_target_label(target_type: str) -> str:
+    """Return the legacy editor's human label without narrowing its schema."""
+
+    if _TARGET_TYPE_RE.fullmatch(target_type) is not None:
+        return _target_label(target_type)
+    return target_type.strip().replace("_", " ")
+
+
+def _historical_target_key(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and bool(value.strip())
+        and not any(ord(character) < 32 for character in value)
+    )
+
+
+def _historical_target_has_evidence(value: Any) -> bool:
+    return isinstance(value, dict) and (
+        value.get("position") is not None
+        or bool(value.get("traj"))
+        or value.get("img") is not None
+    )
+
+
 def build_trajectory_revision_state(
     segment_root: Path,
     *,
@@ -543,6 +572,204 @@ def build_trajectory_revision_state(
     return {
         "schema_version": 1,
         "target_bindings": dict(sorted(target_bindings.items())),
+        "frame_count": len(frames),
+        "frames": frames,
+    }
+
+
+def build_historical_fix_revision_state(
+    segment_root: Path,
+    *,
+    fix_path: Path,
+    asset_ref: str,
+) -> dict[str, Any]:
+    """Project an imported legacy Fix result through the native evidence contract.
+
+    Historical data was reviewed before DataPilot existed, so it has no Fix
+    command ledger or ``.system_fix_preview.json``.  The published directory
+    already contains the corrected trajectory JSON, camera frames, Gridmaps,
+    and the legacy pre-rendered camera projection.  This reader indexes those
+    immutable outputs without inventing a native execution history.
+    """
+
+    if not _regular_directory(segment_root) or fix_path.parent != segment_root:
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The historical Fix artifact is unavailable.",
+        )
+    if (
+        not fix_path.name.endswith("_trajectory_fix_five.json")
+        or not fix_path.is_file()
+        or fix_path.is_symlink()
+    ):
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The historical Fix artifact identity is invalid.",
+        )
+    trajectory = _load_object(fix_path, label="historical Fix trajectory")
+    frame_keys: list[str] = []
+    for key in trajectory:
+        if not isinstance(key, str):
+            continue
+        try:
+            float(key)
+        except ValueError:
+            # Some legacy exports store editor metadata such as light_up and
+            # light_down beside the timestamp-indexed frame objects.
+            continue
+        frame_keys.append(key)
+    frame_keys.sort(key=float)
+    if not frame_keys:
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The historical Fix frame keys are invalid.",
+        )
+    if len(frame_keys) > _MAX_FRAMES:
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The historical Fix frame count is unsupported.",
+        )
+
+    candidate_target_types: set[str] = set()
+    evidenced_target_types: set[str] = set()
+    for frame_key in frame_keys:
+        raw_frame = trajectory.get(frame_key)
+        if not isinstance(raw_frame, dict):
+            raise RuntimeExecutionError(
+                "trajectory_evidence_unavailable",
+                "A historical Fix frame is invalid.",
+            )
+        for key, value in raw_frame.items():
+            if key == "pass":
+                continue
+            if not _historical_target_key(key) or not isinstance(value, dict):
+                raise RuntimeExecutionError(
+                    "trajectory_evidence_unavailable",
+                    "A historical Fix target is invalid.",
+                )
+            candidate_target_types.add(key)
+            if _historical_target_has_evidence(value):
+                evidenced_target_types.add(key)
+    target_types = {
+        target_type
+        for target_type in candidate_target_types
+        if _TARGET_TYPE_RE.fullmatch(target_type) is not None
+        or target_type in evidenced_target_types
+    }
+    if not target_types:
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The historical Fix target set is empty.",
+        )
+
+    bindings = {
+        target_type: (
+            "target_"
+            + hashlib.sha256(
+                f"{asset_ref}:{target_type}".encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        for target_type in sorted(target_types)
+    }
+    motion: dict[str, Any] = {}
+    try:
+        speed_path = _one_file(
+            segment_root,
+            "*_speed_direction.json",
+            label="speed/direction file",
+        )
+        motion = _load_object(speed_path, label="speed/direction")
+    except (OSError, RuntimeExecutionError):
+        # Direction and speed improve the read-only overlay but are not needed
+        # to display the authoritative corrected position and trajectory.
+        motion = {}
+
+    frames: list[dict[str, Any]] = []
+    for frame_index, frame_key in enumerate(frame_keys):
+        raw_frame = trajectory[frame_key]
+        raw_motion_frame = motion.get(frame_key)
+        motion_frame = raw_motion_frame if isinstance(raw_motion_frame, dict) else {}
+        targets: dict[str, dict[str, Any]] = {}
+        for target_type in sorted(target_types):
+            target_ref = bindings[target_type]
+            raw_target = raw_frame.get(target_type)
+            target = raw_target if isinstance(raw_target, dict) else {}
+            raw_target_motion = motion_frame.get(target_type)
+            target_motion = (
+                raw_target_motion if isinstance(raw_target_motion, dict) else {}
+            )
+            velocity = _number_list(
+                target_motion.get("speed_object"),
+                minimum=2,
+                maximum=3,
+            )
+            speed = hypot(velocity[0], velocity[1]) if velocity is not None else None
+            direction = _finite_number(target_motion.get("direction_object"))
+            position = (
+                _number_pair(target.get("position"))
+                if target.get("position") is not None
+                else None
+            )
+            trajectory_points = _trajectory_points(target.get("traj"))
+            image_box = (
+                _number_list(target.get("img"), minimum=4, maximum=4)
+                if target.get("img") is not None
+                else None
+            )
+            color = target.get("color")
+            targets[target_ref] = {
+                "label": _historical_target_label(target_type),
+                "position": position,
+                "direction": direction,
+                "speed": speed,
+                "color": (
+                    [str(item) for item in color[:3]]
+                    if isinstance(color, list)
+                    else []
+                ),
+                "image_box": image_box,
+                "trajectory_points": trajectory_points,
+                "camera_position": None,
+                "camera_trajectory_points": [],
+                "base_position": position,
+                "base_direction": direction,
+                "base_speed": speed,
+                "base_trajectory_points": trajectory_points,
+            }
+
+        camera = segment_root / "fisheye_front" / f"{frame_key}.jpg"
+        projection = segment_root / "rout_plot_v2" / f"{frame_key}.png"
+        gridmap = segment_root / "grid_map" / f"{frame_key}.json"
+        gridmap_available = gridmap.is_file() and not gridmap.is_symlink()
+        frames.append(
+            {
+                "frame_index": frame_index,
+                "private_frame_key": frame_key,
+                "camera_available": camera.is_file() and not camera.is_symlink(),
+                "projection_available": (
+                    projection.is_file() and not projection.is_symlink()
+                ),
+                "gridmap_available": gridmap_available,
+                # Legacy segments use one Gridmap contract throughout a
+                # segment.  The public evidence service reads the first
+                # available Gridmap once and applies that metadata lazily,
+                # avoiding eager parsing of hundreds of large JSON files.
+                "gridmap_width": None,
+                "gridmap_height": None,
+                "gridmap_resolution": None,
+                "gridmap_x_range": None,
+                "gridmap_y_range": None,
+                "pass": bool(raw_frame.get("pass", False)),
+                "targets": targets,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "source": "historical_fix",
+        "target_bindings": {
+            target_ref: target_type
+            for target_type, target_ref in bindings.items()
+        },
         "frame_count": len(frames),
         "frames": frames,
     }

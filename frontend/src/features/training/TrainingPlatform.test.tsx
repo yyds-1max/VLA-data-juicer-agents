@@ -4,8 +4,9 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as trainingApi from "../../api/client";
-import type { TrainingCapabilities, TrainingModel, TrainingNode, TrainingRun, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingDatasetTransfer, TrainingEvent, TrainingModel, TrainingNode, TrainingRun, TrainingServer, TrainingServerResources } from "../../api/types";
 import { validateParameterDefinitions } from "./ParameterDefinitionEditor";
+import { datasetTransferDestination, TrainingDatasetTransferMonitor } from "./TrainingDatasetTransferDialog";
 import { TrainingPlatform } from "./TrainingPlatform";
 import { navilaTrajectoryParameters } from "./navilaTemplate";
 
@@ -20,6 +21,9 @@ vi.mock("../../api/client", () => ({
   createTrainingNode: vi.fn(), deleteTrainingNode: vi.fn(), discoverTrainingNodeHostKey: vi.fn(), preflightTrainingNodeWorker: vi.fn(), deployTrainingNodeWorker: vi.fn(), removeTrainingNodeWorker: vi.fn(),
   updateTrainingModel: vi.fn(), verifyTrainingModel: vi.fn(),
   previewTrainingRun: vi.fn(), createTrainingRun: vi.fn(), getTrainingRun: vi.fn(),
+  getNavigationDatasetReleases: vi.fn(), createNavigationDatasetRelease: vi.fn(),
+  listTrainingDatasetReleases: vi.fn(), listTrainingDatasetReplicas: vi.fn(), requestTrainingDirectoryListing: vi.fn(), getTrainingDirectoryListing: vi.fn(),
+  createTrainingDatasetTransfers: vi.fn(), listTrainingDatasetTransfers: vi.fn(), getTrainingDatasetTransfer: vi.fn(), pauseTrainingDatasetTransfer: vi.fn(), cancelTrainingDatasetTransfer: vi.fn(), retryTrainingDatasetTransfer: vi.fn(), removeTrainingDatasetReplica: vi.fn(),
   getTrainingRunLogs: vi.fn(), getTrainingRunMetrics: vi.fn(), stopTrainingRun: vi.fn(),
   openTrainingEvents: vi.fn(),
 }));
@@ -65,11 +69,22 @@ function mockApi(capabilities = readonlyCapabilities, models: TrainingModel[] = 
   vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server]);
   vi.mocked(trainingApi.getTrainingServerResources).mockResolvedValue(resources);
   vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([]);
+  vi.mocked(trainingApi.listTrainingDatasetReplicas).mockResolvedValue([]);
+  vi.mocked(trainingApi.getNavigationDatasetReleases).mockResolvedValue([]);
+  vi.mocked(trainingApi.listTrainingDatasetReleases).mockResolvedValue([]);
+  vi.mocked(trainingApi.listTrainingDatasetTransfers).mockResolvedValue([]);
 }
 
 describe("TrainingPlatform", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.stubGlobal("ResizeObserver", TestResizeObserver); mockApi(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it("shows the exact managed destination beneath a selected parent directory", () => {
+    expect(datasetTransferDestination("/data/caiji_test", {
+      dataset_date: "20260416",
+      release_ref: "dataset_release_f0e579a74b8a4109",
+    })).toBe("/data/caiji_test/datapilot-managed/20260416-f0e579a7");
+  });
 
   it("shows a real-execution disabled notice and keeps write flows disabled for a read-only principal", async () => {
     renderPlatform();
@@ -84,12 +99,26 @@ describe("TrainingPlatform", () => {
     mockApi(adminCapabilities, [model]);
     renderPlatform();
     expect(await screen.findByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "训练数据" })).toBeVisible();
     expect(screen.queryByRole("tab", { name: "新建训练" })).not.toBeInTheDocument();
     fireEvent.click((await screen.findAllByRole("button", { name: "新建训练任务" }))[0]);
     expect(await screen.findByRole("heading", { name: "新建训练任务" })).toBeVisible();
     expect(screen.getByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
     fireEvent.click(screen.getByRole("button", { name: "← 返回训练任务" }));
     expect(await screen.findByRole("heading", { name: "训练任务" })).toBeVisible();
+  });
+
+  it("keeps the training-data page mounted when switching training tabs", async () => {
+    mockApi(adminCapabilities, [model]);
+    renderPlatform();
+    await waitFor(() => expect(trainingApi.getNavigationDatasetReleases).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("tab", { name: "训练数据" }));
+    expect(await screen.findByRole("heading", { name: "训练数据" })).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+    fireEvent.click(screen.getByRole("tab", { name: "训练数据" }));
+
+    expect(trainingApi.getNavigationDatasetReleases).toHaveBeenCalledTimes(1);
   });
 
   it("summarizes the selected node resources beside the GPU picker", async () => {
@@ -436,7 +465,7 @@ describe("TrainingPlatform", () => {
     await waitFor(() => expect(trainingApi.deployTrainingNodeWorker).toHaveBeenCalledTimes(1));
   });
 
-  it("surfaces a registered dataset parameter separately from hyperparameters", async () => {
+  it("treats a legacy registered dataset parameter as a normal hyperparameter", async () => {
     const datasetModel: TrainingModel = { ...model, configuration: { ...model.configuration!, parameter_definitions: [
       { key: "data_mixture", label: "数据混合配置", type: "string", semantic_role: "dataset", default: "rxr", editable: true },
       ...model.configuration!.parameter_definitions,
@@ -444,8 +473,235 @@ describe("TrainingPlatform", () => {
     mockApi(adminCapabilities, [datasetModel]);
     renderPlatform();
     await openNewTraining();
-    expect(await screen.findByRole("region", { name: "训练数据集" })).toBeVisible();
-    expect(within(screen.getByRole("region", { name: "训练数据集" })).getByLabelText("数据混合配置")).toHaveValue("rxr");
+    expect(screen.queryByRole("region", { name: "训练数据集" })).not.toBeInTheDocument();
+    expect(await screen.findByLabelText("数据混合配置")).toHaveValue("rxr");
+  });
+
+  it("selects ready dates into mutually exclusive train and test sets and requires a version description", async () => {
+    const managedModel: TrainingModel = { ...model, data_access_mode: "datapilot_managed", configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    const replicas = [
+      { replica_ref: "replica-train", node_ref: "fake-local", release_ref: "release-train", dataset_date: "20260806", status: "ready" as const, local_root: "/data/datapilot-managed/20260806-a", total_bytes: 1024, inventory_sha256: "a" },
+      { replica_ref: "replica-test", node_ref: "fake-local", release_ref: "release-test", dataset_date: "20260807", status: "ready" as const, local_root: "/data/datapilot-managed/20260807-b", total_bytes: 2048, inventory_sha256: "b" },
+    ];
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetReplicas).mockResolvedValue(replicas);
+    vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py --dataset_manifest /preview/dataset-manifest.json", output_directory: "/preview/stage-01", run_spec: runSpec, preflight: [{ ok: true, message: "资源可用" }] }] });
+    vi.mocked(trainingApi.createTrainingRun).mockResolvedValue({ ...runningRun, status: "queued" });
+    renderPlatform();
+    await openNewTraining();
+
+    fireEvent.click(await screen.findByRole("button", { name: "选择训练数据" }));
+    fireEvent.click(await screen.findByLabelText("使用 20260806 数据"));
+    fireEvent.click(screen.getByLabelText("使用 20260807 数据"));
+    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    expect(screen.getByRole("button", { name: "取消选择 20260806 数据" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "取消选择 20260807 数据" })).toBeVisible();
+    fireEvent.click(screen.getByText("设置测试集"));
+    fireEvent.click(screen.getByLabelText("20260807 测试集"));
+    fireEvent.click(screen.getByLabelText("选择 GPU 0"));
+    fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
+    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ dataset_selection: { train_replica_refs: ["replica-train"], test_replica_refs: ["replica-test"] } })));
+    expect(screen.getByRole("button", { name: "启动模拟训练" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("本次训练说明"), { target: { value: "加入 8 月新增日期并调整训练数据" } });
+    expect(screen.getByRole("button", { name: "启动模拟训练" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
+    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "启动模拟训练" }));
+    await waitFor(() => expect(trainingApi.createTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ version_description: "加入 8 月新增日期并调整训练数据", dataset_selection: { train_replica_refs: ["replica-train"], test_replica_refs: ["replica-test"] } })));
+  });
+
+  it("separates training selection from destructive node dataset management", async () => {
+    const managedModel: TrainingModel = { ...model, data_access_mode: "datapilot_managed", configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    const replica = {
+      replica_ref: "replica-managed",
+      node_ref: "fake-local",
+      release_ref: "release-managed",
+      dataset_date: "20260416",
+      status: "ready" as const,
+      local_root: "/data/caiji_test/datapilot-managed/20260416-managed",
+      file_count: 292,
+      total_bytes: 2048,
+      inventory_sha256: "digest",
+      created_at: "2026-08-19T01:30:00Z",
+    };
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetReplicas).mockResolvedValue([replica]);
+    vi.mocked(trainingApi.removeTrainingDatasetReplica).mockResolvedValue({ ...replica, status: "removing" });
+
+    renderPlatform();
+    await openNewTraining();
+    fireEvent.click(await screen.findByRole("button", { name: "选择训练数据" }));
+    fireEvent.click(await screen.findByLabelText("使用 20260416 数据"));
+    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消选择 20260416 数据" }));
+    expect(trainingApi.removeTrainingDatasetReplica).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "管理节点数据" }));
+    const managementDialog = await screen.findByRole("dialog", { name: "管理节点数据" });
+    expect(within(managementDialog).getByText("292")).toBeVisible();
+    expect(within(managementDialog).getByText("2.0 KiB")).toBeVisible();
+    expect(within(managementDialog).getByText(replica.local_root)).toBeVisible();
+    fireEvent.click(within(managementDialog).getByRole("button", { name: "删除节点中的 20260416 数据" }));
+    expect(trainingApi.removeTrainingDatasetReplica).not.toHaveBeenCalled();
+
+    const confirmation = await screen.findByRole("alertdialog", { name: "删除训练节点中的数据？" });
+    fireEvent.click(within(confirmation).getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(trainingApi.removeTrainingDatasetReplica).toHaveBeenCalledWith("replica-managed"));
+    expect(await within(managementDialog).findByText(/删除请求已提交/)).toBeVisible();
+  });
+
+  it("chooses a directory in a separate browser and keeps submitted transfers visible in the background", async () => {
+    const managedModel: TrainingModel = { ...model, configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetReleases).mockResolvedValue([
+      { release_ref: "dataset_release_aabbccdd111", dataset_date: "20260808", status: "released", source_clip_count: 12, total_duration_ns: 100, released_at: "2026-08-08T00:00:00Z", source_manifest: { manifest_ref: "manifest-1", status: "ready", file_count: 8, total_bytes: 4096, inventory_sha256: "digest" } },
+      { release_ref: "dataset_release_eeff0011222", dataset_date: "20260809", status: "released", source_clip_count: 8, total_duration_ns: 80, released_at: "2026-08-09T00:00:00Z", source_manifest: { manifest_ref: "manifest-2", status: "ready", file_count: 5, total_bytes: 2048, inventory_sha256: "digest-2" } },
+    ]);
+    vi.mocked(trainingApi.requestTrainingDirectoryListing).mockResolvedValue({ listing_ref: "listing-1", node_ref: "fake-local", path: "/", status: "succeeded", writable: true, free_bytes: 1024 ** 3, directories: [{ name: "data", path: "/data", writable: true }] });
+    const createdTransfer: TrainingDatasetTransfer = { transfer_ref: "transfer-1", node_ref: "fake-local", release_ref: "dataset_release_aabbccdd111", dataset_date: "20260808", status: "preparing", target_parent_directory: "/", bytes_transferred: 0, total_bytes: 4096 };
+    const secondTransfer: TrainingDatasetTransfer = { transfer_ref: "transfer-2", node_ref: "fake-local", release_ref: "dataset_release_eeff0011222", dataset_date: "20260809", status: "preparing", target_parent_directory: "/", bytes_transferred: 0, total_bytes: 2048 };
+    vi.mocked(trainingApi.createTrainingDatasetTransfers).mockResolvedValue([createdTransfer, secondTransfer]);
+    vi.mocked(trainingApi.listTrainingDatasetTransfers).mockResolvedValueOnce([]).mockResolvedValue([createdTransfer, secondTransfer]);
+    renderPlatform();
+    await openNewTraining();
+    fireEvent.click(await screen.findByRole("button", { name: "从中心服务器传输数据" }));
+
+    expect(await screen.findByRole("dialog", { name: "从中心服务器传输数据" })).toBeVisible();
+    expect(screen.queryByText("20260808")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "选择中心已发布数据" }));
+    expect(await screen.findByLabelText("搜索已发布日期")).toBeVisible();
+    fireEvent.click(await screen.findByText("20260808"));
+    fireEvent.click(await screen.findByText("20260809"));
+    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    expect(screen.getByText("已选择 2 个日期")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "选择保存目录" }));
+    const directoryDialog = await screen.findByRole("dialog", { name: "选择保存位置" });
+    expect(within(directoryDialog).getByText("可写 · 剩余 1.0 GiB", { exact: false })).toBeVisible();
+    fireEvent.click(within(directoryDialog).getByRole("button", { name: "选择当前目录" }));
+    expect(await screen.findByText("可写 · 剩余 1.0 GiB")).toBeVisible();
+    expect(screen.getByText("/datapilot-managed/20260808-aabbccdd")).toBeVisible();
+    expect(screen.getByText("/datapilot-managed/20260809-eeff0011")).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "开始传输" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "开始传输" }));
+    await waitFor(() => expect(trainingApi.createTrainingDatasetTransfers).toHaveBeenCalledWith({ node_ref: "fake-local", release_refs: ["dataset_release_aabbccdd111", "dataset_release_eeff0011222"], target_parent_directory: "/" }));
+    expect(screen.queryByRole("dialog", { name: "从中心服务器传输数据" })).not.toBeInTheDocument();
+    const transferFloat = await screen.findByRole("complementary", { name: "数据传输进度" });
+    expect(transferFloat).toHaveClass("fixed");
+    expect(await within(transferFloat).findAllByText("正在准备文件清单")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "刷新" })).not.toBeInTheDocument();
+  });
+
+  it("allows a released date to be transferred again after its node replica was removed", async () => {
+    const managedModel: TrainingModel = { ...model, configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    const completedTransfer: TrainingDatasetTransfer = {
+      transfer_ref: "transfer-completed",
+      node_ref: "fake-local",
+      release_ref: "release-removed",
+      dataset_date: "20260416",
+      status: "succeeded",
+      target_parent_directory: "/data",
+      bytes_transferred: 4096,
+      total_bytes: 4096,
+      progress_percent: 100,
+    };
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetReplicas).mockResolvedValue([]);
+    vi.mocked(trainingApi.listTrainingDatasetTransfers).mockResolvedValue([completedTransfer]);
+    vi.mocked(trainingApi.listTrainingDatasetReleases).mockResolvedValue([
+      { release_ref: "release-removed", dataset_date: "20260416", status: "released", source_clip_count: 4, total_duration_ns: 100, released_at: "2026-04-16T00:00:00Z", source_manifest: { manifest_ref: "manifest-removed", status: "ready", file_count: 292, total_bytes: 4096, inventory_sha256: "digest" } },
+    ]);
+
+    renderPlatform();
+    await waitFor(() => expect(trainingApi.listTrainingDatasetTransfers).toHaveBeenCalled());
+    await openNewTraining();
+    fireEvent.click(await screen.findByRole("button", { name: "从中心服务器传输数据" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择中心已发布数据" }));
+
+    expect(await screen.findByText("20260416")).toBeVisible();
+    expect(screen.getByText("1 个可选日期")).toBeVisible();
+  });
+
+  it("refreshes ready replicas silently without replacing the data area with a loading message", async () => {
+    const managedModel: TrainingModel = { ...model, configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    const replicas = [
+      { replica_ref: "replica-ready", node_ref: "fake-local", release_ref: "release-ready", dataset_date: "20260416", status: "ready" as const, local_root: "/data/datapilot-managed/20260416-a" },
+    ];
+    let eventHandler: ((event: TrainingEvent) => void) | undefined;
+    let resolveRefresh!: (value: typeof replicas) => void;
+    const pendingRefresh = new Promise<typeof replicas>((resolve) => { resolveRefresh = resolve; });
+    vi.stubGlobal("EventSource", class EventSource {});
+    vi.mocked(trainingApi.openTrainingEvents).mockImplementation((onEvent) => {
+      eventHandler = onEvent;
+      return { close: vi.fn() } as unknown as EventSource;
+    });
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetReplicas).mockResolvedValue(replicas);
+
+    renderPlatform();
+    await openNewTraining();
+    expect(await screen.findByRole("button", { name: "选择训练数据" })).toBeVisible();
+
+    vi.mocked(trainingApi.listTrainingDatasetReplicas).mockImplementationOnce(() => pendingRefresh);
+    await act(async () => { eventHandler?.({ event_id: 10, type: "dataset.replica.ready", replica_ref: "replica-ready" }); });
+    await waitFor(() => expect(trainingApi.listTrainingDatasetReplicas).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "选择训练数据" }));
+    expect(screen.getByLabelText("使用 20260416 数据")).toBeVisible();
+    expect(screen.queryByText("正在读取训练节点中的数据…")).not.toBeInTheDocument();
+
+    resolveRefresh(replicas);
+    await act(async () => { await pendingRefresh; });
+  });
+
+  it("updates background transfer progress from SSE without a manual refresh", async () => {
+    const managedModel: TrainingModel = { ...model, configuration: { ...model.configuration!, data_access_mode: "datapilot_managed" } };
+    const runningTransfer: TrainingDatasetTransfer = { transfer_ref: "transfer-live", node_ref: "fake-local", release_ref: "release-live", dataset_date: "20260808", status: "running", target_parent_directory: "/data", bytes_transferred: 2048, total_bytes: 4096, progress_percent: 50 };
+    const succeededTransfer: TrainingDatasetTransfer = { ...runningTransfer, status: "succeeded", bytes_transferred: 4096, progress_percent: 100 };
+    let eventHandler: ((event: TrainingEvent) => void) | undefined;
+    vi.stubGlobal("EventSource", class EventSource {});
+    vi.mocked(trainingApi.openTrainingEvents).mockImplementation((onEvent) => {
+      eventHandler = onEvent;
+      return { close: vi.fn() } as unknown as EventSource;
+    });
+    mockApi(adminCapabilities, [managedModel]);
+    vi.mocked(trainingApi.listTrainingDatasetTransfers).mockResolvedValue([runningTransfer]);
+    vi.mocked(trainingApi.pauseTrainingDatasetTransfer).mockResolvedValue({ ...runningTransfer, status: "pause_requested" });
+
+    renderPlatform();
+    const transferFloat = await screen.findByRole("complementary", { name: "数据传输进度" });
+    expect(transferFloat).toHaveClass("fixed");
+    expect(screen.getByText("正在传输")).toBeVisible();
+    expect(screen.getByText(/2\.0 KiB \/ 4\.0 KiB/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "暂停 20260808 数据传输" }));
+    await waitFor(() => expect(trainingApi.pauseTrainingDatasetTransfer).toHaveBeenCalledWith("transfer-live"));
+    expect(await screen.findByText("正在暂停")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起数据传输进度" }));
+    expect(screen.getByRole("button", { name: "展开数据传输进度" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "展开数据传输进度" }));
+
+    vi.mocked(trainingApi.listTrainingDatasetTransfers).mockResolvedValue([succeededTransfer]);
+    await act(async () => { eventHandler?.({ event_id: 9, type: "dataset.transfer.updated", transfer_ref: "transfer-live" }); });
+
+    expect(await screen.findByText("传输完成")).toBeVisible();
+    expect(screen.getByText(/4\.0 KiB \/ 4\.0 KiB/)).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("20260808：传输完成");
+    expect(screen.getByRole("button", { name: "关闭数据传输进度" })).toBeVisible();
+  });
+
+  it("only allows closing the transfer monitor after completion or full cancellation", () => {
+    const pausedTransfer: TrainingDatasetTransfer = { transfer_ref: "transfer-paused", node_ref: "fake-local", release_ref: "release-paused", dataset_date: "20260808", status: "paused", target_parent_directory: "/data", bytes_transferred: 2048, total_bytes: 4096, progress_percent: 50 };
+    const callbacks = { onPause: vi.fn(), onCancel: vi.fn(), onRetry: vi.fn() };
+    const view = render(<TrainingDatasetTransferMonitor transfers={[pausedTransfer]} {...callbacks} />);
+
+    expect(screen.queryByRole("button", { name: "关闭数据传输进度" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续传输" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "收起数据传输进度" }));
+    expect(screen.getByRole("button", { name: "展开数据传输进度" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "展开数据传输进度" }));
+
+    view.rerender(<TrainingDatasetTransferMonitor transfers={[{ ...pausedTransfer, status: "cancelled" }]} {...callbacks} />);
+    expect(screen.getByRole("button", { name: "关闭数据传输进度" })).toBeVisible();
   });
 
   it("sends an admin model registration payload with the structured launch template", async () => {
@@ -763,6 +1019,7 @@ describe("TrainingPlatform", () => {
     fireEvent.keyDown(parameterHelp, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
     fireEvent.change(frames, { target: { value: "8" } });
+    fireEvent.change(screen.getByLabelText("本次训练说明"), { target: { value: "验证 8 帧训练配置" } });
     expect(screen.getByRole("button", { name: "启动模拟训练" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
     await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ family_ref: "navila-family", stages: [{ stage_input_source: "manual", parameters: { num_video_frames: 8 } }], gpu_uuids: ["GPU-0"] })));
@@ -1009,8 +1266,8 @@ describe("TrainingPlatform", () => {
     await screen.findByRole("tab", { name: "训练任务" });
     await openNewTraining();
 
-    expect(await screen.findByRole("heading", { name: "常用参数 (17)" })).toBeVisible();
-    expect(screen.getByRole("region", { name: "训练数据集" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "常用参数 (18)" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "训练数据集" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("学习率")).toBeVisible();
     expect(screen.getByLabelText("随机种子")).toBeVisible();
     expect(screen.getByLabelText("保存 step 间隔")).toBeVisible();
@@ -1203,7 +1460,7 @@ describe("TrainingPlatform", () => {
     const editedDefinitions = [{ ...model.configuration!.parameter_definitions[0], default: 8, display_group: "common", display_group_label: "常用参数", display_group_order: 0 }];
     fireEvent.change(screen.getByLabelText("num_video_frames 默认值"), { target: { value: "8" } });
     fireEvent.click(screen.getByRole("button", { name: "保存模型配置" }));
-    await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila-family", expect.objectContaining({ expected_revision: 1, configuration: { parameter_definitions: editedDefinitions, launch_template: launchTemplate } })));
+    await waitFor(() => expect(trainingApi.updateTrainingModel).toHaveBeenCalledWith("navila-family", expect.objectContaining({ expected_revision: 1, configuration: { data_access_mode: "self_managed", parameter_definitions: editedDefinitions, launch_template: launchTemplate } })));
     fireEvent.click(within(screen.getByRole("dialog", { name: "操作进度" })).getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("button", { name: "登记新模型" })).toBeVisible();
   });

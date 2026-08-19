@@ -338,6 +338,7 @@ export function parseTrajectoryReviewEvidence(
   if (
     evidence.evidence_kind !== "trajectory_revision"
     && evidence.evidence_kind !== "fix_revision"
+    && evidence.evidence_kind !== "historical_fix"
   ) {
     contractError();
   }
@@ -366,7 +367,8 @@ export function parseTrajectoryReviewEvidence(
         || fixRevisionSourceDraftRevision !== null
       ))
     || (
-      evidence.evidence_kind === "fix_revision"
+      (evidence.evidence_kind === "fix_revision"
+        || evidence.evidence_kind === "historical_fix")
       && (
         fixRevisionRef === null
         || fixRevisionSourceDraftRevision === null

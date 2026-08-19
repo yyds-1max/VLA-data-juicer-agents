@@ -212,11 +212,11 @@ export function selectActionableReview(
 export function buildReviewGroups(
   reviews: TrajectoryReview[],
 ): ReviewGroupPresentation[] {
-  // 列表的一行代表同一数据日期、同一外层 clip 下的完整 Segment 复核组。
-  // 所有进度、状态分布和标定统计都基于完整组，不能被界面筛选条件裁剪。
+  // 列表的一行代表一个完整数据日期。当天所有外层 clips 的 Segment
+  // 共同构成复核组；进度、状态分布和标定统计均按 Segment 汇总。
   const grouped = new Map<string, TrajectoryReview[]>();
   for (const review of reviews) {
-    const key = `${review.dataset_date}:${review.source_clip}`;
+    const key = review.dataset_date;
     const current = grouped.get(key) ?? [];
     current.push(review);
     grouped.set(key, current);
@@ -225,7 +225,8 @@ export function buildReviewGroups(
   return [...grouped.entries()]
     .map(([key, groupedReviews]) => {
       const orderedReviews = [...groupedReviews].sort((left, right) => (
-        left.segment_ordinal - right.segment_ordinal
+        left.source_clip.localeCompare(right.source_clip)
+        || left.segment_ordinal - right.segment_ordinal
         || left.review_ref.localeCompare(right.review_ref)
       ));
       const breakdown = statusBreakdown(orderedReviews);

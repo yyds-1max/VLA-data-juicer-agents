@@ -8,7 +8,7 @@ import re
 from typing import Annotated, Any, Callable, Literal, Protocol
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -95,7 +95,29 @@ class TrainingServiceProtocol(Protocol):
         payload: Any,
     ) -> dict[str, Any]: ...
 
+    def poll_node_commands(
+        self, node_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]: ...
+
+    def finish_node_command(
+        self, node_ref: str, command_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]: ...
+
     def get_node_resources(self, node_ref: str) -> dict[str, Any]: ...
+
+    def list_dataset_releases(self) -> list[dict[str, Any]]: ...
+    def list_dataset_replicas(self, node_ref: str, principal: TrainingPrincipal) -> list[dict[str, Any]]: ...
+    def request_directory_listing(self, node_ref: str, payload: Any, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def get_directory_listing(self, listing_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def create_dataset_transfers(self, payload: Any, idempotency_key: str, principal: TrainingPrincipal) -> list[dict[str, Any]]: ...
+    def list_dataset_transfers(self, *, node_ref: str | None = None, status: str | None = None, principal: TrainingPrincipal) -> list[dict[str, Any]]: ...
+    def get_dataset_transfer(self, transfer_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def pause_dataset_transfer(self, transfer_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def cancel_dataset_transfer(self, transfer_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def retry_dataset_transfer(self, transfer_ref: str, idempotency_key: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def remove_dataset_replica(self, replica_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
+    def source_manifest_page(self, node_ref: str, release_ref: str, worker_token: str, *, cursor: int, limit: int) -> dict[str, Any]: ...
+    def source_file(self, node_ref: str, file_ref: str, worker_token: str) -> dict[str, Any]: ...
 
     def list_models(
         self, *, include_private: bool = False
@@ -534,6 +556,36 @@ class ModelVerificationResultRequest(StrictRequest):
         return self
 
 
+class PollNodeCommandsRequest(StrictRequest):
+    worker_instance_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    )
+    wait_seconds: Annotated[int, Field(strict=True, ge=0, le=30)] = 25
+    limit: Annotated[int, Field(strict=True, ge=1, le=10)] = 1
+
+
+class WorkerCommandResultRequest(StrictRequest):
+    worker_instance_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    )
+    claim_token: str = Field(
+        min_length=32,
+        max_length=200,
+        pattern=r"^claim_[A-Za-z0-9_-]+$",
+    )
+    status: Literal["running", "succeeded", "failed", "paused", "cancelled"]
+    transfer_ref: str | None = Field(default=None, max_length=200)
+    replica_ref: str | None = Field(default=None, max_length=200)
+    path: str | None = Field(default=None, max_length=4096)
+    parent_path: str | None = Field(default=None, max_length=4096)
+    writable: bool | None = None
+    free_bytes: Annotated[int, Field(strict=True, ge=0)] | None = None
+    directories: list[dict[str, Any]] | None = Field(default=None, max_length=10000)
+    progress: dict[str, Any] | None = None
+    replica: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
 class ParameterChoice(StrictRequest):
     value: str = Field(min_length=1, max_length=200)
     label: str = Field(min_length=1, max_length=200)
@@ -583,11 +635,14 @@ class ParameterDefinition(StrictRequest):
         "value", "explicit_boolean", "flag_when_true"
     ] | None = None
 
+    @field_validator("semantic_role", mode="before")
+    @classmethod
+    def normalize_legacy_dataset_role(cls, value: Any) -> Any:
+        return "hyperparameter" if value == "dataset" else value
+
     @model_validator(mode="after")
     def validate_definition(self) -> ParameterDefinition:
         default = self.default
-        if self.semantic_role == "dataset" and self.type not in {"string", "enum"}:
-            raise ValueError("dataset parameters must be strings or enums")
         if self.semantic_role == "stage_input" and self.type != "string":
             raise ValueError("stage input parameters must be strings")
         if self.semantic_role == "stage_input" and self.visible_when is not None:
@@ -760,6 +815,7 @@ class LaunchTemplate(StrictRequest):
 
 class ModelConfigurationRequest(StrictRequest):
     launch_template: LaunchTemplate
+    data_access_mode: Literal["datapilot_managed", "self_managed"] = "self_managed"
     parameter_definitions: list[ParameterDefinition] = Field(
         min_length=1,
         max_length=200,
@@ -777,11 +833,6 @@ class ModelConfigurationRequest(StrictRequest):
 
     @model_validator(mode="after")
     def reserve_platform_output_flag(self) -> ModelConfigurationRequest:
-        if sum(
-            definition.semantic_role == "dataset"
-            for definition in self.parameter_definitions
-        ) > 1:
-            raise ValueError("a model family can declare at most one dataset parameter")
         if sum(
             definition.semantic_role == "stage_input"
             for definition in self.parameter_definitions
@@ -827,6 +878,14 @@ class ModelConfigurationRequest(StrictRequest):
             duplicate = sorted(duplicate_fixed_flags)[0]
             raise ValueError(
                 f"fixed_argv cannot redeclare registered parameter flag {duplicate}"
+            )
+        if self.data_access_mode == "datapilot_managed" and (
+            "--dataset_manifest" in parameter_flags
+            or "--dataset_manifest" in fixed_token_flags
+            or self.launch_template.output_flag == "--dataset_manifest"
+        ):
+            raise ValueError(
+                "--dataset_manifest is reserved for DataPilot managed data"
             )
         definitions = {item.key: item for item in self.parameter_definitions}
         dependencies: dict[str, str] = {}
@@ -923,12 +982,35 @@ class RunStageRequest(StrictRequest):
         return value
 
 
+class DatasetSelectionRequest(StrictRequest):
+    train_replica_refs: list[str] = Field(default_factory=list, max_length=1000)
+    test_replica_refs: list[str] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> DatasetSelectionRequest:
+        combined = [*self.train_replica_refs, *self.test_replica_refs]
+        if len(combined) != len(set(combined)):
+            raise ValueError("dataset replica selections must be unique and disjoint")
+        if any(not _SAFE_REF.fullmatch(ref) for ref in combined):
+            raise ValueError("dataset selection contains an invalid replica reference")
+        return self
+
+
 class RunRequest(StrictRequest):
     family_ref: str = Field(min_length=1, max_length=200)
     server_ref: str = Field(min_length=1, max_length=200)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
     execution_mode: Literal["simulation"]
+    version_description: str = Field(default="", max_length=500)
+    dataset_selection: DatasetSelectionRequest | None = None
+
+    @field_validator("version_description")
+    @classmethod
+    def normalize_version_description(cls, value: str) -> str:
+        if "\x00" in value or "\r" in value:
+            raise ValueError("version_description contains control characters")
+        return value.strip()
 
     @field_validator("family_ref", "server_ref")
     @classmethod
@@ -967,6 +1049,41 @@ class PreviewRunRequest(RunRequest):
 
 class StopRunRequest(StrictRequest):
     expected_revision: Annotated[int, Field(strict=True, ge=1)]
+
+
+class DirectoryListingRequest(StrictRequest):
+    path: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("path")
+    @classmethod
+    def absolute_safe_path(cls, value: str) -> str:
+        if not value.startswith("/") or any(c in value for c in ("\x00", "\n", "\r")):
+            raise ValueError("path must be a safe absolute directory path")
+        return value.rstrip("/") or "/"
+
+
+class CreateDatasetTransfersRequest(StrictRequest):
+    node_ref: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+    release_refs: list[str] = Field(min_length=1, max_length=100)
+    target_parent_directory: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("release_refs")
+    @classmethod
+    def unique_release_refs(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(not _SAFE_REF.fullmatch(value) for value in values):
+            raise ValueError("release_refs must contain unique safe resource references")
+        return values
+
+    @field_validator("target_parent_directory")
+    @classmethod
+    def safe_target_parent(cls, value: str) -> str:
+        if not value.startswith("/") or any(c in value for c in ("\x00", "\n", "\r")):
+            raise ValueError("target_parent_directory must be a safe absolute path")
+        return value.rstrip("/") or "/"
+
+
+class EmptyRequest(StrictRequest):
+    pass
 
 
 def create_training_router(
@@ -1159,11 +1276,24 @@ def create_training_router(
             "command": heartbeat.get("command"),
         }
 
+    @router.post("/nodes/{node_ref}/commands/poll")
+    def poll_node_commands(
+        node_ref: str,
+        request: PollNodeCommandsRequest,
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.poll_node_commands,
+            node_ref,
+            _worker_bearer_token(authorization),
+            request,
+        )
+
     @router.post("/nodes/{node_ref}/commands/{command_ref}/result")
     def finish_model_verification(
         node_ref: str,
         command_ref: str,
-        request: ModelVerificationResultRequest,
+        request: ModelVerificationResultRequest | WorkerCommandResultRequest,
         authorization: Annotated[
             str | None,
             Header(alias="Authorization", max_length=512),
@@ -1177,8 +1307,26 @@ def create_training_router(
                     "message": "Worker command reference contains unsupported characters.",
                 },
             )
+        if command_ref.startswith("verify_"):
+            if not isinstance(request, ModelVerificationResultRequest):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "invalid_verification_result", "message": "A model verification result is required."},
+                )
+            return _translate(
+                service.finish_model_verification,
+                node_ref,
+                command_ref,
+                _worker_bearer_token(authorization),
+                request,
+            )
+        if not isinstance(request, WorkerCommandResultRequest):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_worker_command_result", "message": "A Worker command result is required."},
+            )
         return _translate(
-            service.finish_model_verification,
+            service.finish_node_command,
             node_ref,
             command_ref,
             _worker_bearer_token(authorization),
@@ -1188,6 +1336,97 @@ def create_training_router(
     @router.get("/nodes/{node_ref}/resources")
     def node_resources(node_ref: str) -> dict[str, Any]:
         return _translate(service.get_node_resources, node_ref)
+
+    @router.get("/dataset-releases")
+    def list_dataset_releases() -> dict[str, Any]:
+        return {"releases": _translate(service.list_dataset_releases)}
+
+    @router.get("/nodes/{node_ref}/dataset-replicas")
+    def list_dataset_replicas(node_ref: str) -> dict[str, Any]:
+        return {"replicas": _translate(service.list_dataset_replicas, node_ref, get_principal())}
+
+    @router.post("/nodes/{node_ref}/directory-listings", status_code=202)
+    def request_directory_listing(
+        node_ref: str, request: DirectoryListingRequest
+    ) -> dict[str, Any]:
+        return {"listing": _translate(service.request_directory_listing, node_ref, request, get_principal())}
+
+    @router.get("/directory-listings/{listing_ref}")
+    def get_directory_listing(listing_ref: str) -> dict[str, Any]:
+        return {"listing": _translate(service.get_directory_listing, listing_ref, get_principal())}
+
+    @router.post("/dataset-transfers", status_code=202)
+    def create_dataset_transfers(
+        request: CreateDatasetTransfersRequest, idempotency_key: IdempotencyKey
+    ) -> dict[str, Any]:
+        return {"transfers": _translate(service.create_dataset_transfers, request, idempotency_key, get_principal())}
+
+    @router.get("/dataset-transfers")
+    def list_dataset_transfers(
+        node_ref: str | None = Query(default=None, max_length=200),
+        status: str | None = Query(default=None, max_length=30),
+    ) -> dict[str, Any]:
+        return {"transfers": _translate(service.list_dataset_transfers, node_ref=node_ref, status=status, principal=get_principal())}
+
+    @router.get("/dataset-transfers/{transfer_ref}")
+    def get_dataset_transfer(transfer_ref: str) -> dict[str, Any]:
+        return {"transfer": _translate(service.get_dataset_transfer, transfer_ref, get_principal())}
+
+    @router.post("/dataset-transfers/{transfer_ref}/cancel", status_code=202)
+    def cancel_dataset_transfer(transfer_ref: str, request: EmptyRequest) -> dict[str, Any]:
+        return {"transfer": _translate(service.cancel_dataset_transfer, transfer_ref, get_principal())}
+
+    @router.post("/dataset-transfers/{transfer_ref}/pause", status_code=202)
+    def pause_dataset_transfer(transfer_ref: str, request: EmptyRequest) -> dict[str, Any]:
+        return {"transfer": _translate(service.pause_dataset_transfer, transfer_ref, get_principal())}
+
+    @router.post("/dataset-transfers/{transfer_ref}/retry", status_code=202)
+    def retry_dataset_transfer(
+        transfer_ref: str, request: EmptyRequest, idempotency_key: IdempotencyKey
+    ) -> dict[str, Any]:
+        return {"transfer": _translate(service.retry_dataset_transfer, transfer_ref, idempotency_key, get_principal())}
+
+    @router.post("/dataset-replicas/{replica_ref}/remove", status_code=202)
+    def remove_dataset_replica(replica_ref: str, request: EmptyRequest) -> dict[str, Any]:
+        return {"replica": _translate(service.remove_dataset_replica, replica_ref, get_principal())}
+
+    @router.get("/nodes/{node_ref}/dataset-releases/{release_ref}/manifest")
+    def worker_dataset_manifest(
+        node_ref: str,
+        release_ref: str,
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=500, ge=1, le=2000),
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.source_manifest_page,
+            node_ref,
+            release_ref,
+            _worker_bearer_token(authorization),
+            cursor=cursor,
+            limit=limit,
+        )
+
+    @router.get("/nodes/{node_ref}/dataset-files/{file_ref}/content")
+    def worker_dataset_file(
+        node_ref: str,
+        file_ref: str,
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> FileResponse:
+        item = _translate(
+            service.source_file,
+            node_ref,
+            file_ref,
+            _worker_bearer_token(authorization),
+        )
+        return FileResponse(
+            path=item["path"],
+            media_type="application/octet-stream",
+            headers={
+                "ETag": f'"{item["sha256"]}"',
+                "Cache-Control": "private, max-age=31536000, immutable",
+            },
+        )
 
     @router.get("/models")
     def list_models() -> dict[str, Any]:
@@ -1640,6 +1879,7 @@ def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
         "trained_version_count": int(model.get("trained_version_count", 0)),
         "created_at": model.get("created_at"),
         "updated_at": model.get("updated_at"),
+        "data_access_mode": model.get("data_access_mode", "self_managed"),
     }
     verification = model.get("verification")
     if isinstance(verification, dict):
@@ -1658,6 +1898,9 @@ def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
     if isinstance(configuration, dict):
         definitions = configuration.get("parameter_definitions")
         normalized_configuration: dict[str, Any] = {}
+        normalized_configuration["data_access_mode"] = configuration.get(
+            "data_access_mode", model.get("data_access_mode", "self_managed")
+        )
         if isinstance(definitions, list):
             normalized_configuration["parameter_definitions"] = [
                 _normalize_parameter_definition(definition)
@@ -1701,6 +1944,7 @@ def _run_spec_projection(spec: dict[str, Any]) -> dict[str, Any]:
         "entrypoint": spec.get("entrypoint"),
         "argv": spec.get("argv", []),
         "output_preview": spec.get("output_preview"),
+        "dataset_manifest": spec.get("dataset_manifest"),
     }
 
 
@@ -1720,6 +1964,8 @@ def _preview_projection(preview: dict[str, Any]) -> dict[str, Any]:
                 }
                 for stage in preview["stages"]
             ],
+            "dataset_manifest_preview": preview.get("dataset_manifest_preview"),
+            "dataset_manifest_path": preview.get("dataset_manifest_path"),
             "preflight": preview.get("preflight", []),
         }
     raw_preflight = preview.get("preflight", [])
@@ -1801,6 +2047,8 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "version_number": int(run.get("version_number", 1)),
         "version_date": run.get("version_date"),
         "version_label": run.get("version_label"),
+        "version_description": run.get("version_description"),
+        "dataset_snapshot": run.get("dataset_snapshot"),
         "status": run["status"],
         "state_revision": int(run.get("state_revision", 1)),
         "server_ref": run.get("server_ref", ""),
@@ -1882,19 +2130,33 @@ def _safe_event(raw_event: Any) -> dict[str, Any]:
     event_id = raw_event.get("event_id", raw_event.get("seq"))
     event_type = raw_event.get("type", raw_event.get("event_type"))
     run_ref = raw_event.get("run_ref", payload.get("run_ref"))
+    run_event_types = {"run.updated", "run.log.appended", "run.metric.appended"}
+    dataset_event_types = {
+        "dataset.transfer.updated",
+        "dataset.replica.ready",
+        "dataset.replica.removed",
+    }
     if (
         type(event_id) is not int
         or event_id < 1
-        or event_type
-        not in {"run.updated", "run.log.appended", "run.metric.appended"}
-        or not isinstance(run_ref, str)
+        or event_type not in run_event_types | dataset_event_types
+        or (event_type in run_event_types and not isinstance(run_ref, str))
     ):
         raise TypeError("training service returned an invalid event")
     event: dict[str, Any] = {
         "event_id": event_id,
         "type": event_type,
-        "run_ref": run_ref,
     }
+    if event_type in run_event_types:
+        event["run_ref"] = run_ref
+    else:
+        for field in ("transfer_ref", "replica_ref", "release_ref", "status"):
+            value = raw_event.get(field, payload.get(field))
+            if isinstance(value, str) and (
+                field == "status" or _SAFE_REF.fullmatch(value)
+            ):
+                event[field] = value
+        return event
     item_seq = raw_event.get(
         "item_seq",
         raw_event.get("resource_seq", payload.get("seq")),
@@ -1976,6 +2238,7 @@ def _run_projection(
     projected = dict(run)
     projected.pop("run_spec", None)
     projected.pop("version_model", None)
+    projected.pop("dataset_snapshot", None)
     stages = projected.get("stages")
     if isinstance(stages, list):
         projected["stages"] = [

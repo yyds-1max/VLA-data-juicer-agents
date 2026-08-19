@@ -1100,9 +1100,12 @@ class TrainingStore:
     def _insert_revision(self, db: sqlite3.Connection, model_id: int, revision_ref: str, revision: int, data: dict[str, Any], timestamp: str) -> None:
         template = data["launch_template"]
         db.execute(
-            """INSERT INTO model_revisions(revision_ref,model_id,revision_number,working_directory,entrypoint,fixed_argv_json,output_template,parameter_definitions_json,launch_template_json,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (revision_ref, model_id, revision, template["working_directory"], template["entrypoint"], canonical_json(template.get("fixed_argv", [])), f"{template['output_root'].rstrip('/')}/{{run_ref}}", canonical_json(data["parameter_definitions"]), canonical_json(template), timestamp),
+            """INSERT INTO model_revisions(revision_ref,model_id,revision_number,
+            working_directory,entrypoint,fixed_argv_json,output_template,
+            parameter_definitions_json,launch_template_json,created_at,
+            data_access_mode)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (revision_ref, model_id, revision, template["working_directory"], template["entrypoint"], canonical_json(template.get("fixed_argv", [])), f"{template['output_root'].rstrip('/')}/{{run_ref}}", canonical_json(data["parameter_definitions"]), canonical_json(template), timestamp, data.get("data_access_mode", "self_managed")),
         )
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -1121,6 +1124,7 @@ class TrainingStore:
             rev = db.execute("SELECT * FROM model_revisions WHERE model_id=? AND revision_number=?", (model["id"], number)).fetchone()
         result = self._safe_model(model)
         result["parameter_definitions"] = json.loads(rev["parameter_definitions_json"])
+        result["data_access_mode"] = rev["data_access_mode"]
         result["launch_template"] = json.loads(rev["launch_template_json"]) if include_private else {
             "domain": json.loads(rev["launch_template_json"])["domain"],
             "server_ref": json.loads(rev["launch_template_json"])["server_ref"],
@@ -1159,6 +1163,7 @@ class TrainingStore:
             rev["parameter_definitions_json"]
         )
         result["launch_template"] = json.loads(rev["launch_template_json"])
+        result["data_access_mode"] = rev["data_access_mode"]
         result["output_template"] = rev["output_template"]
         result["internal_revision"] = number
         result["revision_ref"] = rev["revision_ref"]
@@ -1293,6 +1298,10 @@ class TrainingStore:
                     "model_configuration_changed",
                     "The selected model configuration changed before the run was created.",
                 )
+            if data.get("dataset_splits") is not None:
+                self._validate_dataset_splits_in(
+                    db, data["server_ref"], data["dataset_splits"]
+                )
             port = (
                 self.find_available_port(data["server_ref"], db=db)
                 if data.get("requires_master_port", True)
@@ -1312,6 +1321,11 @@ class TrainingStore:
                 "version_number": version_number,
                 "version_date": version_date,
                 "version_label": f"v{version_number}-{version_date}",
+                "snapshot_ref": (
+                    new_ref("dataset_snapshot")
+                    if data.get("dataset_splits") is not None
+                    else None
+                ),
             }
             spec = run_spec_builder(run_ref, port, version_meta)
             stage_specs = list(spec.get("stages") or [])
@@ -1357,7 +1371,7 @@ class TrainingStore:
             db.execute(
                 """INSERT INTO model_versions(
                 version_ref,family_id,run_id,version_number,version_date,
-                version_label,created_at) VALUES(?,?,?,?,?,?,?)""",
+                version_label,created_at,description) VALUES(?,?,?,?,?,?,?,?)""",
                 (
                     version_meta["version_ref"],
                     model["family_id"],
@@ -1366,8 +1380,29 @@ class TrainingStore:
                     version_date,
                     version_meta["version_label"],
                     timestamp,
+                    data.get("version_description") or None,
                 ),
             )
+            if version_meta["snapshot_ref"] is not None:
+                manifest = spec.get("dataset_manifest")
+                if not isinstance(manifest, dict):
+                    raise TrainingConflictError(
+                        "dataset_manifest_missing",
+                        "Managed training data requires a dataset manifest.",
+                    )
+                manifest_json = canonical_json(manifest)
+                db.execute(
+                    """INSERT INTO dataset_snapshots(
+                    snapshot_ref,run_id,manifest_json,manifest_sha256,created_at)
+                    VALUES(?,?,?,?,?)""",
+                    (
+                        version_meta["snapshot_ref"],
+                        run_id,
+                        manifest_json,
+                        hashlib.sha256(manifest_json.encode()).hexdigest(),
+                        timestamp,
+                    ),
+                )
             for index, stage in enumerate(stage_specs, start=1):
                 private_spec = stage.get("private_spec") or {}
                 stage_ref = stage.get("stage_ref") or new_ref("stage")
@@ -1416,6 +1451,45 @@ class TrainingStore:
             )
             return self._get_run_in(db, run_ref)
 
+    def _validate_dataset_splits_in(
+        self,
+        db: sqlite3.Connection,
+        node_ref: str,
+        splits: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        entries = [*(splits.get("train") or []), *(splits.get("test") or [])]
+        if not entries:
+            raise TrainingConflictError(
+                "managed_dataset_training_set_required",
+                "Managed training data requires at least one ready training date.",
+            )
+        refs = [str(item["replica_ref"]) for item in entries]
+        placeholders = ",".join("?" for _ in refs)
+        rows = db.execute(
+            self._REPLICA_SELECT + f" WHERE replica.replica_ref IN ({placeholders})",
+            tuple(refs),
+        ).fetchall()
+        by_ref = {str(row["replica_ref"]): row for row in rows}
+        if set(by_ref) != set(refs):
+            raise TrainingConflictError(
+                "dataset_replica_changed",
+                "A selected dataset date changed before the run was created.",
+            )
+        for entry in entries:
+            row = by_ref[str(entry["replica_ref"])]
+            if (
+                row["status"] != "ready"
+                or row["node_ref_snapshot"] != node_ref
+                or row["release_ref"] != entry["release_ref"]
+                or row["dataset_date"] != entry["dataset_date"]
+                or row["local_root"] != entry["local_root"]
+                or row["inventory_sha256"] != entry["inventory_sha256"]
+            ):
+                raise TrainingConflictError(
+                    "dataset_replica_changed",
+                    "A selected dataset date changed before the run was created.",
+                )
+
     @staticmethod
     def _stage_name(number: int) -> str:
         names = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
@@ -1455,12 +1529,14 @@ class TrainingStore:
 
     _RUN_SELECT = """SELECT run.*,family.family_ref,family.name AS family_name,
       model.model_ref,version.version_ref,version.version_number,
-      version.version_date,version.version_label,
+      version.version_date,version.version_label,version.description AS version_description,
+      snapshot.snapshot_ref,snapshot.manifest_json AS dataset_manifest_json,
       version_artifact.path AS version_model_path
       FROM training_runs AS run
       JOIN registered_models AS model ON model.id=run.model_id
       JOIN model_families AS family ON family.id=model.family_id
       JOIN model_versions AS version ON version.run_id=run.id
+      LEFT JOIN dataset_snapshots AS snapshot ON snapshot.run_id=run.id
       LEFT JOIN training_artifacts AS version_artifact ON version_artifact.id=(
         SELECT latest_artifact.id FROM training_artifacts AS latest_artifact
         WHERE latest_artifact.version_id=version.id
@@ -1518,6 +1594,15 @@ class TrainingStore:
             "version_number": version_number,
             "version_date": row["version_date"],
             "version_label": row["version_label"],
+            "version_description": row["version_description"],
+            "dataset_snapshot": (
+                {
+                    "snapshot_ref": row["snapshot_ref"],
+                    "manifest": json.loads(row["dataset_manifest_json"]),
+                }
+                if row["snapshot_ref"] is not None
+                else None
+            ),
             # Kept temporarily for older clients while the public API migrates.
             "model_version_number": version_number,
             "model_display_name": f"{row['family_name']} {row['version_label']}",
@@ -2058,6 +2143,1142 @@ class TrainingStore:
             }
             for row in rows
         ]
+
+    def authenticate_worker(
+        self, node_ref: str, worker_token: str, worker_instance_id: str | None = None
+    ) -> dict[str, Any]:
+        digest = self._token_digest(worker_token)
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)
+            ).fetchone()
+        if (
+            row is None
+            or row["worker_token_sha256"] is None
+            or not secrets.compare_digest(str(row["worker_token_sha256"]), digest)
+            or (
+                worker_instance_id is not None
+                and row["worker_instance_id"] != worker_instance_id
+            )
+        ):
+            raise TrainingForbiddenError(
+                "worker_authentication_failed",
+                "The Training Worker credential is invalid.",
+            )
+        return self._safe_node(row)
+
+    def ensure_source_manifest_placeholder(self, release: dict[str, Any]) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            existing = db.execute(
+                "SELECT * FROM dataset_source_manifests WHERE release_ref=?",
+                (release["release_ref"],),
+            ).fetchone()
+            if existing is not None:
+                return self._safe_source_manifest(existing)
+            manifest_ref = new_ref("dataset_manifest")
+            cursor = db.execute(
+                """INSERT INTO dataset_source_manifests(
+                manifest_ref,release_ref,domain,dataset_date,status,created_at,updated_at)
+                VALUES(?,?,?,?,'preparing',?,?)""",
+                (
+                    manifest_ref,
+                    release["release_ref"],
+                    release.get("domain", "navigation"),
+                    release["dataset_date"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = db.execute("SELECT * FROM dataset_source_manifests WHERE id=?", (cursor.lastrowid,)).fetchone()
+            assert row is not None
+            return self._safe_source_manifest(row)
+
+    def complete_source_manifest(self, inventory: dict[str, Any]) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            existing = db.execute(
+                "SELECT * FROM dataset_source_manifests WHERE release_ref=?",
+                (inventory["release_ref"],),
+            ).fetchone()
+            if existing is None:
+                raise TrainingNotFoundError("dataset_source_manifest_not_found", "The dataset source manifest was not found.")
+            manifest_ref = str(existing["manifest_ref"])
+            files: list[dict[str, Any]] = []
+            for index, item in enumerate(inventory["files"], start=1):
+                files.append(
+                    {
+                        **item,
+                        "file_ref": "dataset_file_"
+                        + hashlib.sha256(
+                            f"{manifest_ref}\0{index}\0{item['relative_path']}".encode()
+                        ).hexdigest(),
+                    }
+                )
+            db.execute(
+                "DELETE FROM dataset_source_files WHERE manifest_id=?",
+                (existing["id"],),
+            )
+            db.executemany(
+                """INSERT INTO dataset_source_files(
+                manifest_id,file_ref,ordinal,relative_path,size_bytes,sha256)
+                VALUES(?,?,?,?,?,?)""",
+                (
+                    (
+                        existing["id"],
+                        item["file_ref"],
+                        ordinal,
+                        item["relative_path"],
+                        int(item["size_bytes"]),
+                        item["sha256"],
+                    )
+                    for ordinal, item in enumerate(files)
+                ),
+            )
+            db.execute(
+                """UPDATE dataset_source_manifests SET status='ready',source_root=?,
+                inventory_json=?,inventory_sha256=?,file_count=?,total_bytes=?,
+                error_code=NULL,error_message=NULL,preparation_lease_expires_at=NULL,
+                updated_at=? WHERE id=?""",
+                (
+                    inventory["source_root"],
+                    None,
+                    inventory["inventory_sha256"],
+                    len(files),
+                    inventory["total_bytes"],
+                    timestamp,
+                    existing["id"],
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM dataset_source_manifests WHERE id=?",
+                (existing["id"],),
+            ).fetchone()
+            assert row is not None
+            waiting = db.execute(
+                """SELECT transfer.* FROM dataset_transfers AS transfer
+                WHERE transfer.source_manifest_id=? AND transfer.status='preparing'
+                ORDER BY transfer.id""", (existing["id"],)
+            ).fetchall()
+            for transfer in waiting:
+                db.execute("UPDATE dataset_transfers SET status='queued',updated_at=? WHERE transfer_ref=?", (timestamp, transfer["transfer_ref"]))
+                node = db.execute("SELECT * FROM training_nodes WHERE id=?", (transfer["node_id"],)).fetchone()
+                if node is None:
+                    continue
+                self._insert_node_command(db, node, "transfer_dataset", {
+                    "transfer_ref": transfer["transfer_ref"],
+                    "release_ref": inventory["release_ref"],
+                    "dataset_date": inventory["dataset_date"],
+                    "destination_parent": transfer["target_parent_directory"],
+                }, timestamp)
+            return self._safe_source_manifest(row)
+
+    def claim_source_manifest_preparation(self) -> dict[str, Any] | None:
+        timestamp = now_iso()
+        lease_expires_at = (
+            datetime.now(UTC) + timedelta(minutes=30)
+        ).isoformat(timespec="milliseconds")
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT * FROM dataset_source_manifests
+                WHERE status='preparing'
+                   OR (status='building' AND preparation_lease_expires_at<?)
+                ORDER BY id LIMIT 1""",
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute("UPDATE dataset_source_manifests SET status='building',error_code=NULL,error_message=NULL,preparation_lease_expires_at=?,updated_at=? WHERE id=?", (lease_expires_at, timestamp, row["id"]))
+            return {"manifest_ref": row["manifest_ref"], "release_ref": row["release_ref"], "dataset_date": row["dataset_date"]}
+
+    def fail_source_manifest_preparation(self, manifest_ref: str, code: str, message: str) -> None:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute("SELECT id FROM dataset_source_manifests WHERE manifest_ref=?", (manifest_ref,)).fetchone()
+            if row is None:
+                return
+            db.execute("UPDATE dataset_source_manifests SET status='failed',error_code=?,error_message=?,preparation_lease_expires_at=NULL,updated_at=? WHERE id=?", (code, message, timestamp, row["id"]))
+            db.execute("UPDATE dataset_transfers SET status='failed',error_code=?,error_message=?,finished_at=?,updated_at=? WHERE source_manifest_id=? AND status='preparing'", (code, message, timestamp, timestamp, row["id"]))
+
+    @staticmethod
+    def _safe_source_manifest(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "manifest_ref": row["manifest_ref"],
+            "release_ref": row["release_ref"],
+            "dataset_date": row["dataset_date"],
+            "status": row["status"],
+            "inventory_sha256": row["inventory_sha256"],
+            "file_count": int(row["file_count"]),
+            "total_bytes": int(row["total_bytes"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "error_code": row["error_code"],
+            "error_message": row["error_message"],
+        }
+
+    def get_source_manifest_by_release(self, release_ref: str) -> dict[str, Any] | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM dataset_source_manifests WHERE release_ref=?",
+                (release_ref,),
+            ).fetchone()
+        return self._safe_source_manifest(row) if row is not None else None
+
+    def source_manifest_page(
+        self, release_ref: str, *, cursor: int, limit: int
+    ) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM dataset_source_manifests WHERE release_ref=?",
+                (release_ref,),
+            ).fetchone()
+            page_rows = (
+                db.execute(
+                    """SELECT file_ref,relative_path,size_bytes,sha256
+                    FROM dataset_source_files WHERE manifest_id=?
+                    ORDER BY ordinal LIMIT ? OFFSET ?""",
+                    (row["id"], limit, cursor),
+                ).fetchall()
+                if row is not None and row["status"] == "ready"
+                else []
+            )
+        if row is None:
+            raise TrainingNotFoundError(
+                "dataset_source_manifest_not_found",
+                "The dataset source manifest was not found.",
+            )
+        if row["status"] != "ready":
+            raise TrainingConflictError("dataset_source_manifest_not_ready", "The dataset source manifest is not ready.")
+        page = [
+            {
+                "file_ref": item["file_ref"],
+                "relative_path": item["relative_path"],
+                "size_bytes": int(item["size_bytes"]),
+                "sha256": item["sha256"],
+            }
+            for item in page_rows
+        ]
+        next_cursor = (
+            cursor + len(page)
+            if cursor + len(page) < int(row["file_count"])
+            else None
+        )
+        return {
+            **self._safe_source_manifest(row),
+            "files": page,
+            "next_cursor": next_cursor,
+        }
+
+    def get_source_file(self, file_ref: str) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT file.file_ref,file.relative_path,file.size_bytes,file.sha256,
+                source.release_ref,source.source_root
+                FROM dataset_source_files AS file
+                JOIN dataset_source_manifests AS source ON source.id=file.manifest_id
+                WHERE file.file_ref=? AND source.status='ready'""",
+                (file_ref,),
+            ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError(
+                "dataset_source_file_not_found",
+                "The released dataset file was not found.",
+            )
+        root = Path(str(row["source_root"]))
+        candidate = root / row["relative_path"]
+        try:
+            if candidate.is_symlink():
+                raise OSError("symbolic link")
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise TrainingNotFoundError(
+                "dataset_source_file_not_found",
+                "The released dataset file is no longer available.",
+            ) from exc
+        if root not in resolved.parents or not resolved.is_file():
+            raise TrainingForbiddenError(
+                "dataset_source_file_unsafe",
+                "The released dataset file is not safe to serve.",
+            )
+        return {
+            "file_ref": row["file_ref"],
+            "relative_path": row["relative_path"],
+            "size_bytes": int(row["size_bytes"]),
+            "sha256": row["sha256"],
+            "path": resolved,
+            "release_ref": row["release_ref"],
+        }
+
+    def authorize_source_download(self, node_ref: str, release_ref: str) -> None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1 FROM dataset_transfers AS transfer
+                JOIN dataset_source_manifests AS source
+                  ON source.id=transfer.source_manifest_id
+                WHERE transfer.node_ref_snapshot=? AND source.release_ref=?
+                  AND transfer.status IN (
+                    'preparing','queued','running','pause_requested','cancel_requested'
+                  ) LIMIT 1""",
+                (node_ref, release_ref),
+            ).fetchone()
+        if row is None:
+            raise TrainingForbiddenError(
+                "dataset_source_not_assigned_to_node",
+                "This released dataset was not assigned to the authenticated node.",
+            )
+
+    def create_directory_listing(
+        self, node_ref: str, path: str, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        command_ref = new_ref("listing")
+        with self.transaction() as db:
+            node = self._require_online_node_in(db, node_ref)
+            db.execute(
+                """INSERT INTO training_node_commands(
+                command_ref,node_id,node_ref_snapshot,kind,status,request_json,
+                created_at,updated_at) VALUES(?,?,?,'list_directories','queued',?,?,?)""",
+                (
+                    command_ref,
+                    node["id"],
+                    node_ref,
+                    canonical_json({"path": path}),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._audit(db, actor, "dataset.directory_listing_requested", command_ref, {}, timestamp)
+        return self.get_directory_listing(command_ref)
+
+    def get_directory_listing(self, listing_ref: str) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT * FROM training_node_commands
+                WHERE command_ref=? AND kind='list_directories'""",
+                (listing_ref,),
+            ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError(
+                "directory_listing_not_found", "The directory listing was not found."
+            )
+        result = json.loads(row["result_json"]) if row["result_json"] else {}
+        listing = result.get("listing") or {
+            key: result[key]
+            for key in ("path", "parent_path", "writable", "free_bytes", "directories")
+            if key in result
+        }
+        error = result.get("error") or {}
+        return {
+            "listing_ref": row["command_ref"],
+            "node_ref": row["node_ref_snapshot"],
+            "status": row["status"],
+            **listing,
+            "error_code": error.get("code"),
+            "error_message": error.get("message"),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_dataset_transfers(
+        self,
+        *,
+        node_ref: str,
+        source_manifests: list[dict[str, Any]],
+        target_parent_directory: str,
+        idempotency_key: str,
+        request_payload: dict[str, Any],
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        digest = payload_hash(request_payload)
+        timestamp = now_iso()
+        with self.transaction() as db:
+            replay = db.execute(
+                """SELECT payload_sha256,response_ref FROM training_idempotency
+                WHERE scope='dataset_transfer_batch' AND idempotency_key=?""",
+                (idempotency_key,),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload_sha256"] != digest:
+                    raise TrainingConflictError(
+                        "idempotency_conflict",
+                        "Idempotency-Key was already used for another request.",
+                    )
+                return [
+                    self._get_dataset_transfer_in(db, ref)
+                    for ref in json.loads(replay["response_ref"])
+                ]
+            node = self._require_online_node_in(db, node_ref)
+            active = db.execute(
+                """SELECT transfer_ref FROM dataset_transfers
+                WHERE node_id=? AND status IN ('preparing','queued','running','pause_requested','cancel_requested')
+                LIMIT 1""",
+                (node["id"],),
+            ).fetchone()
+            if active is not None:
+                raise TrainingConflictError(
+                    "dataset_transfer_node_busy",
+                    "This training node already has an active dataset transfer.",
+                    current={"transfer_ref": active["transfer_ref"]},
+                )
+            transfer_refs: list[str] = []
+            for manifest in source_manifests:
+                source = db.execute(
+                    "SELECT * FROM dataset_source_manifests WHERE manifest_ref=?",
+                    (manifest["manifest_ref"],),
+                ).fetchone()
+                assert source is not None
+                if source["status"] == "failed":
+                    db.execute(
+                        """UPDATE dataset_source_manifests SET status='preparing',
+                        error_code=NULL,error_message=NULL,
+                        preparation_lease_expires_at=NULL,updated_at=? WHERE id=?""",
+                        (timestamp, source["id"]),
+                    )
+                    source = db.execute(
+                        "SELECT * FROM dataset_source_manifests WHERE id=?",
+                        (source["id"],),
+                    ).fetchone()
+                    assert source is not None
+                replica = db.execute(
+                    """SELECT replica_ref FROM dataset_replicas
+                    WHERE node_id=? AND source_manifest_id=?""",
+                    (node["id"], source["id"]),
+                ).fetchone()
+                if replica is not None:
+                    raise TrainingConflictError(
+                        "dataset_replica_already_exists",
+                        "This released date already exists on the training node.",
+                        current={"replica_ref": replica["replica_ref"]},
+                    )
+                previous = db.execute(
+                    """SELECT transfer_ref,status FROM dataset_transfers
+                    WHERE node_id=? AND source_manifest_id=?
+                      AND status IN ('failed','paused')
+                    ORDER BY id DESC LIMIT 1""",
+                    (node["id"], source["id"]),
+                ).fetchone()
+                if previous is not None:
+                    raise TrainingConflictError(
+                        "dataset_transfer_retry_required",
+                        "This released date already has a paused or failed transfer. Continue that transfer instead.",
+                        current={
+                            "transfer_ref": previous["transfer_ref"],
+                            "status": previous["status"],
+                        },
+                    )
+                transfer_ref = new_ref("transfer")
+                suffix = str(source["release_ref"]).rsplit("_", 1)[-1][:8]
+                final_directory = (
+                    target_parent_directory.rstrip("/")
+                    + f"/datapilot-managed/{source['dataset_date']}-{suffix}"
+                )
+                initial_status = "queued" if source["status"] == "ready" else "preparing"
+                db.execute(
+                    """INSERT INTO dataset_transfers(
+                    transfer_ref,node_id,node_ref_snapshot,source_manifest_id,status,
+                    target_parent_directory,final_directory,error_code,error_message,
+                    created_at,updated_at,finished_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        transfer_ref,
+                        node["id"],
+                        node_ref,
+                        source["id"],
+                        initial_status,
+                        target_parent_directory,
+                        final_directory,
+                        None,
+                        None,
+                        timestamp,
+                        timestamp,
+                        None,
+                    ),
+                )
+                if initial_status == "queued":
+                    self._insert_node_command(
+                        db,
+                        node,
+                        "transfer_dataset",
+                        {
+                            "transfer_ref": transfer_ref,
+                            "release_ref": source["release_ref"],
+                            "dataset_date": source["dataset_date"],
+                            "destination_parent": target_parent_directory,
+                        },
+                        timestamp,
+                    )
+                transfer_refs.append(transfer_ref)
+                self._audit(db, actor, "dataset.transfer_requested", transfer_ref, {}, timestamp)
+            db.execute(
+                """INSERT INTO training_idempotency(
+                scope,idempotency_key,payload_sha256,response_ref,created_at)
+                VALUES('dataset_transfer_batch',?,?,?,?)""",
+                (idempotency_key, digest, canonical_json(transfer_refs), timestamp),
+            )
+            return [self._get_dataset_transfer_in(db, ref) for ref in transfer_refs]
+
+    def list_dataset_transfers(
+        self, *, node_ref: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if node_ref is not None:
+            clauses.append("transfer.node_ref_snapshot=?")
+            values.append(node_ref)
+        if status is not None:
+            clauses.append("transfer.status=?")
+            values.append(status)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connection() as db:
+            rows = db.execute(
+                self._TRANSFER_SELECT + f" {where} ORDER BY transfer.id DESC",
+                tuple(values),
+            ).fetchall()
+        return [self._safe_dataset_transfer(row) for row in rows]
+
+    def get_dataset_transfer(self, transfer_ref: str) -> dict[str, Any]:
+        with self.connection() as db:
+            return self._get_dataset_transfer_in(db, transfer_ref)
+
+    def _get_dataset_transfer_in(
+        self, db: sqlite3.Connection, transfer_ref: str
+    ) -> dict[str, Any]:
+        row = db.execute(
+            self._TRANSFER_SELECT + " WHERE transfer.transfer_ref=?", (transfer_ref,)
+        ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError(
+                "dataset_transfer_not_found", "The dataset transfer was not found."
+            )
+        return self._safe_dataset_transfer(row)
+
+    _TRANSFER_SELECT = """SELECT transfer.*,source.release_ref,source.dataset_date,
+      source.inventory_sha256,source.file_count,source.total_bytes
+      FROM dataset_transfers AS transfer
+      JOIN dataset_source_manifests AS source ON source.id=transfer.source_manifest_id"""
+
+    @staticmethod
+    def _safe_dataset_transfer(row: sqlite3.Row) -> dict[str, Any]:
+        total = int(row["total_bytes"])
+        transferred = min(int(row["bytes_transferred"]), total)
+        return {
+            "transfer_ref": row["transfer_ref"],
+            "node_ref": row["node_ref_snapshot"],
+            "release_ref": row["release_ref"],
+            "dataset_date": row["dataset_date"],
+            "status": row["status"],
+            "bytes_transferred": transferred,
+            "total_bytes": total,
+            "files_completed": int(row["files_completed"]),
+            "file_count": int(row["file_count"]),
+            "progress_percent": round(transferred * 100 / total, 2) if total else (100.0 if row["status"] == "succeeded" else 0.0),
+            "target_parent_directory": row["target_parent_directory"],
+            "final_directory": row["final_directory"],
+            "inventory_sha256": row["inventory_sha256"],
+            "error_code": row["error_code"],
+            "error_message": row["error_message"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
+
+    def pause_dataset_transfer(
+        self, transfer_ref: str, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            transfer = db.execute(
+                self._TRANSFER_SELECT + " WHERE transfer.transfer_ref=?",
+                (transfer_ref,),
+            ).fetchone()
+            if transfer is None:
+                raise TrainingNotFoundError(
+                    "dataset_transfer_not_found", "The dataset transfer was not found."
+                )
+            if transfer["status"] not in {"preparing", "queued", "running"}:
+                raise TrainingConflictError(
+                    "dataset_transfer_not_pausable",
+                    "Only a preparing, queued, or running transfer can be paused.",
+                    current=self._safe_dataset_transfer(transfer),
+                )
+            command_running = self._transfer_command_running(db, transfer_ref)
+            next_status = "pause_requested" if transfer["status"] == "running" or command_running else "paused"
+            db.execute(
+                """UPDATE dataset_transfers SET status=?,updated_at=?,
+                finished_at=CASE WHEN ?='paused' THEN ? ELSE finished_at END
+                WHERE id=?""",
+                (next_status, timestamp, next_status, timestamp, transfer["id"]),
+            )
+            if transfer["status"] == "queued" and not command_running:
+                self._cancel_queued_transfer_commands(db, transfer_ref, timestamp)
+            if next_status == "pause_requested":
+                node = self._require_online_node_in(db, transfer["node_ref_snapshot"])
+                self._insert_node_command(
+                    db,
+                    node,
+                    "cancel_dataset_transfer",
+                    self._dataset_stop_command_payload(transfer, action="pause"),
+                    timestamp,
+                )
+            self._event(db, "dataset.transfer.updated", None, {"transfer_ref": transfer_ref, "status": next_status}, timestamp)
+            self._audit(db, actor, "dataset.transfer_pause_requested", transfer_ref, {}, timestamp)
+            return self._get_dataset_transfer_in(db, transfer_ref)
+
+    def cancel_dataset_transfer(
+        self, transfer_ref: str, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            transfer = db.execute(
+                self._TRANSFER_SELECT + " WHERE transfer.transfer_ref=?",
+                (transfer_ref,),
+            ).fetchone()
+            if transfer is None:
+                raise TrainingNotFoundError(
+                    "dataset_transfer_not_found", "The dataset transfer was not found."
+                )
+            if transfer["status"] not in {"preparing", "queued", "running", "paused", "failed"}:
+                raise TrainingConflictError(
+                    "dataset_transfer_not_cancellable",
+                    "Only an unfinished, paused, or failed transfer can be cancelled.",
+                    current=self._safe_dataset_transfer(transfer),
+                )
+            command_running = self._transfer_command_running(db, transfer_ref)
+            next_status = "cancelled" if transfer["status"] == "preparing" or (transfer["status"] == "queued" and not command_running) else "cancel_requested"
+            db.execute(
+                """UPDATE dataset_transfers SET status=?,updated_at=?,
+                finished_at=CASE WHEN ?='cancelled' THEN ? ELSE finished_at END
+                WHERE id=?""",
+                (next_status, timestamp, next_status, timestamp, transfer["id"]),
+            )
+            if transfer["status"] == "queued" and not command_running:
+                self._cancel_queued_transfer_commands(db, transfer_ref, timestamp)
+            if next_status == "cancel_requested":
+                node = self._require_online_node_in(db, transfer["node_ref_snapshot"])
+                self._insert_node_command(
+                    db,
+                    node,
+                    "cancel_dataset_transfer",
+                    self._dataset_stop_command_payload(transfer, action="cancel"),
+                    timestamp,
+                )
+            self._event(db, "dataset.transfer.updated", None, {"transfer_ref": transfer_ref, "status": next_status}, timestamp)
+            self._audit(db, actor, "dataset.transfer_cancel_requested", transfer_ref, {}, timestamp)
+            return self._get_dataset_transfer_in(db, transfer_ref)
+
+    @staticmethod
+    def _transfer_command_running(db: sqlite3.Connection, transfer_ref: str) -> bool:
+        rows = db.execute(
+            """SELECT request_json FROM training_node_commands
+            WHERE kind='transfer_dataset' AND status='running'"""
+        ).fetchall()
+        return any(
+            json.loads(command["request_json"]).get("transfer_ref") == transfer_ref
+            for command in rows
+        )
+
+    @staticmethod
+    def _dataset_stop_command_payload(transfer: sqlite3.Row, *, action: str) -> dict[str, Any]:
+        return {
+            "transfer_ref": transfer["transfer_ref"],
+            "release_ref": transfer["release_ref"],
+            "dataset_date": transfer["dataset_date"],
+            "destination_parent": transfer["target_parent_directory"],
+            "action": action,
+        }
+
+    @staticmethod
+    def _cancel_queued_transfer_commands(
+        db: sqlite3.Connection, transfer_ref: str, timestamp: str
+    ) -> None:
+        rows = db.execute(
+            """SELECT id,request_json FROM training_node_commands
+            WHERE kind='transfer_dataset' AND status='queued'"""
+        ).fetchall()
+        for command in rows:
+            if json.loads(command["request_json"]).get("transfer_ref") != transfer_ref:
+                continue
+            result = canonical_json({
+                "status": "cancelled",
+                "transfer_ref": transfer_ref,
+                "reason": "transfer_stopped_before_start",
+            })
+            db.execute(
+                """UPDATE training_node_commands SET status='cancelled',result_json=?,
+                finished_at=?,updated_at=? WHERE id=?""",
+                (result, timestamp, timestamp, command["id"]),
+            )
+
+    def retry_dataset_transfer(
+        self, transfer_ref: str, idempotency_key: str, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        digest = payload_hash({"transfer_ref": transfer_ref})
+        with self.transaction() as db:
+            replay = db.execute(
+                """SELECT payload_sha256,response_ref FROM training_idempotency
+                WHERE scope='dataset_transfer_retry' AND idempotency_key=?""",
+                (idempotency_key,),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload_sha256"] != digest or replay["response_ref"] != transfer_ref:
+                    raise TrainingConflictError("idempotency_conflict", "Idempotency-Key was already used for another request.")
+                return self._get_dataset_transfer_in(db, transfer_ref)
+            transfer = db.execute(
+                self._TRANSFER_SELECT + " WHERE transfer.transfer_ref=?", (transfer_ref,)
+            ).fetchone()
+            if transfer is None:
+                raise TrainingNotFoundError("dataset_transfer_not_found", "The dataset transfer was not found.")
+            if transfer["status"] not in {"failed", "paused"}:
+                raise TrainingConflictError("dataset_transfer_not_retryable", "Only failed or paused transfers can be continued.")
+            node = self._require_online_node_in(db, transfer["node_ref_snapshot"])
+            source = db.execute("SELECT * FROM dataset_source_manifests WHERE id=?", (transfer["source_manifest_id"],)).fetchone()
+            assert source is not None
+            next_status = "queued" if source["status"] == "ready" else "preparing"
+            db.execute(
+                """UPDATE dataset_transfers SET status=?,error_code=NULL,
+                error_message=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?""",
+                (next_status, timestamp, transfer["id"]),
+            )
+            if next_status == "preparing":
+                db.execute("UPDATE dataset_source_manifests SET status='preparing',error_code=NULL,error_message=NULL,preparation_lease_expires_at=NULL,updated_at=? WHERE id=?", (timestamp, source["id"]))
+            else:
+                self._insert_node_command(db, node, "transfer_dataset", {
+                    "transfer_ref": transfer_ref,
+                    "release_ref": transfer["release_ref"],
+                    "dataset_date": transfer["dataset_date"],
+                    "destination_parent": transfer["target_parent_directory"],
+                }, timestamp)
+            db.execute(
+                """INSERT INTO training_idempotency(scope,idempotency_key,payload_sha256,response_ref,created_at)
+                VALUES('dataset_transfer_retry',?,?,?,?)""",
+                (idempotency_key, digest, transfer_ref, timestamp),
+            )
+            self._audit(db, actor, "dataset.transfer_retried", transfer_ref, {}, timestamp)
+            return self._get_dataset_transfer_in(db, transfer_ref)
+
+    def list_dataset_replicas(self, node_ref: str) -> list[dict[str, Any]]:
+        with self.connection() as db:
+            rows = db.execute(
+                self._REPLICA_SELECT
+                + " WHERE replica.node_ref_snapshot=? AND replica.status='ready' ORDER BY source.dataset_date DESC",
+                (node_ref,),
+            ).fetchall()
+        return [self._safe_dataset_replica(row) for row in rows]
+
+    def resolve_dataset_selection(
+        self,
+        *,
+        node_ref: str,
+        train_replica_refs: list[str],
+        test_replica_refs: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        train_set = set(train_replica_refs)
+        test_set = set(test_replica_refs)
+        if train_set & test_set:
+            raise TrainingConflictError(
+                "dataset_split_overlap",
+                "A released date cannot be used in both the training and test sets.",
+            )
+        requested = [*train_replica_refs, *test_replica_refs]
+        if not requested:
+            return {"train": [], "test": []}
+        placeholders = ",".join("?" for _ in requested)
+        with self.connection() as db:
+            rows = db.execute(
+                self._REPLICA_SELECT
+                + f" WHERE replica.replica_ref IN ({placeholders})",
+                tuple(requested),
+            ).fetchall()
+        by_ref = {str(row["replica_ref"]): row for row in rows}
+        if set(by_ref) != set(requested):
+            raise TrainingNotFoundError(
+                "dataset_replica_not_found",
+                "One or more selected dataset dates were not found.",
+            )
+        for row in rows:
+            if row["node_ref_snapshot"] != node_ref or row["status"] != "ready":
+                raise TrainingConflictError(
+                    "dataset_replica_unavailable",
+                    "Every selected dataset date must be ready on the model's training node.",
+                )
+
+        def entry(ref: str) -> dict[str, Any]:
+            row = by_ref[ref]
+            return {
+                "dataset_date": row["dataset_date"],
+                "release_ref": row["release_ref"],
+                "replica_ref": row["replica_ref"],
+                "local_root": row["local_root"],
+                "inventory_sha256": row["inventory_sha256"],
+            }
+
+        return {
+            "train": [entry(ref) for ref in train_replica_refs],
+            "test": [entry(ref) for ref in test_replica_refs],
+        }
+
+    def get_dataset_replica(self, replica_ref: str) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                self._REPLICA_SELECT + " WHERE replica.replica_ref=?", (replica_ref,)
+            ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError("dataset_replica_not_found", "The dataset replica was not found.")
+        return self._safe_dataset_replica(row)
+
+    _REPLICA_SELECT = """SELECT replica.*,source.release_ref,source.dataset_date
+      FROM dataset_replicas AS replica
+      JOIN dataset_source_manifests AS source ON source.id=replica.source_manifest_id"""
+
+    @staticmethod
+    def _safe_dataset_replica(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "replica_ref": row["replica_ref"],
+            "node_ref": row["node_ref_snapshot"],
+            "release_ref": row["release_ref"],
+            "dataset_date": row["dataset_date"],
+            "status": row["status"],
+            "local_root": row["local_root"],
+            "inventory_sha256": row["inventory_sha256"],
+            "file_count": int(row["file_count"]),
+            "total_bytes": int(row["total_bytes"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def remove_dataset_replica(self, replica_ref: str, actor: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.transaction() as db:
+            row = db.execute(
+                self._REPLICA_SELECT + " WHERE replica.replica_ref=?", (replica_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError("dataset_replica_not_found", "The dataset replica was not found.")
+            if row["status"] != "ready":
+                raise TrainingConflictError("dataset_replica_not_removable", "The dataset replica is already being removed.")
+            node = self._require_online_node_in(db, row["node_ref_snapshot"])
+            db.execute("UPDATE dataset_replicas SET status='removing',updated_at=? WHERE id=?", (timestamp, row["id"]))
+            self._insert_node_command(db, node, "remove_dataset_replica", {
+                "replica_ref": replica_ref,
+                "local_root": row["local_root"],
+                "release_ref": row["release_ref"],
+                "inventory_sha256": row["inventory_sha256"],
+            }, timestamp)
+            self._audit(db, actor, "dataset.replica_remove_requested", replica_ref, {}, timestamp)
+            current = db.execute(self._REPLICA_SELECT + " WHERE replica.id=?", (row["id"],)).fetchone()
+            assert current is not None
+            return self._safe_dataset_replica(current)
+
+    def claim_node_commands(
+        self, node_ref: str, worker_token: str, worker_instance_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        worker_token_digest = self._token_digest(worker_token)
+        timestamp = now_iso()
+        with self.transaction() as db:
+            node = db.execute("SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)).fetchone()
+            if (
+                node is None
+                or node["worker_token_sha256"] is None
+                or not secrets.compare_digest(
+                    str(node["worker_token_sha256"]), worker_token_digest
+                )
+                or node["worker_instance_id"] != worker_instance_id
+            ):
+                raise TrainingForbiddenError(
+                    "worker_authentication_failed",
+                    "The Training Worker credential is invalid.",
+                )
+            stale = db.execute(
+                """SELECT * FROM training_node_commands
+                WHERE node_id=? AND status='running' AND lease_expires_at<?
+                ORDER BY id""",
+                (node["id"], timestamp),
+            ).fetchall()
+            for command in stale:
+                if command["kind"] == "transfer_dataset":
+                    request = json.loads(command["request_json"])
+                    transfer = db.execute(
+                        "SELECT status FROM dataset_transfers WHERE transfer_ref=?",
+                        (request["transfer_ref"],),
+                    ).fetchone()
+                    if transfer is None or transfer["status"] not in {"queued", "running"}:
+                        self._settle_abandoned_transfer_command(
+                            db, command, request["transfer_ref"], transfer, timestamp
+                        )
+                        continue
+                db.execute(
+                    """UPDATE training_node_commands SET status='queued',worker_instance_id=NULL,
+                    claim_token_sha256=NULL,lease_expires_at=NULL,started_at=NULL,
+                    updated_at=? WHERE id=?""",
+                    (timestamp, command["id"]),
+                )
+            rows = db.execute(
+                """SELECT * FROM training_node_commands AS candidate
+                WHERE candidate.node_id=? AND candidate.status='queued'
+                AND (
+                  candidate.kind!='transfer_dataset'
+                  OR NOT EXISTS (
+                    SELECT 1 FROM training_node_commands AS active
+                    WHERE active.node_id=candidate.node_id
+                      AND active.kind='transfer_dataset'
+                      AND active.status='running'
+                  )
+                )
+                ORDER BY id LIMIT ?""", (node["id"], limit)
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            claimed_transfer = False
+            for row in rows:
+                if row["kind"] == "transfer_dataset" and claimed_transfer:
+                    continue
+                if row["kind"] == "transfer_dataset":
+                    request = json.loads(row["request_json"])
+                    transfer = db.execute(
+                        "SELECT status FROM dataset_transfers WHERE transfer_ref=?",
+                        (request["transfer_ref"],),
+                    ).fetchone()
+                    if transfer is None or transfer["status"] not in {"queued", "running"}:
+                        self._settle_abandoned_transfer_command(
+                            db, row, request["transfer_ref"], transfer, timestamp
+                        )
+                        continue
+                if db.execute(
+                    """UPDATE training_node_commands SET status='running',worker_instance_id=?,
+                    claim_token_sha256=?,lease_expires_at=?,
+                    started_at=COALESCE(started_at,?),updated_at=?
+                    WHERE id=? AND status='queued'""",
+                    (
+                        worker_instance_id,
+                        self._token_digest(claim_token := "claim_" + secrets.token_urlsafe(32)),
+                        (
+                            datetime.now(UTC)
+                            + timedelta(
+                                minutes=30
+                                if row["kind"] == "transfer_dataset"
+                                else 1.5
+                            )
+                        ).isoformat(timespec="milliseconds"),
+                        timestamp,
+                        timestamp,
+                        row["id"],
+                    ),
+                ).rowcount:
+                    claimed.append(
+                        {
+                            "command_ref": row["command_ref"],
+                            "claim_token": claim_token,
+                            "kind": row["kind"],
+                            "payload": json.loads(row["request_json"]),
+                        }
+                    )
+                    claimed_transfer = claimed_transfer or row["kind"] == "transfer_dataset"
+            return claimed
+
+    def _settle_abandoned_transfer_command(
+        self,
+        db: sqlite3.Connection,
+        command: sqlite3.Row,
+        transfer_ref: str,
+        transfer: sqlite3.Row | None,
+        timestamp: str,
+    ) -> None:
+        result = {
+            "status": "cancelled",
+            "transfer_ref": transfer_ref,
+            "reason": "transfer_no_longer_active",
+        }
+        db.execute(
+            """UPDATE training_node_commands SET status='cancelled',result_json=?,
+            worker_instance_id=NULL,claim_token_sha256=NULL,
+            lease_expires_at=NULL,finished_at=?,updated_at=?
+            WHERE id=?""",
+            (canonical_json(result), timestamp, timestamp, command["id"]),
+        )
+        if transfer is not None and transfer["status"] in {"pause_requested", "cancel_requested"}:
+            if transfer["status"] == "pause_requested":
+                terminal_status = "paused"
+                error_code = None
+                error_message = None
+            else:
+                terminal_status = "failed"
+                error_code = "dataset_partial_cleanup_unconfirmed"
+                error_message = "The Worker could not confirm removal of the partial dataset."
+            db.execute(
+                """UPDATE dataset_transfers SET status=?,error_code=?,error_message=?,
+                finished_at=?,updated_at=? WHERE transfer_ref=?""",
+                (terminal_status, error_code, error_message, timestamp, timestamp, transfer_ref),
+            )
+            self._event(
+                db,
+                "dataset.transfer.updated",
+                None,
+                {"transfer_ref": transfer_ref, "status": terminal_status},
+                timestamp,
+            )
+
+    def finish_node_command(
+        self,
+        node_ref: str,
+        worker_token: str,
+        command_ref: str,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        worker_instance_id = data["worker_instance_id"]
+        worker_token_digest = self._token_digest(worker_token)
+        claim_token_digest = self._token_digest(data["claim_token"])
+        timestamp = now_iso()
+        with self.transaction() as db:
+            command = db.execute(
+                """SELECT command.*,node.node_ref,
+                node.worker_token_sha256 AS current_worker_token_sha256,
+                node.worker_instance_id AS current_worker_instance_id
+                FROM training_node_commands AS command
+                LEFT JOIN training_nodes AS node ON node.id=command.node_id
+                WHERE command.command_ref=? AND command.node_ref_snapshot=?""",
+                (command_ref, node_ref),
+            ).fetchone()
+            if command is None:
+                raise TrainingNotFoundError("training_node_command_not_found", "The Worker command was not found.")
+            if (
+                command["current_worker_token_sha256"] is None
+                or not secrets.compare_digest(
+                    str(command["current_worker_token_sha256"]),
+                    worker_token_digest,
+                )
+                or command["current_worker_instance_id"] != worker_instance_id
+            ):
+                raise TrainingForbiddenError(
+                    "worker_authentication_failed",
+                    "The Training Worker credential is invalid.",
+                )
+            if (
+                command["status"] != "running"
+                or command["worker_instance_id"] != worker_instance_id
+                or command["claim_token_sha256"] is None
+                or not secrets.compare_digest(
+                    str(command["claim_token_sha256"]), claim_token_digest
+                )
+            ):
+                raise TrainingConflictError(
+                    "training_node_command_claim_stale",
+                    "This Worker command claim is no longer active.",
+                )
+            result_status = data["status"]
+            if result_status == "running":
+                self._update_running_command(db, command, data, timestamp)
+                return {"command_ref": command_ref, "status": "running", "accepted_at": timestamp}
+            final = "succeeded" if result_status == "succeeded" else "cancelled" if result_status in {"paused", "cancelled"} else "failed"
+            db.execute(
+                """UPDATE training_node_commands SET status=?,result_json=?,lease_expires_at=NULL,
+                claim_token_sha256=NULL,finished_at=?,updated_at=? WHERE id=?""",
+                (final, canonical_json(data), timestamp, timestamp, command["id"]),
+            )
+            self._apply_terminal_command_result(db, command, data, final, timestamp)
+            return {"command_ref": command_ref, "status": final, "accepted_at": timestamp}
+
+    def _update_running_command(self, db: sqlite3.Connection, command: sqlite3.Row, data: dict[str, Any], timestamp: str) -> None:
+        expiry = (
+            datetime.now(UTC)
+            + timedelta(minutes=30 if command["kind"] == "transfer_dataset" else 1.5)
+        ).isoformat(timespec="milliseconds")
+        db.execute("UPDATE training_node_commands SET result_json=?,lease_expires_at=?,updated_at=? WHERE id=?", (canonical_json(data), expiry, timestamp, command["id"]))
+        if command["kind"] == "transfer_dataset":
+            progress = data.get("progress") or {}
+            request = json.loads(command["request_json"])
+            db.execute(
+                """UPDATE dataset_transfers SET
+                status=CASE WHEN status IN ('pause_requested','cancel_requested') THEN status ELSE 'running' END,
+                bytes_transferred=?,
+                files_completed=?,started_at=COALESCE(started_at,?),updated_at=?
+                WHERE transfer_ref=? AND status IN ('queued','running','pause_requested','cancel_requested')""",
+                (int(progress.get("bytes_transferred", 0)), int(progress.get("files_completed", 0)), timestamp, timestamp, request["transfer_ref"]),
+            )
+            current = db.execute(
+                "SELECT status FROM dataset_transfers WHERE transfer_ref=?",
+                (request["transfer_ref"],),
+            ).fetchone()
+            if current is not None:
+                self._event(
+                    db,
+                    "dataset.transfer.updated",
+                    None,
+                    {
+                        "transfer_ref": request["transfer_ref"],
+                        "status": current["status"],
+                    },
+                    timestamp,
+                )
+
+    def _apply_terminal_command_result(self, db: sqlite3.Connection, command: sqlite3.Row, data: dict[str, Any], final: str, timestamp: str) -> None:
+        request = json.loads(command["request_json"])
+        error = data.get("error") or {}
+        if command["kind"] == "transfer_dataset":
+            transfer = db.execute(
+                self._TRANSFER_SELECT + " WHERE transfer.transfer_ref=?", (request["transfer_ref"],)
+            ).fetchone()
+            if transfer is None:
+                return
+            result_status = data.get("status")
+            transfer_status = "succeeded" if final == "succeeded" else result_status if result_status in {"paused", "cancelled"} else "failed"
+            progress = data.get("progress") or {}
+            db.execute(
+                """UPDATE dataset_transfers SET status=?,bytes_transferred=?,files_completed=?,
+                error_code=?,error_message=?,finished_at=?,updated_at=? WHERE id=?""",
+                (transfer_status, int(progress.get("bytes_transferred", transfer["total_bytes"] if final == "succeeded" else transfer["bytes_transferred"])), int(progress.get("files_completed", transfer["file_count"] if final == "succeeded" else transfer["files_completed"])), error.get("code"), error.get("message"), timestamp, timestamp, transfer["id"]),
+            )
+            if final == "succeeded":
+                replica_data = data.get("replica") or {}
+                replica_ref = new_ref("replica")
+                db.execute(
+                    """INSERT INTO dataset_replicas(replica_ref,node_id,node_ref_snapshot,
+                    source_manifest_id,status,local_root,inventory_sha256,file_count,total_bytes,
+                    created_at,updated_at) VALUES(?,?,?,?,'ready',?,?,?,?,?,?)
+                    ON CONFLICT(node_id,source_manifest_id) DO UPDATE SET status='ready',
+                    local_root=excluded.local_root,inventory_sha256=excluded.inventory_sha256,
+                    file_count=excluded.file_count,total_bytes=excluded.total_bytes,updated_at=excluded.updated_at""",
+                    (replica_ref, transfer["node_id"], transfer["node_ref_snapshot"], transfer["source_manifest_id"], replica_data.get("local_root", transfer["final_directory"]), replica_data.get("inventory_sha256", transfer["inventory_sha256"]), int(replica_data.get("file_count", transfer["file_count"])), int(replica_data.get("total_bytes", transfer["total_bytes"])), timestamp, timestamp),
+                )
+                self._event(db, "dataset.replica.ready", None, {"transfer_ref": request["transfer_ref"], "release_ref": transfer["release_ref"]}, timestamp)
+            self._event(db, "dataset.transfer.updated", None, {"transfer_ref": request["transfer_ref"], "status": transfer_status}, timestamp)
+        elif command["kind"] == "remove_dataset_replica":
+            if final == "succeeded":
+                db.execute("DELETE FROM dataset_replicas WHERE replica_ref=?", (request["replica_ref"],))
+                self._event(db, "dataset.replica.removed", None, {"replica_ref": request["replica_ref"]}, timestamp)
+            else:
+                db.execute("UPDATE dataset_replicas SET status='ready',updated_at=? WHERE replica_ref=?", (timestamp, request["replica_ref"]))
+        elif command["kind"] == "cancel_dataset_transfer" and final == "succeeded":
+            action = request.get("action", "pause")
+            requested_status = "cancel_requested" if action == "cancel" else "pause_requested"
+            terminal_status = "cancelled" if action == "cancel" else "paused"
+            updated = db.execute(
+                """UPDATE dataset_transfers SET status=?,finished_at=?,updated_at=?
+                WHERE transfer_ref=? AND status=?""",
+                (terminal_status, timestamp, timestamp, request["transfer_ref"], requested_status),
+            ).rowcount
+            if updated:
+                self._event(db, "dataset.transfer.updated", None, {"transfer_ref": request["transfer_ref"], "status": terminal_status}, timestamp)
+
+    @staticmethod
+    def _insert_node_command(db: sqlite3.Connection, node: sqlite3.Row, kind: str, request: dict[str, Any], timestamp: str) -> str:
+        command_ref = new_ref("command")
+        db.execute(
+            """INSERT INTO training_node_commands(command_ref,node_id,node_ref_snapshot,
+            kind,status,request_json,created_at,updated_at)
+            VALUES(?,?,?,?,'queued',?,?,?)""",
+            (command_ref, node["id"], node["node_ref"], kind, canonical_json(request), timestamp, timestamp),
+        )
+        return command_ref
+
+    @staticmethod
+    def _require_online_node_in(db: sqlite3.Connection, node_ref: str) -> sqlite3.Row:
+        node = db.execute("SELECT * FROM training_nodes WHERE node_ref=?", (node_ref,)).fetchone()
+        if node is None:
+            raise TrainingNotFoundError("training_node_not_found", "Training node was not found.")
+        if node["status"] not in {TrainingNodeStatus.ONLINE.value, TrainingNodeStatus.DEGRADED.value}:
+            raise TrainingConflictError("training_node_unavailable", "The Training Worker node must be online.")
+        return node
 
     def active_gpu_leases(self) -> dict[str, str]:
         with self.connection() as db:

@@ -147,14 +147,16 @@ token 失效，中心数据库只保存 SHA-256 摘要。Worker 首次注册换�
 同样只在中心保存摘要；节点停用时立即吊销。
 
 `datapilot-training-worker` 是独立进程。v1 采集 CPU、内存、磁盘和 GPU 状态并上报
-心跳，并可在心跳响应中领取上述固定类型的模型配置只读验证；它不能领取任意命令，
-也不能启动、停止、占用或检查同事的训练进程。GPU fallback
+心跳，并可领取模型配置只读验证、目录浏览、托管数据传输、暂停或取消传输和移除托管副本
+这些固定类型的命令；它不能领取任意 Shell 或命令文本，也不能启动、停止、占用或检查
+同事的训练进程。GPU fallback
 只使用固定 `nvidia-smi` argv、五秒超时和 `shell=False`。节点本地保存私有 identity、
 权限为 `0600` 的 Worker token，以及用于重启后保守对账的 SQLite ledger；PID 必须与
 进程启动标记和 argv digest 同时匹配，无法确认时标为 unknown，绝不发送信号。
 
-Worker HTTP 客户端只允许固定中心 origin 上的 enroll、heartbeat 和验证结果回传端点，
-拒绝重定向并限制超时和响应大小。部署使用系统级 systemd 自启动服务，但 Worker 与
+Worker HTTP 客户端只允许固定中心 origin 上的 enroll、heartbeat、命令长轮询、命令
+结果回传和托管数据分块下载端点，拒绝重定向并限制超时和响应大小。部署使用系统级
+systemd 自启动服务，但 Worker 与
 未来训练都沿用 SSH 实际登录身份；平台不创建另一套 Linux 账号。systemd 仍启用
 `NoNewPrivileges` 等不妨碍工程、Home、Conda 和输出目录访问的基础保护。
 中心公网 Nginx 的最小端点白名单模板位于
@@ -236,3 +238,64 @@ Python 3、安装磁盘、NVIDIA 工具及 root/sudo 能力；未安装 NVIDIA �
 即使模型工程允许测试修改，Worker 也只安装到上述独立系统目录。除管理员主动发起的
 模型配置只读验证外，当前部署和 Worker 不读取模型工程；任何情况下都不会修改模型工程、
 权重、checkpoint 或训练输出。真实 Runner 仍保持禁用。
+
+## 托管训练数据与 manifest 契约
+
+模型训练模块的“训练数据”页面复用 Annotation 的已验证轨迹投影能力，同时列出整个日期已经
+满足训练发布条件的待发布和已发布数据。用户先按日期进入只读检查，再按 Clip/Segment 浏览
+相机投影和 Gridmap。页面只接受 `approved + published` 的 Fix revision，并校验展示证据与
+兼容发布记录绑定的 revision 一致；原始 `*_trajectory.json`、仍在修正中的草稿以及发布失败
+的 Fix 不会进入该页面。页面标识的权威业务产物为 `*_trajectory_fix_five.json`。
+
+平台上线前由旧流程完成的修正结果通过同一个 Review 读接口展示，内部来源标记为
+`historical_import`，但不会伪造曾在平台执行过的 Annotation Job 或人工操作记录。历史结果
+只读解析已有 `*_trajectory_fix_five.json`、`fisheye_front`、`rout_plot_v2` 和 `grid_map`；
+缺失的单帧证据仅在对应画面提示不可用，不会把历史记录变成可编辑任务。
+
+日期发布按钮仅出现在检查详情中。发布继续使用 Annotation Store 的日期级原子发布契约，
+不会复制文件或启动训练；发布成功后，该日期才会进入下述训练数据传输流程。
+
+Training 将中心已发布的 `finish_data/<日期>` 视为不透明文件。平台只负责把完整发布日期
+复制到模型绑定的训练节点、记录节点副本、按完整日期划分训练集和可选测试集，并向模型
+工程提供一个统一 manifest；它不解释或生成模型专用的 instruction、answer、trajectory、
+mask 或样本索引。
+
+模型族的数据接入方式分为：
+
+- `self_managed`：模型工程和普通训练参数自行管理所有数据路径；
+- `datapilot_managed`：平台负责日期传输、划分，并保留 `--dataset_manifest` 参数。
+
+`data_mixture` 等模型参数仍是普通超参数，不承担节点路径职责。每个节点对同一发布日最多
+保留一份有效托管副本；换盘时应先移除原副本再重新传输。移除 Worker 或删除节点记录不会
+自动删除已传输数据。
+
+Worker 通过经过认证的出站 HTTPS 连接主动拉取数据，日常传输不使用 SSH。用户通过远程
+目录浏览器选择一个 Worker 账号可进入且可写的父目录，Worker 最终创建：
+
+```text
+<选择目录>/datapilot-managed/<日期>-<release_ref短标识>/
+```
+
+中心异步为首次传输建立逐文件大小和 SHA-256 清单。Worker 分块下载到隐藏临时目录，支持
+从已验证的部分文件继续，全部文件校验通过、写入平台 marker 后才原子发布为可选副本。
+移除操作只能删除数据库登记路径且 marker 与 release 和清单摘要完全匹配的目录。
+
+“暂停传输”会停止下载并保留隐藏的 `.part` 临时目录，用户之后点击“继续传输”时从已校验
+内容断点续传；“取消本次传输”会要求 Worker 删除该临时目录，只有清理成功后任务才进入
+`cancelled`。清理失败会保留失败状态供用户处理，不能伪装为已取消。传输浮窗在进行中、
+暂停、失败或取消清理中只能收起为常驻胶囊，刷新页面后仍可恢复；只有传输完成或已彻底取消
+时才允许关闭。
+
+DataPilot 托管数据的一次训练使用一份不可变 DatasetSnapshot，多阶段共享同一划分。训练集
+至少包含一个完整日期，测试集可以为空，同一日期不能同时进入两个集合。平台为预览生成
+未来内容，为真实任务预留以下路径；预览不会写节点文件、创建版本、申请 GPU 或启动进程：
+
+```text
+<output_root>/<family_ref>/<version_label>/dataset-manifest.json
+```
+
+manifest 使用 `datapilot_dataset_manifest_v1`，每个 split 项只记录发布日期、release、
+replica、节点本地根目录和清单摘要。所有训练阶段收到相同的 `--dataset_manifest` 值。模型
+项目在启动时读取 manifest，并自行完成索引、转换、归一化和缓存。当前真实 Runner 仍禁用；
+允许适配和验收的模型工程仅为 `/data/caiji_test/NaVILA`，不得读取、修改或运行
+`/data/cui/NaVILA`。

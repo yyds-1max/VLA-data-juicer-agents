@@ -93,6 +93,7 @@ def _run_payload(
             },
         }],
         "execution_mode": "simulation",
+        "version_description": "Regression training run",
     }
 
 
@@ -171,7 +172,7 @@ def _typed_model_payload() -> dict[str, object]:
     return payload
 
 
-def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
+def test_legacy_dataset_parameter_role_is_normalized_to_hyperparameter(
     service: TrainingService,
 ) -> None:
     client = _client(service, admin=True)
@@ -194,7 +195,7 @@ def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
     assert response.status_code == 201
     registered = response.json()["model"]["configuration"]["parameter_definitions"]
     dataset = next(item for item in registered if item["key"] == "data_mixture")
-    assert dataset["semantic_role"] == "dataset"
+    assert dataset["semantic_role"] == "hyperparameter"
 
     definitions.append(
         {
@@ -206,8 +207,13 @@ def test_dataset_parameter_role_roundtrips_and_is_limited_to_one(
             "cli_flag": "--validation_data",
         }
     )
-    rejected = client.post("/api/training/models", json=payload)
-    assert rejected.status_code == 422
+    accepted = client.post("/api/training/models", json=payload)
+    assert accepted.status_code == 201
+    roles = {
+        item["key"]: item["semantic_role"]
+        for item in accepted.json()["model"]["configuration"]["parameter_definitions"]
+    }
+    assert roles["data_mixture"] == roles["validation_data"] == "hyperparameter"
 
 
 def test_runtime_and_monitoring_contracts_roundtrip_and_reach_run_spec(
@@ -300,7 +306,10 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         (5, "model_worker_verification_m5"),
         (6, "training_node_revision_split_m6"),
         (7, "training_workflows_m7"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "training_node_deletion_history_m8"),
+        (8, "training_node_deletion_history_m8"),
+        (9, "training_datasets_m9"),
+        (10, "training_node_command_claim_tokens_m10"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "dataset_transfer_pause_cancel_m11"),
     ]
 
 

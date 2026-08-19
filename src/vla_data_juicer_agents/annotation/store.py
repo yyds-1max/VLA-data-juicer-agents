@@ -69,6 +69,9 @@ _SAFE_RUNTIME_STEP_CODES = frozenset(
 _SAFE_RUNTIME_DIAGNOSTIC_KINDS = frozenset(
     {"nonzero_exit", "timeout", "cancelled", "error"}
 )
+_HISTORICAL_ASSET_PREFIX = "verified_asset_"
+_HISTORICAL_REVIEW_PREFIX = "review_"
+_HISTORICAL_UPDATE_SORT_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 def _now() -> str:
@@ -92,6 +95,57 @@ def _valid_sha256(value: Any) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _historical_ref_suffix(value: Any, *, prefix: str) -> str | None:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    suffix = value.removeprefix(prefix)
+    if len(suffix) != 32 or any(
+        character not in "0123456789abcdef" for character in suffix
+    ):
+        return None
+    return suffix
+
+
+def _historical_review_ref(asset_ref: str) -> str:
+    suffix = _historical_ref_suffix(asset_ref, prefix=_HISTORICAL_ASSET_PREFIX)
+    if suffix is None:
+        raise RuntimeError("historical asset identity is invalid")
+    return f"{_HISTORICAL_REVIEW_PREFIX}{suffix}"
+
+
+def _historical_asset_ref(review_ref: str) -> str | None:
+    suffix = _historical_ref_suffix(review_ref, prefix=_HISTORICAL_REVIEW_PREFIX)
+    return f"{_HISTORICAL_ASSET_PREFIX}{suffix}" if suffix is not None else None
+
+
+def _historical_projected_updated_at(dataset_date: str, imported_at: str) -> str:
+    """Give one bulk historical import a stable date-based display order.
+
+    Native annotation tasks always retain their real update timestamps. Historical
+    rows imported together otherwise share almost the same timestamp, so their
+    collection date is encoded as a small offset within the import day.
+    """
+    try:
+        collected_on = datetime.strptime(dataset_date, "%Y%m%d").replace(tzinfo=UTC)
+        imported = datetime.fromisoformat(imported_at)
+    except (TypeError, ValueError):
+        return imported_at
+    if imported.tzinfo is None:
+        imported = imported.replace(tzinfo=UTC)
+    import_day = imported.astimezone(UTC).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    date_rank_seconds = int(
+        (collected_on - _HISTORICAL_UPDATE_SORT_EPOCH).total_seconds() // 86_400
+    )
+    return (import_day + timedelta(seconds=date_rank_seconds)).isoformat(
+        timespec="milliseconds"
     )
 
 
@@ -1399,7 +1453,13 @@ class AnnotationStore:
                     review_refs=[],
                     verified_review_refs=[],
                     historical_asset_refs=[str(row["asset_ref"]) for row in rows],
-                    updated_at=max(str(row["imported_at"]) for row in rows),
+                    updated_at=max(
+                        _historical_projected_updated_at(
+                            str(row["dataset_date"]),
+                            str(row["imported_at"]),
+                        )
+                        for row in rows
+                    ),
                     source="historical_import",
                 )
             release_rows = connection.execute(
@@ -2557,23 +2617,89 @@ class AnnotationStore:
                 """,
                 arguments,
             ).fetchall()
-            return [
+            reviews = [
                 self._review_projection(connection, int(row["id"]))
                 for row in rows
             ]
+            if status in {None, "approved"}:
+                historical_clauses: list[str] = []
+                historical_arguments: list[Any] = []
+                if dataset_date is not None:
+                    historical_clauses.append("dataset_date = ?")
+                    historical_arguments.append(dataset_date)
+                if source_clip is not None:
+                    historical_clauses.append("source_clip = ?")
+                    historical_arguments.append(source_clip)
+                historical_where = (
+                    f"WHERE {' AND '.join(historical_clauses)}"
+                    if historical_clauses
+                    else ""
+                )
+                historical_rows = connection.execute(
+                    f"""
+                    SELECT * FROM historical_verified_assets
+                    {historical_where}
+                    ORDER BY imported_at DESC, id DESC
+                    """,
+                    historical_arguments,
+                ).fetchall()
+                reviews.extend(
+                    self._historical_review_projection(row)
+                    for row in historical_rows
+                )
+            reviews.sort(
+                key=lambda item: (str(item["updated_at"]), str(item["review_ref"])),
+                reverse=True,
+            )
+            return reviews
 
     def get_review(self, review_ref: str) -> dict[str, Any]:
         with self._connect() as connection:
-            return self._review_projection(
-                connection,
-                self._review_id(connection, review_ref),
-            )
+            native = connection.execute(
+                "SELECT id FROM trajectory_review_tasks WHERE review_ref = ?",
+                (review_ref,),
+            ).fetchone()
+            if native is not None:
+                return self._review_projection(connection, int(native["id"]))
+            historical = self._historical_review_row(connection, review_ref)
+            if historical is not None:
+                return self._historical_review_projection(historical)
+            raise AnnotationNotFoundError("trajectory review not found")
 
     def review_evidence_private(self, review_ref: str) -> dict[str, Any]:
         """Return private artifact bindings for the in-process evidence service."""
 
         with self._connect() as connection:
-            review_id = self._review_id(connection, review_ref)
+            native = connection.execute(
+                "SELECT id FROM trajectory_review_tasks WHERE review_ref = ?",
+                (review_ref,),
+            ).fetchone()
+            if native is None:
+                historical = self._historical_review_row(connection, review_ref)
+                if historical is None:
+                    raise AnnotationNotFoundError("trajectory review not found")
+                suffix = _historical_ref_suffix(
+                    str(historical["asset_ref"]),
+                    prefix=_HISTORICAL_ASSET_PREFIX,
+                )
+                if suffix is None:
+                    raise RuntimeError("historical asset identity is invalid")
+                return {
+                    "source": "historical_import",
+                    "review_ref": review_ref,
+                    "status": "approved",
+                    "state_revision": 1,
+                    "trajectory_revision_ref": f"trajectory_revision_{suffix}",
+                    "fix_revision_ref": f"fix_revision_{suffix}",
+                    "private_artifact_path": str(
+                        historical["private_artifact_path"]
+                    ),
+                    "artifact_sha256": str(historical["artifact_sha256"]),
+                    "asset_ref": str(historical["asset_ref"]),
+                    "draft_state": None,
+                    "draft_revision": None,
+                }
+            review_id = int(native["id"])
             row = connection.execute(
                 """
                 SELECT r.review_ref, r.status, r.state_revision,
@@ -2633,6 +2759,7 @@ class AnnotationStore:
                 (review_id,),
             ).fetchone()
             return {
+                "source": "native",
                 "review_ref": str(row["review_ref"]),
                 "status": str(row["status"]),
                 "state_revision": int(row["state_revision"]),
@@ -8428,6 +8555,7 @@ class AnnotationStore:
             (review_id,),
         ).fetchone()
         result: dict[str, Any] = {
+            "source": "native",
             "review_ref": row["review_ref"],
             "status": row["status"],
             "state_revision": int(row["state_revision"]),
@@ -8520,6 +8648,83 @@ class AnnotationStore:
         }
         return result
 
+    def _historical_review_row(
+        self,
+        connection: sqlite3.Connection,
+        review_ref: str,
+    ) -> sqlite3.Row | None:
+        asset_ref = _historical_asset_ref(review_ref)
+        if asset_ref is None:
+            return None
+        return connection.execute(
+            "SELECT * FROM historical_verified_assets WHERE asset_ref = ?",
+            (asset_ref,),
+        ).fetchone()
+
+    def _historical_review_projection(
+        self,
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        asset_ref = str(row["asset_ref"])
+        suffix = _historical_ref_suffix(
+            asset_ref,
+            prefix=_HISTORICAL_ASSET_PREFIX,
+        )
+        if suffix is None:
+            raise RuntimeError("historical asset identity is invalid")
+        review_ref = _historical_review_ref(asset_ref)
+        fix_revision_ref = f"fix_revision_{suffix}"
+        trajectory_revision_ref = f"trajectory_revision_{suffix}"
+        imported_at = str(row["imported_at"])
+        projected_updated_at = _historical_projected_updated_at(
+            str(row["dataset_date"]),
+            imported_at,
+        )
+        content_sha256 = str(row["artifact_sha256"])
+        return {
+            "source": "historical_import",
+            "review_ref": review_ref,
+            "status": "approved",
+            "state_revision": 1,
+            "job_ref": f"job_{suffix}",
+            "dataset_date": str(row["dataset_date"]),
+            "source_clip": str(row["source_clip"]),
+            "segment_ref": f"segment_{suffix}",
+            "segment_ordinal": int(row["segment_ordinal"]),
+            "trajectory_revision": {
+                "revision_ref": trajectory_revision_ref,
+                "content_sha256": content_sha256,
+            },
+            "processing_calibration": {
+                "profile_ref": "historical_import",
+                "label": "历史修正结果",
+                "content_sha256": content_sha256,
+            },
+            "fix_draft": None,
+            "fix_revisions": [
+                {
+                    "revision_ref": fix_revision_ref,
+                    "revision_number": 1,
+                    "source_draft_revision": 1,
+                    "content_sha256": content_sha256,
+                    "created_at": imported_at,
+                }
+            ],
+            "active_fix_run": None,
+            "fix_failure": None,
+            "latest_publication": {
+                "fix_revision_ref": fix_revision_ref,
+                "attempt": 1,
+                "status": "published",
+                "content_sha256": content_sha256,
+                "failure": None,
+                "created_at": imported_at,
+            },
+            "submitted_fix_revision_ref": fix_revision_ref,
+            "created_at": imported_at,
+            "updated_at": projected_updated_at,
+        }
+
     def _review_id(
         self,
         connection: sqlite3.Connection,
@@ -8530,6 +8735,13 @@ class AnnotationStore:
             (review_ref,),
         ).fetchone()
         if row is None:
+            historical = self._historical_review_row(connection, review_ref)
+            if historical is not None:
+                raise AnnotationConflictError(
+                    "historical_review_read_only",
+                    "Historical verified results are read-only.",
+                    current=self._historical_review_projection(historical),
+                )
             raise AnnotationNotFoundError("trajectory review not found")
         return int(row["id"])
 

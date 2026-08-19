@@ -210,6 +210,7 @@ export type FixFailureSummary = {
 };
 
 export type TrajectoryReview = {
+  source?: "native" | "historical_import";
   review_ref: string;
   status: TrajectoryReviewStatus;
   state_revision: number;
@@ -296,7 +297,7 @@ export type TrajectoryEvidenceFrame = {
 export type TrajectoryReviewEvidence = {
   availability: "available";
   review_ref: string;
-  evidence_kind: "trajectory_revision" | "fix_revision";
+  evidence_kind: "trajectory_revision" | "fix_revision" | "historical_fix";
   fix_revision_ref: string | null;
   fix_revision_source_draft_revision: number | null;
   trajectory_revision_ref: string;

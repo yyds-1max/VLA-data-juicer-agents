@@ -157,6 +157,27 @@ test("strict evidence parser accepts a Fix revision with only trailing draft com
   expect(evidence.frames[0].targets[0].camera_position).toEqual([100, 200]);
 });
 
+test("strict evidence parser accepts a read-only historical Fix projection", () => {
+  const value = payload();
+  value.evidence_kind = "historical_fix";
+  value.fix_revision_ref =
+    "fix_revision_0123456789abcdef0123456789abcdef";
+  value.fix_revision_source_draft_revision = 1;
+  value.draft_revision = null;
+  value.draft_commands = [];
+
+  const evidence = parseTrajectoryReviewEvidence(value, reviewRef);
+
+  expect(evidence).toMatchObject({
+    evidence_kind: "historical_fix",
+    fix_revision_ref:
+      "fix_revision_0123456789abcdef0123456789abcdef",
+    fix_revision_source_draft_revision: 1,
+    draft_revision: null,
+  });
+  expect(evidence.draft_commands).toEqual([]);
+});
+
 test("draft projection replays direct commands and never invents runtime-derived positions", () => {
   const evidence = parseTrajectoryReviewEvidence(payload(), reviewRef);
   const projected = projectTrajectoryReviewEvidence(evidence);

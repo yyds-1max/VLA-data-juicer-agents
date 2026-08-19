@@ -22,7 +22,7 @@ from .resources import ResourceCollector
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="datapilot-training-worker",
-        description="Run the read-only DataPilot Training Worker v1 inventory daemon.",
+        description="Run the DataPilot Training Worker inventory and managed-data daemon.",
     )
     parser.add_argument(
         "--state-dir",

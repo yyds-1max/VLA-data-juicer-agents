@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createSession,
+  createTrainingDatasetTransfers,
   deleteTrainingNode,
   getSession,
   getNavigationDatasetDate,
@@ -9,6 +10,7 @@ import {
   getSyncImageUrl,
   getSyncImages,
   interruptTurn,
+  requestTrainingDirectoryListing,
   listSessions,
   openSessionEvents,
   openTrainingEvents,
@@ -199,6 +201,28 @@ describe("api client", () => {
     );
   });
 
+  it("creates controlled directory listings and idempotent dataset transfers", async () => {
+    const listing = { listing_ref: "listing-1", node_ref: "node/1", path: "/data", status: "queued", directories: [] };
+    const listingFetch = mockFetchJson({ listing });
+    await expect(requestTrainingDirectoryListing("node/1", "/data")).resolves.toEqual(listing);
+    expect(listingFetch).toHaveBeenCalledWith("/api/training/nodes/node%2F1/directory-listings", expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "/data" }) }));
+
+    const transfer = { transfer_ref: "transfer-1", node_ref: "node/1", release_ref: "release-1", dataset_date: "20260808", status: "queued", target_parent_directory: "/data", bytes_transferred: 0 };
+    const transferFetch = mockFetchJson({ transfers: [transfer] });
+    await expect(createTrainingDatasetTransfers({ node_ref: "node/1", release_refs: ["release-1"], target_parent_directory: "/data" })).resolves.toEqual([transfer]);
+    expect(transferFetch).toHaveBeenCalledWith("/api/training/dataset-transfers", expect.objectContaining({ method: "POST", body: JSON.stringify({ node_ref: "node/1", release_refs: ["release-1"], target_parent_directory: "/data" }), headers: expect.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
+  });
+
+  it("uses a structured API message instead of exposing raw error JSON", async () => {
+    mockFetchJson({ detail: { code: "dataset_transfer_retry_required", message: "请继续已有的暂停任务。", current: { transfer_ref: "transfer-old" } } }, false);
+
+    await expect(createTrainingDatasetTransfers({
+      node_ref: "node-1",
+      release_refs: ["release-1"],
+      target_parent_directory: "/data",
+    })).rejects.toMatchObject({ message: "请继续已有的暂停任务。" });
+  });
+
   it("falls back to plain text for non-ok responses", async () => {
     mockFetchJson("Service unavailable", false);
 
@@ -252,6 +276,9 @@ describe("api client", () => {
       "run.updated",
       "run.log.appended",
       "run.metric.appended",
+      "dataset.transfer.updated",
+      "dataset.replica.ready",
+      "dataset.replica.removed",
     ]);
     const event = { event_id: 8, type: "run.updated", run_ref: "run-1" } as const;
     listeners.get("run.updated")?.(

@@ -374,13 +374,41 @@ class AnnotationApplicationService:
     ) -> dict[str, Any]:
         from vla_data_juicer_agents.annotation.runtime import (
             RuntimeExecutionError,
+            _read_stable_regular_bytes,
             _tree_sha256,
         )
         from vla_data_juicer_agents.annotation.trajectory_evidence import (
+            build_historical_fix_revision_state,
             load_fix_revision_preview_state,
         )
 
         private = self.store.review_evidence_private(review_ref)
+        if private.get("source") == "historical_import":
+            fix_path = Path(str(private["private_artifact_path"]))
+            try:
+                content = _read_stable_regular_bytes(fix_path)
+                if hashlib.sha256(content).hexdigest() != private["artifact_sha256"]:
+                    raise ValueError("historical Fix artifact changed")
+                state = build_historical_fix_revision_state(
+                    fix_path.parent,
+                    fix_path=fix_path,
+                    asset_ref=str(private["asset_ref"]),
+                )
+            except (OSError, RuntimeExecutionError, ValueError) as exc:
+                raise AnnotationConflictError(
+                    "trajectory_revision_changed",
+                    "The historical Fix evidence is no longer available.",
+                ) from exc
+            private.update(
+                {
+                    "evidence_kind": "historical_fix",
+                    "fix_revision_source_draft_revision": 1,
+                    "trajectory_state": state,
+                    "source_artifact_path": str(fix_path),
+                    "private_artifact_path": str(fix_path.parent),
+                }
+            )
+            return private
         base_root = Path(private["private_artifact_path"])
         try:
             if _tree_sha256(
@@ -791,7 +819,26 @@ class AnnotationApplicationService:
                 "trajectory_evidence_unavailable",
                 "The original projection is not authoritative for this Fix revision.",
             )
-        if verify_tree:
+        if verify_tree and private.get("source") == "historical_import":
+            from vla_data_juicer_agents.annotation.runtime import (
+                _read_stable_regular_bytes,
+            )
+
+            try:
+                source_content = _read_stable_regular_bytes(
+                    Path(str(private["source_artifact_path"])),
+                )
+            except Exception as exc:
+                raise AnnotationConflictError(
+                    "trajectory_revision_changed",
+                    "The historical Fix evidence is no longer available.",
+                ) from exc
+            if hashlib.sha256(source_content).hexdigest() != private["artifact_sha256"]:
+                raise AnnotationConflictError(
+                    "trajectory_revision_changed",
+                    "The historical Fix evidence changed after it was imported.",
+                )
+        elif verify_tree:
             try:
                 actual_sha256 = _tree_sha256(
                     artifact_root,

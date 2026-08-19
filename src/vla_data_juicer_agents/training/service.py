@@ -13,6 +13,7 @@ from .auth import (
     TRAINING_MANAGE_NODES,
     TRAINING_STOP_RUNS,
 )
+from .datasets import DatasetReleaseCatalog, PublishedDatasetCatalog
 from .errors import (
     TrainingConflictError,
     TrainingError,
@@ -72,6 +73,7 @@ class TrainingService:
         heartbeat_poll_interval_seconds: float = 0.25,
         monotonic_clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        dataset_catalog: DatasetReleaseCatalog | None = None,
     ) -> None:
         self.store, self.provider = store, provider
         self.simulation_enabled = simulation_enabled
@@ -84,6 +86,9 @@ class TrainingService:
         )
         self._monotonic_clock = monotonic_clock
         self._sleeper = sleeper
+        self.dataset_catalog = dataset_catalog or PublishedDatasetCatalog(
+            store.path.with_name("annotation.sqlite")
+        )
 
     def _wait_for_node_heartbeat(
         self, node_ref: str, *, after_revision: int
@@ -388,12 +393,43 @@ class TrainingService:
     ) -> dict[str, Any]:
         data = self._data(payload)
         node = self.store.record_node_heartbeat(node_ref, worker_token, data)
+        verification = self.store.claim_model_verification(
+            node_ref, data["worker_instance_id"]
+        )
+        commands = (
+            []
+            if verification is not None
+            else self.store.claim_node_commands(
+                node_ref, worker_token, data["worker_instance_id"], 1
+            )
+        )
         return {
             "node": node,
-            "command": self.store.claim_model_verification(
-                node_ref, data["worker_instance_id"]
-            ),
+            "command": verification or (commands[0] if commands else None),
         }
+
+    def poll_node_commands(
+        self, node_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]:
+        data = self._data(payload)
+        deadline = self._monotonic_clock() + float(data.get("wait_seconds", 25))
+        while True:
+            commands = self.store.claim_node_commands(
+                node_ref,
+                worker_token,
+                data["worker_instance_id"],
+                int(data.get("limit", 1)),
+            )
+            if commands or self._monotonic_clock() >= deadline:
+                return {"commands": commands}
+            self._sleeper(min(0.25, max(0.0, deadline - self._monotonic_clock())))
+
+    def finish_node_command(
+        self, node_ref: str, command_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]:
+        return self.store.finish_node_command(
+            node_ref, worker_token, command_ref, self._data(payload)
+        )
 
     def finish_model_verification(
         self,
@@ -469,8 +505,11 @@ class TrainingService:
             for item in model["parameter_definitions"]:
                 visible_when = item.get("visible_when")
                 choices = [choice if isinstance(choice, dict) else {"value": choice, "label": choice} for choice in (item.get("choices") or [])]
-                definitions.append({"key": item["name"], "label": item.get("label", item["name"]), "type": "number" if item["kind"] == "float" else item["kind"], "semantic_role": item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description"), "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": choices, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_key": visible_when["parameter_name"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag"), "argument_style": item.get("argument_style") or ("flag_when_true" if item["kind"] == "boolean" else "value")})
-            configuration: dict[str, Any] = {"parameter_definitions": definitions}
+                definitions.append({"key": item["name"], "label": item.get("label", item["name"]), "type": "number" if item["kind"] == "float" else item["kind"], "semantic_role": "hyperparameter" if item.get("semantic_role") == "dataset" else item.get("semantic_role", "hyperparameter"), "default": item["default"], "description": item.get("description"), "minimum": item.get("minimum"), "maximum": item.get("maximum"), "choices": choices, "string_min_length": item.get("string_min_length"), "string_max_length": item.get("string_max_length"), "visible_when": {"parameter_key": visible_when["parameter_name"], "equals": visible_when["equals"]} if visible_when else None, "display_group": item.get("display_group"), "display_group_label": item.get("display_group_label"), "display_group_order": item.get("display_group_order"), "editable": True, "sensitive": item.get("sensitive", False), "cli_flag": item.get("cli_flag"), "argument_style": item.get("argument_style") or ("flag_when_true" if item["kind"] == "boolean" else "value")})
+            configuration: dict[str, Any] = {
+                "parameter_definitions": definitions,
+                "data_access_mode": model.get("data_access_mode", "self_managed"),
+            }
             template = model.get("launch_template")
             if isinstance(template, dict):
                 projected_template = dict(template)
@@ -485,6 +524,9 @@ class TrainingService:
                     projected_template.setdefault("output_flag", "--output_dir")
                 configuration["launch_template"] = projected_template
             result["configuration"] = configuration
+            result["data_access_mode"] = model.get(
+                "data_access_mode", "self_managed"
+            )
         for internal in ("parameter_definitions", "launch_template", "output_template"):
             result.pop(internal, None)
         return result
@@ -500,8 +542,160 @@ class TrainingService:
             **data,
             "launch_template": configuration["launch_template"],
             "parameter_definitions": definitions,
+            "data_access_mode": configuration.get(
+                "data_access_mode", "self_managed"
+            ),
         }
         return adapted
+
+    def list_dataset_releases(self) -> list[dict[str, Any]]:
+        releases: list[dict[str, Any]] = []
+        for release in self.dataset_catalog.list_releases():
+            source_manifest = self.store.get_source_manifest_by_release(
+                release["release_ref"]
+            )
+            releases.append({**release, "source_manifest": source_manifest})
+        return releases
+
+    def list_dataset_replicas(self, node_ref: str, principal: Any) -> list[dict[str, Any]]:
+        self.store.get_node(node_ref)
+        items = self.store.list_dataset_replicas(node_ref)
+        if principal.can(TRAINING_CREATE_RUNS):
+            return items
+        return [
+            {key: value for key, value in item.items() if key != "local_root"}
+            for item in items
+        ]
+
+    def request_directory_listing(
+        self, node_ref: str, payload: Any, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        self._require_dataset_worker_feature(node_ref, "directory_browser_v1")
+        return self.store.create_directory_listing(
+            node_ref, self._data(payload)["path"], principal.subject
+        )
+
+    def get_directory_listing(self, listing_ref: str, principal: Any) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        return self.store.get_directory_listing(listing_ref)
+
+    def create_dataset_transfers(
+        self, payload: Any, idempotency_key: str, principal: Any
+    ) -> list[dict[str, Any]]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        data = self._data(payload)
+        self._require_dataset_worker_feature(data["node_ref"], "dataset_transfer_v1")
+        releases = {
+            release["release_ref"]: release
+            for release in self.dataset_catalog.list_releases()
+        }
+        selected: list[dict[str, Any]] = []
+        for release_ref in data["release_refs"]:
+            release = releases.get(release_ref)
+            if release is None or release.get("status") != "released":
+                raise TrainingValidationError(
+                    "dataset_release_not_available",
+                    "Only released dataset dates can be transferred.",
+                )
+            selected.append(self.store.ensure_source_manifest_placeholder(release))
+        return self.store.create_dataset_transfers(
+            node_ref=data["node_ref"],
+            source_manifests=selected,
+            target_parent_directory=data["target_parent_directory"],
+            idempotency_key=idempotency_key,
+            request_payload=data,
+            actor=principal.subject,
+        )
+
+    def list_dataset_transfers(
+        self, *, node_ref: str | None = None, status: str | None = None, principal: Any
+    ) -> list[dict[str, Any]]:
+        items = self.store.list_dataset_transfers(node_ref=node_ref, status=status)
+        if principal.can(TRAINING_CREATE_RUNS):
+            return items
+        return [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"target_parent_directory", "final_directory"}
+            }
+            for item in items
+        ]
+
+    def get_dataset_transfer(self, transfer_ref: str, principal: Any) -> dict[str, Any]:
+        item = self.store.get_dataset_transfer(transfer_ref)
+        if principal.can(TRAINING_CREATE_RUNS):
+            return item
+        return {
+            key: value
+            for key, value in item.items()
+            if key not in {"target_parent_directory", "final_directory"}
+        }
+
+    def cancel_dataset_transfer(
+        self, transfer_ref: str, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        return self.store.cancel_dataset_transfer(transfer_ref, principal.subject)
+
+    def pause_dataset_transfer(
+        self, transfer_ref: str, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        return self.store.pause_dataset_transfer(transfer_ref, principal.subject)
+
+    def retry_dataset_transfer(
+        self, transfer_ref: str, idempotency_key: str, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        return self.store.retry_dataset_transfer(
+            transfer_ref, idempotency_key, principal.subject
+        )
+
+    def remove_dataset_replica(
+        self, replica_ref: str, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        replica = self.store.get_dataset_replica(replica_ref)
+        self._require_dataset_worker_feature(
+            replica["node_ref"], "dataset_transfer_v1"
+        )
+        return self.store.remove_dataset_replica(replica_ref, principal.subject)
+
+    def _require_dataset_worker_feature(self, node_ref: str, feature: str) -> None:
+        node = self.store.get_node(node_ref)
+        capabilities = node.get("capabilities") or {}
+        features = capabilities.get("worker_features") or []
+        if feature not in features:
+            raise TrainingConflictError(
+                "training_worker_update_required",
+                "Update the Training Worker before using managed training data.",
+                current={"node_ref": node_ref, "required_feature": feature},
+            )
+
+    def source_manifest_page(
+        self,
+        node_ref: str,
+        release_ref: str,
+        worker_token: str,
+        *,
+        cursor: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        self.store.authenticate_worker(node_ref, worker_token)
+        self.store.authorize_source_download(node_ref, release_ref)
+        return self.store.source_manifest_page(
+            release_ref, cursor=cursor, limit=limit
+        )
+
+    def source_file(
+        self, node_ref: str, file_ref: str, worker_token: str
+    ) -> dict[str, Any]:
+        self.store.authenticate_worker(node_ref, worker_token)
+        item = self.store.get_source_file(file_ref)
+        self.store.authorize_source_download(node_ref, item["release_ref"])
+        return item
 
     def _prepare(
         self,
@@ -548,6 +742,28 @@ class TrainingService:
             raise TrainingValidationError("model_unavailable", "The selected model family is disabled.")
         if model["launch_template"]["server_ref"] != data["server_ref"]:
             raise TrainingValidationError("server_mismatch", "The model template belongs to another server.")
+
+        data_access_mode = model.get("data_access_mode", "self_managed")
+        selection = data.get("dataset_selection")
+        dataset_splits: dict[str, list[dict[str, Any]]] | None = None
+        if data_access_mode == "datapilot_managed":
+            if not selection or not selection.get("train_replica_refs"):
+                raise TrainingValidationError(
+                    "managed_dataset_training_set_required",
+                    "DataPilot managed data requires at least one training date.",
+                )
+            dataset_splits = self.store.resolve_dataset_selection(
+                node_ref=data["server_ref"],
+                train_replica_refs=list(selection.get("train_replica_refs") or []),
+                test_replica_refs=list(selection.get("test_replica_refs") or []),
+            )
+        elif selection and (
+            selection.get("train_replica_refs") or selection.get("test_replica_refs")
+        ):
+            raise TrainingValidationError(
+                "self_managed_dataset_selection_not_allowed",
+                "This model family manages its own training data.",
+            )
 
         definitions = [ParameterDefinition.model_validate(item) for item in model["parameter_definitions"]]
         by_name = {item.name: item for item in definitions}
@@ -629,6 +845,23 @@ class TrainingService:
             if uses_torchrun and port is None:
                 raise TrainingValidationError("master_port_required", "Torchrun requires an allocated master port.")
             version_segment = "preview" if run_ref == "preview" else version_meta["version_label"]
+            version_output_root = f"{template['output_root'].rstrip('/')}/{model['family_ref']}/{version_segment}"
+            dataset_manifest_path = (
+                f"{version_output_root}/dataset-manifest.json"
+                if dataset_splits is not None
+                else None
+            )
+            dataset_manifest = (
+                {
+                    "contract": "datapilot_dataset_manifest_v1",
+                    "snapshot_ref": version_meta.get("snapshot_ref") or "preview",
+                    "run_ref": None if run_ref == "preview" else run_ref,
+                    "family_ref": model["family_ref"],
+                    "splits": dataset_splits,
+                }
+                if dataset_splits is not None
+                else None
+            )
             built_stages: list[dict[str, Any]] = []
             previous_output: str | None = None
             for stage_number, source_stage in enumerate(normalized_stages, start=1):
@@ -654,6 +887,9 @@ class TrainingService:
                 else:
                     argv = [template["executable"], template["entrypoint"], *template.get("fixed_argv", [])]
                 safe_argv = list(argv)
+                if dataset_manifest_path is not None:
+                    argv.extend(["--dataset_manifest", dataset_manifest_path])
+                    safe_argv.extend(["--dataset_manifest", dataset_manifest_path])
                 for definition in definitions:
                     if definition.name not in parameters:
                         continue
@@ -669,16 +905,16 @@ class TrainingService:
                 argv.extend([output_flag, output]); safe_argv.extend([output_flag, output])
                 distributed = {"master_addr": "127.0.0.1" if uses_torchrun else None, "master_port": port if uses_torchrun else None, "node_rank": 0 if uses_torchrun else None}
                 public_parameters = {key: "********" if key in source_stage["sensitive_parameters"] else value for key, value in parameters.items()}
-                public = {"contract_version": 2, "execution_mode": execution_mode, "family_ref": model["family_ref"], "family_name": model["family_name"], "version_label": version_meta.get("version_label"), "stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": public_parameters, "entrypoint": template["entrypoint"], "argv": safe_argv, "output_preview": output}
+                public = {"contract_version": 2, "execution_mode": execution_mode, "family_ref": model["family_ref"], "family_name": model["family_name"], "version_label": version_meta.get("version_label"), "stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "launcher_kind": launcher_kind, "nnodes": 1, **distributed, "nproc_per_node": nproc_per_node, "environment": {"CUDA_VISIBLE_DEVICES": ",".join(map(str, indexes))}, "runtime_environment": template.get("runtime_environment", {"kind": "system"}), "monitoring": template.get("monitoring", {"source": "stdout", "format": "plain"}), "parameters": public_parameters, "entrypoint": template["entrypoint"], "argv": safe_argv, "output_preview": output, "dataset_manifest": dataset_manifest_path}
                 preview_check = "simulation_only" if execution_mode == "simulation" else "real_preview_only"
                 ready_code = "simulation_ready" if execution_mode == "simulation" else "real_preview_ready"
                 ready_message = "Simulation inputs and GPU availability are valid." if execution_mode == "simulation" else "真实节点、GPU 和参数已通过预览校验；未创建任务、租约或进程。"
                 private = {**public, "version": 2, "mode": execution_mode, "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": [preview_check, "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
                 built_stages.append({"stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "stage_input_source": source_stage["stage_input_source"], "parameters": parameters, "private_spec": private, "run_spec": public, "command_preview": private["safe_command_preview"], "output_directory": output, "total_steps": source_stage["total_steps"], "preflight": [{"ok": True, "code": ready_code, "message": ready_message}]})
                 previous_output = output
-            return {"stages": built_stages, "total_steps": sum(stage["total_steps"] for stage in built_stages)}
+            return {"stages": built_stages, "total_steps": sum(stage["total_steps"] for stage in built_stages), "dataset_manifest": dataset_manifest, "dataset_manifest_path": dataset_manifest_path}
 
-        prepared = {"family_ref": model["family_ref"], "model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "stages": normalized_stages, "total_steps": sum(stage["total_steps"] for stage in normalized_stages), "requires_master_port": uses_torchrun}
+        prepared = {"family_ref": model["family_ref"], "model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "stages": normalized_stages, "total_steps": sum(stage["total_steps"] for stage in normalized_stages), "requires_master_port": uses_torchrun, "data_access_mode": data_access_mode, "dataset_splits": dataset_splits, "version_description": str(data.get("version_description") or "").strip()}
         return prepared, build
 
     def preview_run(self, payload: Any, principal: Any) -> dict[str, Any]:
@@ -712,6 +948,8 @@ class TrainingService:
         )
         return {
             "stages": built["stages"],
+            "dataset_manifest_preview": built.get("dataset_manifest"),
+            "dataset_manifest_path": built.get("dataset_manifest_path"),
             "preflight": [
                 {"ok": True, "code": ready_code, "message": ready_message}
             ],
@@ -725,6 +963,11 @@ class TrainingService:
         )
         if existing is not None:
             return self._project_run(existing)
+        if not str(public_request.get("version_description") or "").strip():
+            raise TrainingValidationError(
+                "version_description_required",
+                "A description of this training version is required before starting.",
+            )
         # Store idempotency is checked before its atomic GPU lease check.  We
         # therefore ignore only our own platform leases here, allowing a
         # byte-equivalent retry to return the original run while still

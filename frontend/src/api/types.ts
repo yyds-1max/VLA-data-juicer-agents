@@ -330,6 +330,7 @@ export type TrainingModelStatus = "draft" | "verified" | "disabled";
 export type TrainingRunStatus = "queued" | "preparing" | "running" | "stop_requested" | "succeeded" | "failed" | "cancelled" | "lost";
 export type TrainingParameterType = "integer" | "number" | "boolean" | "enum" | "string";
 export type TrainingArgumentStyle = "value" | "explicit_boolean" | "flag_when_true";
+export type TrainingDataAccessMode = "datapilot_managed" | "self_managed";
 
 export interface TrainingCapabilities {
   permissions: TrainingPermission[];
@@ -346,6 +347,7 @@ export interface TrainingParameterDefinition {
   label: string;
   type: TrainingParameterType;
   /** Structured purpose used by the run form. At most one string parameter may receive the previous stage output. */
+  /** `dataset` is a legacy value and is rendered as a normal hyperparameter. */
   semantic_role?: "hyperparameter" | "dataset" | "stage_input";
   default: string | number | boolean;
   description?: string | null;
@@ -370,6 +372,7 @@ export interface TrainingParameterDefinition {
 }
 
 export interface TrainingModelConfiguration {
+  data_access_mode?: TrainingDataAccessMode;
   parameter_definitions: TrainingParameterDefinition[];
   fixed_argv: string[];
   output_preview?: string | null;
@@ -399,6 +402,7 @@ export interface TrainingModel {
   /** Admin-only optimistic concurrency token; never displayed as a model version. */
   edit_revision?: number;
   trained_version_count: number;
+  data_access_mode?: TrainingDataAccessMode;
   created_at: string;
   updated_at: string;
   configuration?: TrainingModelConfiguration;
@@ -542,6 +546,76 @@ export interface TrainingNodeResourceSnapshot {
   resources?: TrainingNodeResources | null;
 }
 
+export type TrainingDatasetTransferStatus = "preparing" | "queued" | "running" | "pause_requested" | "paused" | "cancel_requested" | "succeeded" | "failed" | "cancelled";
+
+export interface TrainingDatasetRelease {
+  release_ref: string;
+  dataset_date: string;
+  status: "released";
+  source_clip_count: number;
+  total_duration_ns: number;
+  source_manifest: {
+    manifest_ref: string;
+    status: string;
+    file_count: number;
+    total_bytes: number;
+    inventory_sha256: string;
+  } | null;
+  released_at?: string | null;
+}
+
+export interface TrainingDatasetReplica {
+  replica_ref: string;
+  node_ref: string;
+  release_ref: string;
+  dataset_date: string;
+  status: "ready" | "removing" | "failed";
+  local_root: string;
+  file_count?: number | null;
+  total_bytes?: number | null;
+  inventory_sha256?: string | null;
+  created_at?: string | null;
+}
+
+export interface TrainingDirectoryEntry {
+  name: string;
+  path: string;
+  writable: boolean;
+}
+
+export interface TrainingDirectoryListing {
+  listing_ref: string;
+  node_ref: string;
+  path: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  writable?: boolean | null;
+  free_bytes?: number | null;
+  directories: TrainingDirectoryEntry[];
+  error_message?: string | null;
+}
+
+export interface TrainingDatasetTransfer {
+  transfer_ref: string;
+  node_ref: string;
+  release_ref: string;
+  dataset_date: string;
+  status: TrainingDatasetTransferStatus;
+  target_parent_directory: string;
+  bytes_transferred: number;
+  total_bytes?: number | null;
+  progress_percent?: number | null;
+  error_message?: string | null;
+  final_directory?: string | null;
+  replica_ref?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface TrainingDatasetSelection {
+  train_replica_refs: string[];
+  test_replica_refs: string[];
+}
+
 export interface TrainingRunSpec {
   contract_version: 1 | 2;
   /** `real` is currently returned only by the non-persistent development preview. */
@@ -571,6 +645,7 @@ export interface TrainingPreflightResult {
 
 export interface TrainingRunPreview {
   stages: TrainingStagePreview[];
+  dataset_manifest_preview?: Record<string, unknown> | null;
 }
 
 export type TrainingStageInputSource = "manual" | "previous_stage_output";
@@ -618,6 +693,8 @@ export interface TrainingRun {
   version_number: number;
   version_date: string;
   version_label: string;
+  version_description?: string | null;
+  dataset_snapshot?: Record<string, unknown> | null;
   status: TrainingRunStatus;
   state_revision: number;
   server_ref: string;
@@ -664,8 +741,10 @@ export interface TrainingStage {
 
 export interface TrainingEvent {
   event_id: number;
-  type: "run.updated" | "run.log.appended" | "run.metric.appended";
-  run_ref: string;
+  type: "run.updated" | "run.log.appended" | "run.metric.appended" | "dataset.transfer.updated" | "dataset.replica.ready" | "dataset.replica.removed";
+  run_ref?: string;
+  transfer_ref?: string;
+  replica_ref?: string;
   stage_ref?: string | null;
   stage_number?: number | null;
   seq?: number;

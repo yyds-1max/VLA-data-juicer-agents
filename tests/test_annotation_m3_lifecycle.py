@@ -8,16 +8,34 @@ import sqlite3
 import pytest
 
 from vla_data_juicer_agents.annotation import operator_cli
+from vla_data_juicer_agents.annotation.application import (
+    AnnotationApplicationService,
+)
 from vla_data_juicer_agents.annotation.models import AnnotationConflictError
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.annotation.store import _annotation_unit_lifecycle
 from vla_data_juicer_agents.annotation.store import _review_unit_lifecycle
+from vla_data_juicer_agents.annotation.trajectory_evidence import (
+    render_gridmap_png,
+)
 
 
 def _trajectory(path: Path, payload: dict[str, object]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _jpeg(width: int = 8, height: int = 6) -> bytes:
+    return (
+        b"\xff\xd8"
+        + b"\xff\xc0"
+        + b"\x00\x07"
+        + b"\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\xff\xd9"
+    )
 
 
 def _asset(
@@ -148,6 +166,171 @@ def test_historical_verified_import_is_idempotent_and_projects_no_private_path(
     assert public_asset["content_sha256"] == first_sha
     assert public_asset["segment_ordinal"] == 1
     assert str(tmp_path) not in json.dumps(public_asset)
+
+
+def test_historical_import_projects_newer_dataset_dates_as_more_recent_updates(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    newer_path = tmp_path / "newer" / "trajectory_fix_five.json"
+    older_path = tmp_path / "older" / "trajectory_fix_five.json"
+    _trajectory(newer_path, {"frame": {"master": {"x": 2}}})
+    _trajectory(older_path, {"frame": {"master": {"x": 1}}})
+
+    # Import the newer collection date first so insertion order cannot accidentally
+    # satisfy the expected presentation order.
+    store.import_historical_verified_assets(
+        manifest_sha256="b" * 64,
+        assets=[
+            _asset(
+                newer_path,
+                ordinal=1,
+                total=1,
+                dataset_date="20260605",
+                source_clip="newer-clip",
+            ),
+            _asset(
+                older_path,
+                ordinal=1,
+                total=1,
+                dataset_date="20260526",
+                source_clip="older-clip",
+            ),
+        ],
+    )
+
+    reviews = store.list_reviews(status="approved")
+    assert [review["dataset_date"] for review in reviews] == [
+        "20260605",
+        "20260526",
+    ]
+    assert reviews[0]["updated_at"] > reviews[1]["updated_at"]
+
+    scopes = {
+        scope["dataset_date"]: scope
+        for scope in store.asset_lifecycle_snapshot()["scopes"]
+    }
+    assert (
+        scopes["20260605"]["review"]["updated_at"]
+        > scopes["20260526"]["review"]["updated_at"]
+    )
+
+
+def test_historical_verified_asset_uses_native_review_and_evidence_contract(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    segment = tmp_path / "finish" / "20260319" / "clip-a" / "segment-a"
+    fix_path = segment / "segment-a_trajectory_fix_five.json"
+    fix_sha = _trajectory(
+        fix_path,
+        {
+            "1.0": {
+                "master": {
+                    "color": ["green", "black", "white"],
+                    "traj": [[1.0, 2.0], [2.0, 3.0]],
+                    "img": [100.0, 120.0, 40.0, 80.0],
+                    "position": [1.0, 2.0],
+                },
+                "couch": {
+                    "color": ["orange", "black", "white"],
+                    "traj": [[3.0, 4.0]],
+                    "img": [10.0, 20.0, 30.0, 40.0],
+                    "position": [3.0, 4.0],
+                },
+                # Older editors also emitted this empty metadata sentinel.
+                # It is not an annotation target and must not block evidence.
+                "distance": {
+                    "color": ["unknown", "unknown", "unknown"],
+                    "traj": [],
+                    "img": None,
+                },
+                "pass": True,
+            },
+            "light_up": [0.0, 0.0],
+            "light_down": [1.0, 1.0],
+        },
+    )
+    (segment / "segment-a_speed_direction.json").write_text(
+        json.dumps(
+            {
+                "1.0": {
+                    "master": {
+                        "speed_object": [0.3, 0.4],
+                        "direction_object": 0.5,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    gridmap = json.dumps(
+        {
+            # The old ROS export stores a float32 resolution whose accumulated
+            # 200-cell range differs from the rounded grid width by ~4e-6.
+            "resolution": 0.11999999731779099,
+            "x_range": [-12.0, 12.0],
+            "y_range": [-12.0, 12.0],
+            "data": [0.0] * 40_000,
+        }
+    ).encode()
+    (segment / "fisheye_front").mkdir()
+    (segment / "fisheye_front" / "1.0.jpg").write_bytes(_jpeg())
+    (segment / "grid_map").mkdir()
+    (segment / "grid_map" / "1.0.json").write_bytes(gridmap)
+    (segment / "rout_plot_v2").mkdir()
+    projection, _width, _height = render_gridmap_png(gridmap)
+    (segment / "rout_plot_v2" / "1.0.png").write_bytes(projection)
+
+    imported = store.import_historical_verified_assets(
+        manifest_sha256="a" * 64,
+        assets=[
+            {
+                "dataset_date": "20260319",
+                "source_clip": "clip-a",
+                "segment_ordinal": 1,
+                "segment_total": 1,
+                "artifact_sha256": fix_sha,
+                "private_artifact_path": str(fix_path),
+            }
+        ],
+    )
+    review_ref = "review_" + imported["asset_refs"][0].removeprefix(
+        "verified_asset_"
+    )
+    reviews = store.list_reviews(status="approved", dataset_date="20260319")
+    assert [item["review_ref"] for item in reviews] == [review_ref]
+    assert reviews[0]["source"] == "historical_import"
+    assert reviews[0]["latest_publication"]["status"] == "published"
+    assert store.get_review(review_ref) == reviews[0]
+    assert store.list_reviews(status="pending", dataset_date="20260319") == []
+
+    service = AnnotationApplicationService(store=store, worker=object())
+    evidence = service.get_review_trajectory_evidence(review_ref)
+    assert evidence["evidence_kind"] == "historical_fix"
+    assert evidence["frame_count"] == 1
+    assert evidence["frames"][0]["camera"] is not None
+    assert evidence["frames"][0]["projection"] is not None
+    assert evidence["frames"][0]["gridmap"] is not None
+    assert evidence["frames"][0]["targets"][0]["position"] == [1.0, 2.0]
+    assert evidence["frames"][0]["targets"][0]["speed"] == pytest.approx(0.5)
+    assert {target["label"] for target in evidence["frames"][0]["targets"]} == {
+        "Master",
+        "couch",
+    }
+
+    content, _sha256, media_type = service.resolve_review_evidence_file(
+        review_ref,
+        frame_index=0,
+        kind="projection",
+    )
+    assert content == projection
+    assert media_type == "image/png"
+    with pytest.raises(
+        AnnotationConflictError,
+        match="Historical verified results are read-only",
+    ):
+        store.fix_runtime_input(review_ref)
 
 
 def test_historical_verified_import_refuses_inconsistent_or_native_scope(

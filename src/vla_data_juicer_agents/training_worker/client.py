@@ -6,9 +6,10 @@ import platform
 import ssl
 from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from .datasets import DatasetFileChunk
 from .identity import WorkerIdentity
 
 
@@ -43,6 +44,30 @@ class WorkerCenterClient(Protocol):
         payload: Mapping[str, object],
     ) -> Mapping[str, object]: ...
 
+    def poll_commands(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]: ...
+
+    def fetch_dataset_manifest_page(
+        self,
+        release_ref: str,
+        *,
+        cursor: int | None,
+        limit: int,
+    ) -> Mapping[str, object]: ...
+
+    def fetch_dataset_file_chunk(
+        self,
+        file_ref: str,
+        *,
+        offset: int,
+        max_bytes: int,
+    ) -> DatasetFileChunk: ...
+
 
 class NoRedirectHandler(HTTPRedirectHandler):
     """Reject every redirect so credentials cannot move to another origin."""
@@ -52,7 +77,7 @@ class NoRedirectHandler(HTTPRedirectHandler):
 
 
 class HttpCenterClient:
-    """Minimal fixed-origin JSON client for enrollment and heartbeat only."""
+    """Fixed-origin client for Worker control and managed dataset downloads."""
 
     def __init__(
         self,
@@ -150,12 +175,106 @@ class HttpCenterClient:
             bearer_token=self.worker_token,
         )
 
+    def poll_commands(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        if wait_seconds < 0 or wait_seconds > 30 or limit < 1 or limit > 10:
+            raise CenterClientError("worker command poll options are invalid")
+        return self._post_json(
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/commands/poll",
+            {
+                "worker_instance_id": identity.worker_id,
+                "wait_seconds": wait_seconds,
+                "limit": limit,
+            },
+            bearer_token=self.worker_token,
+            timeout_seconds=max(self.timeout_seconds, float(wait_seconds + 5)),
+        )
+
+    def fetch_dataset_manifest_page(
+        self,
+        release_ref: str,
+        *,
+        cursor: int | None,
+        limit: int,
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        if limit < 1 or limit > 1000:
+            raise CenterClientError("dataset manifest page limit is invalid")
+        query: dict[str, object] = {"limit": limit}
+        if cursor is not None:
+            if isinstance(cursor, bool) or cursor < 0:
+                raise CenterClientError("dataset manifest cursor is invalid")
+            query["cursor"] = cursor
+        path = (
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/dataset-releases/"
+            f"{quote(_validated_wire_ref(release_ref), safe='')}/manifest?{urlencode(query)}"
+        )
+        return self._get_json(path, bearer_token=self.worker_token)
+
+    def fetch_dataset_file_chunk(
+        self,
+        file_ref: str,
+        *,
+        offset: int,
+        max_bytes: int,
+    ) -> DatasetFileChunk:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        if offset < 0 or max_bytes < 1 or max_bytes > 16 * 1024 * 1024:
+            raise CenterClientError("dataset file range is invalid")
+        path = (
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/dataset-files/"
+            f"{quote(_validated_wire_ref(file_ref), safe='')}/content"
+        )
+        request = Request(
+            self.center_base_url + path,
+            method="GET",
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"Bearer {self.worker_token}",
+                "Range": f"bytes={offset}-{offset + max_bytes - 1}",
+                "User-Agent": f"datapilot-training-worker/{_worker_version()}",
+            },
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                raw_body = response.read(max_bytes + 1)
+                content_range = response.headers.get("Content-Range")
+        except HTTPError as exc:
+            raise CenterClientError(f"center rejected request with HTTP {exc.code}") from None
+        except (URLError, TimeoutError, OSError) as exc:
+            raise CenterClientError(f"center request failed ({type(exc).__name__})") from None
+        if len(raw_body) > max_bytes:
+            raise CenterClientError("center returned too much dataset file data")
+        if status == 200 and offset == 0:
+            total_size = len(raw_body)
+            return DatasetFileChunk(raw_body, 0, total_size, True)
+        if status != 206 or not isinstance(content_range, str):
+            raise CenterClientError("center returned an invalid dataset file range")
+        parsed_range = _parse_content_range(content_range)
+        if parsed_range is None:
+            raise CenterClientError("center returned an invalid dataset file range")
+        start, end, total_size = parsed_range
+        if start != offset or end - start + 1 != len(raw_body):
+            raise CenterClientError("center returned an invalid dataset file range")
+        return DatasetFileChunk(raw_body, start, total_size, end + 1 >= total_size)
+
     def _post_json(
         self,
         path: str,
         payload: Mapping[str, object],
         *,
         bearer_token: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         request = Request(
             self.center_base_url + path,
@@ -173,13 +292,48 @@ class HttpCenterClient:
             },
         )
         try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+            with self._opener.open(
+                request,
+                timeout=self.timeout_seconds if timeout_seconds is None else timeout_seconds,
+            ) as response:
                 raw_body = response.read(1024 * 1024 + 1)
         except HTTPError as exc:
             raise CenterClientError(f"center rejected request with HTTP {exc.code}") from None
         except (URLError, TimeoutError, OSError) as exc:
             raise CenterClientError(f"center request failed ({type(exc).__name__})") from None
         if len(raw_body) > 1024 * 1024:
+            raise CenterClientError("center response exceeded the size limit")
+        try:
+            parsed = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise CenterClientError("center returned an invalid JSON response") from None
+        if not isinstance(parsed, dict):
+            raise CenterClientError("center response must be a JSON object")
+        return parsed
+
+    def _get_json(
+        self,
+        path: str,
+        *,
+        bearer_token: str,
+    ) -> dict[str, Any]:
+        request = Request(
+            self.center_base_url + path,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {bearer_token}",
+                "User-Agent": f"datapilot-training-worker/{_worker_version()}",
+            },
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+                raw_body = response.read(4 * 1024 * 1024 + 1)
+        except HTTPError as exc:
+            raise CenterClientError(f"center rejected request with HTTP {exc.code}") from None
+        except (URLError, TimeoutError, OSError) as exc:
+            raise CenterClientError(f"center request failed ({type(exc).__name__})") from None
+        if len(raw_body) > 4 * 1024 * 1024:
             raise CenterClientError("center response exceeded the size limit")
         try:
             parsed = json.loads(raw_body.decode("utf-8"))
@@ -216,6 +370,33 @@ class OfflineCenterClient:
     ) -> Mapping[str, object]:
         return {}
 
+    def poll_commands(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]:
+        return {"commands": []}
+
+    def fetch_dataset_manifest_page(
+        self,
+        release_ref: str,
+        *,
+        cursor: int | None,
+        limit: int,
+    ) -> Mapping[str, object]:
+        raise CenterClientError("offline worker cannot read dataset manifests")
+
+    def fetch_dataset_file_chunk(
+        self,
+        file_ref: str,
+        *,
+        offset: int,
+        max_bytes: int,
+    ) -> DatasetFileChunk:
+        raise CenterClientError("offline worker cannot download dataset files")
+
 
 def capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
     return _capability_payload(resources)
@@ -240,6 +421,8 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
             "resource_inventory",
             "restart_reconciliation",
             "model_configuration_verification",
+            "directory_browser_v1",
+            "dataset_transfer_v1",
         ],
     }
 
@@ -282,3 +465,31 @@ def _worker_version() -> str:
         return version("vla-data-juicer-agents")
     except Exception:
         return "0.1.0"
+
+
+def _validated_wire_ref(value: str) -> str:
+    if (
+        not value
+        or len(value) > 255
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+            for character in value
+        )
+    ):
+        raise CenterClientError("worker dataset reference is invalid")
+    return value
+
+
+def _parse_content_range(value: str) -> tuple[int, int, int] | None:
+    if not value.startswith("bytes ") or "/" not in value or "-" not in value:
+        return None
+    try:
+        byte_range, raw_total = value[6:].split("/", 1)
+        raw_start, raw_end = byte_range.split("-", 1)
+        start, end, total = int(raw_start), int(raw_end), int(raw_total)
+    except (TypeError, ValueError):
+        return None
+    if start < 0 or end < start or total <= end:
+        return None
+    return start, end, total

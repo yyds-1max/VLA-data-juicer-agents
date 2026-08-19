@@ -1,8 +1,8 @@
 """Node-local Training Worker primitives.
 
-The v1 worker is deliberately control-plane only.  It inventories the host,
-persists its identity, and reconciles process observations recorded in its
-local ledger.  It does not start, stop, or signal training processes.
+The Worker inventories the host, persists its identity, reconciles process
+observations, and executes the fixed managed-dataset protocol. It still does
+not start, stop, or signal training processes.
 """
 
 from .daemon import TrainingWorkerDaemon
