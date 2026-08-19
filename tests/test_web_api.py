@@ -784,6 +784,54 @@ def test_navigation_dataset_event_cursor_is_public_and_starts_empty(tmp_path: Pa
     assert response.json() == {"cursor": 0}
 
 
+def test_navigation_dataset_reset_api_keeps_raw_data_and_removes_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "VLADatasets"
+    raw_clip = root / "raw_data" / "20270623" / "clip_a"
+    _write_dataset_metadata(raw_clip)
+    derived = [
+        root / "raw_data" / "20270623_temp",
+        root / "clip_data" / "20270623",
+        root / "finish_data" / "20270623_temp",
+        root / "finish_data" / "20270623",
+    ]
+    for path in derived:
+        path.mkdir(parents=True)
+        (path / "artifact.txt").write_text("derived", encoding="utf-8")
+    lock_root = tmp_path / "private-lock"
+    lock_root.mkdir(mode=0o700)
+    lock_root.chmod(0o700)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/navigation/datasets/20270623/reset",
+        headers={"Idempotency-Key": "web-reset-1"},
+        json={"confirmation": "20270623", "reason": "manual"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "raw_only"
+    assert response.json()["removed_artifacts"] == [
+        "raw_temp",
+        "clip_data",
+        "finish_temp",
+        "finish_data",
+    ]
+    assert raw_clip.is_dir()
+    assert all(not path.exists() for path in derived)
+    refreshed = client.get("/api/navigation/datasets/20270623")
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "raw_only"
+    assert refreshed.json()["annotation"] is None
+
+
 def test_navigation_dataset_summary_joins_annotation_lifecycle_without_changing_ingestion(
     tmp_path: Path,
     monkeypatch,

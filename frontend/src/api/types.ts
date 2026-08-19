@@ -290,6 +290,16 @@ export interface NavigationDatasetRelease extends DatasetReleaseProjection {
   dataset_date: string;
 }
 
+export interface NavigationDatasetResetResult {
+  reset_ref: string;
+  dataset_date: string;
+  status: "raw_only";
+  retired_job_count: number;
+  released_source_clip_count: number;
+  removed_artifacts: string[];
+  cleanup_pending: boolean;
+}
+
 export interface NavigationDatasetTotals {
   date_count: number;
   clip_count: number;

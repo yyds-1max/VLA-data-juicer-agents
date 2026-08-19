@@ -1771,6 +1771,136 @@ class AnnotationStore:
             callback=create,
         )
 
+    @staticmethod
+    def _require_dataset_resettable(
+        connection: sqlite3.Connection,
+        *,
+        dataset_date: str,
+    ) -> tuple[int, int]:
+        release = connection.execute(
+            """SELECT 1 FROM dataset_releases
+               WHERE domain = 'navigation' AND dataset_date = ?""",
+            (dataset_date,),
+        ).fetchone()
+        if release is not None:
+            raise AnnotationConflictError(
+                "dataset_already_released",
+                "Released datasets cannot be reset.",
+            )
+        historical = connection.execute(
+            """SELECT 1 FROM historical_verified_assets
+               WHERE dataset_date = ? LIMIT 1""",
+            (dataset_date,),
+        ).fetchone()
+        if historical is not None:
+            raise AnnotationConflictError(
+                "historical_dataset_immutable",
+                "Imported historical verified datasets cannot be reset.",
+            )
+        leased_jobs = connection.execute(
+            """SELECT DISTINCT j.id, j.status
+               FROM annotation_source_leases AS leases
+               JOIN annotation_jobs AS j ON j.id = leases.job_id
+               WHERE leases.dataset_date = ?""",
+            (dataset_date,),
+        ).fetchall()
+        job_ids = [int(row["id"]) for row in leased_jobs]
+        busy_statuses = {
+            "preparing",
+            "waiting_initial_annotation",
+            "tracking",
+            "postprocessing",
+        }
+        if any(str(row["status"]) in busy_statuses for row in leased_jobs):
+            raise AnnotationConflictError(
+                "annotation_workflow_active",
+                "The dataset has active annotation processing and cannot be reset.",
+            )
+        if job_ids:
+            placeholders = ",".join("?" for _ in job_ids)
+            active_run = connection.execute(
+                f"""SELECT 1 FROM runtime_runs
+                    WHERE job_id IN ({placeholders})
+                      AND status IN ('queued', 'running')
+                    LIMIT 1""",
+                job_ids,
+            ).fetchone()
+            if active_run is not None:
+                raise AnnotationConflictError(
+                    "annotation_runtime_active",
+                    "The dataset has active runtime work and cannot be reset.",
+                )
+            active_review = connection.execute(
+                f"""SELECT 1
+                    FROM trajectory_review_tasks AS reviews
+                    JOIN trajectory_revisions AS revisions
+                      ON revisions.id = reviews.trajectory_revision_id
+                    WHERE revisions.job_id IN ({placeholders})
+                      AND reviews.status = 'in_progress'
+                    LIMIT 1""",
+                job_ids,
+            ).fetchone()
+            if active_review is not None:
+                raise AnnotationConflictError(
+                    "trajectory_review_active",
+                    "The dataset has an active trajectory review and cannot be reset.",
+                )
+        lease_count = connection.execute(
+            """SELECT COUNT(*) FROM annotation_source_leases
+               WHERE dataset_date = ?""",
+            (dataset_date,),
+        ).fetchone()[0]
+        return len(job_ids), int(lease_count)
+
+    def dataset_reset_preflight(self, *, dataset_date: str) -> dict[str, int]:
+        with self._connect() as connection:
+            job_count, lease_count = self._require_dataset_resettable(
+                connection,
+                dataset_date=dataset_date,
+            )
+        return {
+            "retired_job_count": job_count,
+            "released_source_clip_count": lease_count,
+        }
+
+    def reset_unreleased_dataset(
+        self,
+        *,
+        dataset_date: str,
+        reset_ref: str,
+        removed_artifacts: list[str],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        request_payload = {
+            "dataset_date": dataset_date,
+            "reset_ref": reset_ref,
+        }
+
+        def reset(connection: sqlite3.Connection) -> dict[str, Any]:
+            job_count, lease_count = self._require_dataset_resettable(
+                connection,
+                dataset_date=dataset_date,
+            )
+            connection.execute(
+                "DELETE FROM annotation_source_leases WHERE dataset_date = ?",
+                (dataset_date,),
+            )
+            return {
+                "reset_ref": reset_ref,
+                "dataset_date": dataset_date,
+                "status": "raw_only",
+                "retired_job_count": job_count,
+                "released_source_clip_count": lease_count,
+                "removed_artifacts": removed_artifacts,
+            }
+
+        return self.mutate(
+            idempotency_key=idempotency_key,
+            operation="reset_unreleased_dataset",
+            request_payload=request_payload,
+            callback=reset,
+        )
+
     def import_historical_verified_assets(
         self,
         *,

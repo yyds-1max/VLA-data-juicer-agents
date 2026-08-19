@@ -14,6 +14,7 @@ import {
   listSessions,
   openSessionEvents,
   openTrainingEvents,
+  resetNavigationDataset,
   submitInteractionResponse,
   submitTurn,
 } from "./client";
@@ -338,6 +339,34 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/navigation/datasets/2026%2F06%2029", {
       headers: { "content-type": "application/json" },
     });
+  });
+
+  it("posts an idempotent navigation dataset reset with typed confirmation", async () => {
+    const result = {
+      reset_ref: "dataset_reset_0123456789abcdef0123456789abcdef",
+      dataset_date: "20270623",
+      status: "raw_only" as const,
+      retired_job_count: 1,
+      released_source_clip_count: 2,
+      removed_artifacts: ["clip_data", "finish_data"],
+      cleanup_pending: false,
+    };
+    const fetchMock = mockFetchJson(result);
+
+    await expect(
+      resetNavigationDataset("2027/06 23", "20270623", "reset-request-1"),
+    ).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/navigation/datasets/2027%2F06%2023/reset",
+      {
+        method: "POST",
+        body: JSON.stringify({ confirmation: "20270623", reason: "manual" }),
+        headers: {
+          "Idempotency-Key": "reset-request-1",
+          "content-type": "application/json",
+        },
+      },
+    );
   });
 
   it("encodes the clip when listing sync images", async () => {

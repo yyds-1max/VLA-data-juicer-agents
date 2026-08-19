@@ -11,6 +11,7 @@ import {
   Info,
   Layers3,
   RefreshCw,
+  RotateCcw,
   Search,
   X,
   type LucideIcon,
@@ -24,6 +25,7 @@ import {
   getNavigationDatasetReleases,
   getSyncImages,
   getSyncImageUrl,
+  resetNavigationDataset,
 } from "../../../api/client";
 import type {
   AnnotationLifecycleProjection,
@@ -511,12 +513,14 @@ function DatasetTable({
   expandedDate,
   highlightedClip,
   onToggleDate,
+  onResetDate,
   onViewSyncImages,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
   highlightedClip: string | null;
   onToggleDate: (date: string) => void;
+  onResetDate: (date: NavigationDateSummary) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
   const datasetScrollbar = useScrollbarProximity();
@@ -549,12 +553,13 @@ function DatasetTable({
               <th className="pr-3 font-medium">修正 / 复核</th>
               <th className="pr-3 font-medium">训练发布</th>
               <th className="pr-3 font-medium">详情</th>
+              <th className="pr-4 text-right font-medium">操作</th>
             </tr>
           </thead>
           <tbody>
             {dates.length === 0 ? (
               <tr>
-                <td colSpan={8} className="h-[19rem] px-4 text-center text-sm text-slate-500">
+                <td colSpan={9} className="h-[19rem] px-4 text-center text-sm text-slate-500">
                   <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-400">
                     <Layers3 aria-hidden="true" className="size-5" />
                   </span>
@@ -608,6 +613,28 @@ function DatasetTable({
                           { label: "同步图像帧", value: formatCount(date.sync_frame_counts.image) },
                         ]}
                       />
+                    </td>
+                    <td className="pr-4 text-right">
+                      <button
+                        aria-label={`重置 ${date.date}`}
+                        className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-rose-600 transition-colors hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent"
+                        disabled={
+                          date.release?.status === "released"
+                          || (date.status === "raw_only" && !date.annotation && !date.review)
+                        }
+                        onClick={() => onResetDate(date)}
+                        title={
+                          date.release?.status === "released"
+                            ? "已发布数据不可重置"
+                            : date.status === "raw_only" && !date.annotation && !date.review
+                              ? "当前已是原始采集数据状态"
+                              : undefined
+                        }
+                        type="button"
+                      >
+                        <RotateCcw aria-hidden="true" className="size-3.5" />
+                        重置
+                      </button>
                     </td>
                   </tr>
                   {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
@@ -1363,6 +1390,11 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
   const [dataPilotDialogOpen, setDataPilotDialogOpen] = useState(false);
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
+  const [resetDate, setResetDate] = useState<NavigationDateSummary | null>(null);
+  const [resetConfirmation, setResetConfirmation] = useState("");
+  const [resetIdempotencyKey, setResetIdempotencyKey] = useState("");
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const { summary: datasetSummary, loading, error, reload } = useNavigationDatasetSummary();
   const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const syncImageOpenerRef = useRef<HTMLElement | null>(null);
@@ -1527,6 +1559,38 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     }
   }
 
+  function handleOpenReset(date: NavigationDateSummary) {
+    setResetDate(date);
+    setResetConfirmation("");
+    setResetIdempotencyKey(createDatasetResetIdempotencyKey());
+    setResetError(null);
+  }
+
+  async function handleConfirmReset() {
+    if (!resetDate || resetConfirmation !== resetDate.date || !resetIdempotencyKey || resetting) return;
+    setResetting(true);
+    setResetError(null);
+    try {
+      await resetNavigationDataset(
+        resetDate.date,
+        resetConfirmation,
+        resetIdempotencyKey,
+      );
+      setResetDate(null);
+      setResetConfirmation("");
+      setResetIdempotencyKey("");
+      await reload();
+    } catch (resetFailure) {
+      setResetError(
+        resetFailure instanceof Error
+          ? resetFailure.message
+          : "重置失败，请稍后重试。",
+      );
+    } finally {
+      setResetting(false);
+    }
+  }
+
   return (
     <section className="mx-auto max-w-360 space-y-4 px-3 pb-28 pt-2 md:px-4 lg:px-5">
       {releaseSurface ? (
@@ -1622,6 +1686,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
                 expandedDate={effectiveExpandedDate}
                 highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
                 onToggleDate={handleToggleDate}
+                onResetDate={handleOpenReset}
                 onViewSyncImages={handleViewSyncImages}
               />
             )}
@@ -1641,6 +1706,62 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
         onConfirm={handleConfirmDataPilot}
         onSelectionChange={handleDataPilotSelectionChange}
       />
+      <Dialog
+        open={resetDate !== null}
+        onOpenChange={(open) => {
+          if (!open && !resetting) {
+            setResetDate(null);
+            setResetConfirmation("");
+            setResetIdempotencyKey("");
+            setResetError(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>重置 {resetDate?.date}</DialogTitle>
+            <DialogDescription>
+              将删除该日期的拆解、同步、标注、修正和最终产物，只保留原始采集数据。历史记录会保留，重置后可重新交给 DataPilot 处理。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              已发布或正在处理的数据不会被重置。此操作不会自动启动新的处理任务。
+            </div>
+            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+              输入日期 <span className="font-mono">{resetDate?.date}</span> 确认
+              <Input
+                aria-label="输入日期确认重置"
+                autoComplete="off"
+                disabled={resetting}
+                maxLength={8}
+                onChange={(event) => setResetConfirmation(event.target.value)}
+                placeholder={resetDate?.date}
+                value={resetConfirmation}
+              />
+            </label>
+            {resetError ? <p className="text-sm text-rose-600" role="alert">{resetError}</p> : null}
+          </div>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button disabled={resetting} type="button" variant="outline">取消</Button>
+            </DialogClose>
+            <Button
+              disabled={
+                !resetDate
+                || resetConfirmation !== resetDate.date
+                || !resetIdempotencyKey
+                || resetting
+              }
+              onClick={() => void handleConfirmReset()}
+              type="button"
+              variant="destructive"
+            >
+              {resetting ? "正在重置..." : "确认重置"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
         </>
       )}
     </section>
@@ -1659,4 +1780,11 @@ function createReleaseIdempotencyKey(): string {
     return `dataset-release-${crypto.randomUUID()}`;
   }
   return `dataset-release-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createDatasetResetIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `dataset-reset-${crypto.randomUUID()}`;
+  }
+  return `dataset-reset-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }

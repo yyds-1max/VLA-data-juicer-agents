@@ -48,15 +48,13 @@ checkpoints/
 *.pth
 *.safetensors
 
-# Project-local docs and agent working notes
-!docs/
-docs/*
-!docs/datapilot-contract-v1-operations.md
-!docs/architecture.md
-!docs/automatic-annotation-*.md
-!docs/training-simulation.md
-!docs/data-asset-lifecycle-contract.md
-docs/2026-07-17-navigation-agent-deferred-issues.md
+# Only the public entrypoint and the two deployment/runtime READMEs stay in Git.
+# Navigation agent guidance is a runtime prompt resource rather than handoff docs.
+*.md
+!/README.md
+!/deployment/systemd/README.md
+!/runtime/navigation_odom_v1/README.md
+!/docs/navigation-plan-agent-guidance.md
 /DATAPILOT_ROUTING_SINGLE_AGENT_HANDOFF.md
 
 # 数据

@@ -13,8 +13,6 @@ Stage one intentionally excludes `run_fix.sh`; it is out of scope and is not run
 This describes the current Navigation Agent implementation. The automatic
 annotation module starts from synchronized artifacts, replaces the legacy GUI,
 and connects three-dimensional review/Fix and data-asset lifecycle management.
-Its implemented boundaries and operational constraints are recorded in
-[`docs/automatic-annotation-development-summary.md`](docs/automatic-annotation-development-summary.md).
 
 ## WSL setup
 
@@ -99,9 +97,8 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 The model-training page currently executes only simulated training runs. Its
 node page can separately deploy the read-only Training Worker through one
 explicit SSH authorization when a reachable HTTPS center origin is configured;
-the Worker still cannot execute a displayed RunSpec. See
-[`docs/training-simulation.md`](docs/training-simulation.md) for the explicit
-development-admin switch and local acceptance flow.
+the Worker still cannot execute a displayed RunSpec. Real training remains
+disabled until the dedicated runner milestone is implemented.
 
 For server use, run the bundled web script from the repository root. It builds the frontend, starts
 the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
@@ -303,11 +300,3 @@ npm test
 npm run build
 npm run e2e
 ```
-
-## Runtime isolation
-
-See `docs/navigation-runtime-isolation.md` for the Agent/legacy runtime split, required environment variables, server preflight checks, wrapper behavior, dry-run verification, and operational boundaries.
-
-## Server runbook
-
-See `docs/navigation-server-runbook.md` for server setup, dry-run, and full execution commands.

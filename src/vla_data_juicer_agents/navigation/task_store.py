@@ -17,6 +17,7 @@ from vla_data_juicer_agents.navigation.schema import (
 
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
+    TERMINAL_NAVIGATION_TASK_STATUSES,
     NavigationRunningWriter,
     NavigationTask,
     NavigationTaskLineage,
@@ -333,6 +334,21 @@ class SqliteNavigationTaskStore:
                 segments=writer_segments,
             )
         return None
+
+    def find_nonterminal_for_date(self, date: str) -> NavigationTask | None:
+        if not self.db_path.exists():
+            return None
+        terminal = sorted(status.value for status in TERMINAL_NAVIGATION_TASK_STATUSES)
+        placeholders = ", ".join("?" for _ in terminal)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""SELECT * FROM navigation_tasks
+                    WHERE date = ? AND status NOT IN ({placeholders})
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT 1""",
+                (date, *terminal),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
 
     def get_task(self, task_id: str) -> NavigationTask | None:
         with self._connect() as connection:

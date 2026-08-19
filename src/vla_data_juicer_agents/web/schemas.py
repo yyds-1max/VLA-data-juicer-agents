@@ -18,6 +18,7 @@ MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
 TurnOrigin = Literal["user", "system", "interaction"]
 TurnStatus = Literal["running", "waiting", "completed", "failed", "interrupted"]
+DatasetResetReason = Literal["manual"]
 _MAX_REQUEST_CONTEXT_BYTES = 3_000
 
 
@@ -91,6 +92,13 @@ class SessionDetail(SessionRecord):
 
 class CreateSessionResponse(BaseModel):
     session: SessionRecord
+
+
+class ResetNavigationDatasetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=8, max_length=8, pattern=r"^[0-9]{8}$")
+    reason: DatasetResetReason = "manual"
 
 
 class AllClipsSelectionV1(BaseModel):

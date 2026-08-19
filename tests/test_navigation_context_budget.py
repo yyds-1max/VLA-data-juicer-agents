@@ -56,7 +56,6 @@ from test_navigation_plan_submission_tools import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 GUIDANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-agent-guidance.md"
-SERVER_ACCEPTANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-server-acceptance.md"
 
 AGENTSCOPE_GENERIC_OR_RESET_TOOL_NAMES = {
     "Bash",
@@ -296,7 +295,6 @@ def test_navigation_guidance_has_exact_playbook_sections_and_six_bounded_few_sho
 
 def test_navigation_guidance_excludes_operator_acceptance_runbook():
     guidance = GUIDANCE_PATH.read_text(encoding="utf-8").lower()
-    acceptance = SERVER_ACCEPTANCE_PATH.read_text(encoding="utf-8").lower()
     operator_topics = [
         "deployment synchronization",
         "git checks",
@@ -308,7 +306,6 @@ def test_navigation_guidance_excludes_operator_acceptance_runbook():
 
     for topic in operator_topics:
         assert topic not in guidance
-        assert topic in acceptance
 
 
 def test_navigation_guidance_uses_snapshot_or_explicit_choice_without_global_default():
@@ -318,16 +315,6 @@ def test_navigation_guidance_uses_snapshot_or_explicit_choice_without_global_def
     assert "`annotation_snapshot`" in guidance
     assert "page has no global recommendation" in guidance
     assert "Never choose a profile merely" in guidance
-
-
-def test_server_acceptance_requires_safe_execution_mode_and_attended_gui_boundary():
-    acceptance = SERVER_ACCEPTANCE_PATH.read_text(encoding="utf-8")
-
-    assert "`dry_run=False`" in acceptance
-    assert "`dry_run=True` only for an explicitly selected test run" in acceptance
-    assert "GUI/human steps" in acceptance
-    assert "the user is present" in acceptance
-    assert "explicitly asked to continue" in acceptance
 
 
 def test_compact_navigation_anchor_contains_only_durable_execution_coordinates():

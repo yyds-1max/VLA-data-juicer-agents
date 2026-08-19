@@ -4,6 +4,7 @@ import type {
   InteractionResponseResult,
   NavigationDatasetSummary,
   NavigationDatasetRelease,
+  NavigationDatasetResetResult,
   NavigationDateSummary,
   NavigationSyncImageListing,
   SessionDetail,
@@ -203,6 +204,21 @@ export async function createNavigationDatasetRelease(
         expected_scope_manifest_sha256: expectedScopeManifestSha256,
         note,
       }),
+    },
+  );
+}
+
+export async function resetNavigationDataset(
+  date: string,
+  confirmation: string,
+  idempotencyKey: string,
+): Promise<NavigationDatasetResetResult> {
+  return requestJson<NavigationDatasetResetResult>(
+    `${navigationDatasetPath(date)}/reset`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ confirmation, reason: "manual" }),
     },
   );
 }

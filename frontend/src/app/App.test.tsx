@@ -19,6 +19,7 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  resetNavigationDataset,
   submitTurn,
 } from "../api/client";
 import type { NavigationDatasetSummary, SessionDetail, TrainingCapabilities, TrainingServer, TrainingServerResources } from "../api/types";
@@ -52,6 +53,7 @@ vi.mock("../api/client", () => ({
   submitTurn: vi.fn(),
   interruptTurn: vi.fn(),
   openSessionEvents: vi.fn(),
+  resetNavigationDataset: vi.fn(),
 }));
 
 const apiMocks = vi.mocked({
@@ -73,6 +75,7 @@ const apiMocks = vi.mocked({
   submitTurn,
   interruptTurn,
   openSessionEvents,
+  resetNavigationDataset,
 });
 
 type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][number] & {
@@ -280,6 +283,15 @@ beforeEach(() => {
     deployment_instance: "test",
     released_at: "2026-08-10T00:00:00Z",
     updated_at: "2026-08-10T00:00:00Z",
+  });
+  apiMocks.resetNavigationDataset.mockResolvedValue({
+    reset_ref: "dataset_reset_0123456789abcdef0123456789abcdef",
+    dataset_date: "20270515",
+    status: "raw_only",
+    retired_job_count: 1,
+    released_source_clip_count: 2,
+    removed_artifacts: ["raw_temp", "clip_data", "finish_temp", "finish_data"],
+    cleanup_pending: false,
   });
   apiMocks.getSyncImages.mockResolvedValue({
     date: "20270515",
@@ -521,7 +533,7 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
   expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
   expect(screen.getByRole("columnheader", { name: "详情" })).toBeVisible();
-  expect(screen.queryByRole("columnheader", { name: "操作" })).not.toBeInTheDocument();
+  expect(screen.getByRole("columnheader", { name: "操作" })).toBeVisible();
   expect(screen.queryByRole("tab", { name: "数据资产" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "数据资产" })).toHaveAttribute("aria-current", "page");
   expect(screen.getByRole("button", { name: "训练发布" })).not.toHaveAttribute("aria-current");
@@ -566,6 +578,58 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+});
+
+test("data management resets an unreleased date only after typed confirmation", async () => {
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+
+  const resetButton = await screen.findByRole("button", { name: "重置 20270515" });
+  expect(resetButton).toBeEnabled();
+  fireEvent.click(resetButton);
+
+  const dialog = screen.getByRole("dialog", { name: "重置 20270515" });
+  const confirmButton = within(dialog).getByRole("button", { name: "确认重置" });
+  expect(confirmButton).toBeDisabled();
+  fireEvent.change(within(dialog).getByRole("textbox", { name: "输入日期确认重置" }), {
+    target: { value: "20270515" },
+  });
+  expect(confirmButton).toBeEnabled();
+  fireEvent.click(confirmButton);
+
+  await waitFor(() => {
+    expect(apiMocks.resetNavigationDataset).toHaveBeenCalledWith(
+      "20270515",
+      "20270515",
+      expect.stringMatching(/^dataset-reset-/),
+    );
+  });
+  await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2));
+  expect(screen.queryByRole("dialog", { name: "重置 20270515" })).not.toBeInTheDocument();
+});
+
+test("data management disables reset for a released date", async () => {
+  const summary = navigationDatasetSummaryFixture();
+  summary.dates[0].release = {
+    status: "released",
+    release_ref: "dataset_release_0123456789abcdef0123456789abcdef",
+    source_clip_count: 2,
+    total_duration_ns: 3_500_000_000,
+    verified_unit_count: 2,
+    discarded_unit_count: 0,
+    scope_manifest_sha256: "a".repeat(64),
+    note: null,
+    actor_kind: "manual_web",
+    deployment_instance: "test",
+    released_at: "2026-08-19T00:00:00Z",
+    updated_at: "2026-08-19T00:00:00Z",
+  };
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue(summary);
+
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+
+  expect(await screen.findByRole("button", { name: "重置 20270515" })).toBeDisabled();
 });
 
 test("data management exposes asset and training release subpages in the sidebar", async () => {

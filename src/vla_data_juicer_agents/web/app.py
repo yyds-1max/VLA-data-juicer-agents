@@ -52,6 +52,9 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_date,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.dataset_reset import (
+    reset_navigation_dataset,
+)
 from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
 from vla_data_juicer_agents.training.datasets import (
@@ -82,6 +85,7 @@ from vla_data_juicer_agents.web.schemas import (
     InterruptResponse,
     InteractionResponse,
     InteractionResponseRequest,
+    ResetNavigationDatasetRequest,
 )
 from vla_data_juicer_agents.web.contract_models import ContractConflictError
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
@@ -615,6 +619,38 @@ def create_app(
                     detail={"code": exc.code, "message": str(exc)},
                 ) from exc
             except (ValueError, FileNotFoundError) as exc:
+                _raise_navigation_http_error(exc)
+
+        @app.post("/api/navigation/datasets/{date}/reset")
+        async def reset_navigation_dataset_date(
+            date: str,
+            request: ResetNavigationDatasetRequest,
+            idempotency_key: str = Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=200,
+            ),
+        ) -> dict[str, Any]:
+            try:
+                return await asyncio.to_thread(
+                    reset_navigation_dataset,
+                    dataset_date=date,
+                    confirmation=request.confirmation,
+                    idempotency_key=idempotency_key,
+                    annotation_store=annotation_store,
+                    task_store=annotation_gateway.task_store,
+                )
+            except AnnotationConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            except AnnotationValidationError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            except ValueError as exc:
                 _raise_navigation_http_error(exc)
 
         @app.get("/api/navigation/datasets/{date}")
