@@ -122,6 +122,7 @@ def build_navigation_observation_tools(
     annotation_gateway: NavigationAnnotationGateway | None = None,
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
+    minimum_finish_observation_revision: int = 0,
 ) -> list[FunctionTool]:
     def append_observation(
         *,
@@ -256,7 +257,7 @@ def build_navigation_observation_tools(
         )
 
     def inspect_gridmap_state() -> dict[str, Any]:
-        """Inspect existing gridmap artifacts and projection readiness."""
+        """Refresh synchronized PCD sources, gridmap artifacts, and projection readiness."""
         raw = inspect_gridmap_artifacts(
             task.date,
             segments=task.segments,
@@ -339,8 +340,11 @@ def build_navigation_observation_tools(
         )
 
     def get_navigation_task_context() -> dict[str, Any]:
-        """Return the bounded factual, stage-neutral context for the bound task."""
+        """Return current facts; stale post-extract facts are omitted until reinspected."""
         observation = observation_store.latest(task.task_id)
+        latest_evidence_revisions = observation_store.latest_evidence_revisions(
+            task.task_id
+        )
         evidence = observation_store.list_evidence(
             task.task_id,
             limit=101,
@@ -350,6 +354,10 @@ def build_navigation_observation_tools(
             observation=observation,
             evidence=evidence,
             capabilities=list_navigation_tool_capabilities(),
+            minimum_finish_observation_revision=(
+                minimum_finish_observation_revision
+            ),
+            latest_evidence_revisions=latest_evidence_revisions,
         ).model_dump(mode="json")
 
     def list_observation_evidence(

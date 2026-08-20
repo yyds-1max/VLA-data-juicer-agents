@@ -232,29 +232,52 @@ def build_navigation_tool_groups(
 ) -> dict[str, NavigationToolGroupDefinition]:
     task = snapshot.task
     task_outcome = services.task_store.get_task_outcome(task.task_id)
+    requested_outcome = (
+        task_outcome.requested_outcome if task_outcome is not None else "auto"
+    )
+    minimum_finish_observation_revision = (
+        services.plan_store.get_finish_observation_revision_floor(task.task_id)
+    )
     is_trajectory_review = task.target == "trajectory_review"
     is_finish_processing = bool(
-        task_outcome
-        and task_outcome.requested_outcome
-        in {"postprocessing", "postprocessing_and_fix"}
+        requested_outcome in {"postprocessing", "postprocessing_and_fix"}
+        or task.accepted_plan_phase == "finish_processing"
+        or (
+            requested_outcome == "auto"
+            and task.accepted_plan_phase == "extract_sync"
+            and minimum_finish_observation_revision > 0
+        )
     )
+    observation = services.observation_store.latest(task.task_id)
+    latest_evidence_revisions = (
+        services.observation_store.latest_evidence_revisions(task.task_id)
+    )
+    annotation_fresh = (
+        minimum_finish_observation_revision <= 0
+        or latest_evidence_revisions.get("annotation_job_facts", 0)
+        > minimum_finish_observation_revision
+    )
+    annotation_ready = annotation_fresh and m2_annotation_ready_for_postprocessing(
+        observation
+    )
+    submission_ready = m2_finish_observations_complete(
+        observation,
+        latest_evidence_revisions=latest_evidence_revisions,
+        minimum_observation_revision=minimum_finish_observation_revision,
+    ) and (annotation_ready or task.scene_mode in {"in", "out"})
+    planning_tool_names = set(_FIXED_TOOL_NAMES_BY_ACTIVITY["planning"])
+    if not submission_ready:
+        planning_tool_names.discard("submit_finish_processing_plan_tool")
     finish_processing_planning_tool_names = set(
         _FINISH_PROCESSING_PLANNING_TOOL_NAMES
     )
     if is_finish_processing:
-        observation = services.observation_store.latest(task.task_id)
-        annotation_ready = m2_annotation_ready_for_postprocessing(observation)
-        submission_ready = m2_finish_observations_complete(observation) and (
-            annotation_ready or task.scene_mode in {"in", "out"}
-        )
         if not submission_ready:
             finish_processing_planning_tool_names.discard(
                 "submit_finish_processing_plan_tool"
             )
         if (
             not annotation_ready
-            and observation is not None
-            and "annotation_job_facts" in observation.completed_kinds
             and task.scene_mode not in {"in", "out"}
         ):
             finish_processing_planning_tool_names.add(
@@ -273,6 +296,9 @@ def build_navigation_tool_groups(
         annotation_gateway=services.annotation_gateway,
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
+        minimum_finish_observation_revision=(
+            minimum_finish_observation_revision
+        ),
     )
     fixed_tools: list[ToolBase] = list(observation_tools)
     execution_tools: list[ToolBase] = []
@@ -301,6 +327,9 @@ def build_navigation_tool_groups(
                 expected_agentscope_session_id=agentscope_session_id,
             )
         )
+        fixed_tools = [
+            tool for tool in fixed_tools if tool.name in planning_tool_names
+        ]
     elif snapshot.active_plan is not None and snapshot.activity in {
         "execution",
         "recovery_required",
@@ -377,7 +406,11 @@ def build_navigation_tool_groups(
     }:
         expected_fixed_names = _NARROW_EXECUTION_STATE_TOOL_NAMES
     else:
-        expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
+        expected_fixed_names = (
+            planning_tool_names
+            if snapshot.activity == "planning"
+            else _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
+        )
     if actual_fixed_names != expected_fixed_names:
         missing = sorted(expected_fixed_names - actual_fixed_names)
         unexpected = sorted(actual_fixed_names - expected_fixed_names)
@@ -436,7 +469,9 @@ def build_navigation_tool_groups(
                     if is_trajectory_review
                     else (
                         "Use the latest task context to diagnose missing scene_mode "
-                        "or observation facts. If the finish-Plan submission tool is "
+                        "or observation facts. Facts captured before a completed "
+                        "extract/sync stage are stale and must be reinspected. If the "
+                        "finish-Plan submission tool is "
                         "absent, continue only with available bounded inspection or "
                         "guidance tools and do not guess hidden submission or "
                         "execution tools. Immediately before submission, read the "

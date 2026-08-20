@@ -29,7 +29,10 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanValidationReport,
     TrajectoryReviewPlanInput,
 )
-from vla_data_juicer_agents.navigation.planning_context import PLAN_REQUIRED_OBSERVATIONS
+from vla_data_juicer_agents.navigation.planning_context import (
+    PLAN_REQUIRED_OBSERVATIONS,
+    stale_finish_observation_kinds,
+)
 from vla_data_juicer_agents.navigation.profiles import topic_route
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
@@ -1131,6 +1134,8 @@ def validate_navigation_plan(
     plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
     evidence: Sequence[EvidenceDescriptor],
     capabilities: Sequence[ToolCapability] | dict[str, Any],
+    minimum_finish_observation_revision: int = 0,
+    require_finish_annotation_facts: bool = False,
 ) -> PlanValidationReport:
     """Validate one complete model-authored phase plan without mutating stores."""
     errors: list[PlanValidationIssue] = []
@@ -1161,6 +1166,8 @@ def validate_navigation_plan(
             )
         )
     required = PLAN_REQUIRED_OBSERVATIONS[phase]
+    if phase == "finish_processing" and require_finish_annotation_facts:
+        required = (*required, "annotation_job_facts")
     missing = [kind for kind in required if kind not in observation.completed_kinds]
     if missing:
         errors.append(
@@ -1171,6 +1178,32 @@ def validate_navigation_plan(
                 missing,
             )
         )
+    if phase == "finish_processing" and minimum_finish_observation_revision > 0:
+        latest_evidence_revisions: dict[str, int] = {}
+        for descriptor in evidence:
+            if descriptor.task_id != task.task_id:
+                continue
+            latest_evidence_revisions[descriptor.kind] = max(
+                descriptor.observation_revision,
+                latest_evidence_revisions.get(descriptor.kind, 0),
+            )
+        stale = stale_finish_observation_kinds(
+            observation,
+            latest_evidence_revisions=latest_evidence_revisions,
+            minimum_observation_revision=minimum_finish_observation_revision,
+        )
+        if stale:
+            errors.append(
+                _plan_issue(
+                    "observation.completed_kinds",
+                    "stale_required_observation",
+                    (
+                        "Finish facts captured before extract/sync completion "
+                        "must be reinspected"
+                    ),
+                    stale,
+                )
+            )
     annotation_facts = _payload_of_type(
         observation,
         AnnotationJobFactsObservation,

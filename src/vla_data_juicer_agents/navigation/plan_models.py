@@ -70,7 +70,13 @@ class LocalizationDecision(DecisionBase):
 
 
 class GridmapDecision(DecisionBase):
-    source: Literal["existing_gridmap", "generated_from_pcd", "projection_ready"]
+    source: Literal["existing_gridmap", "generated_from_pcd", "projection_ready"] = Field(
+        description=(
+            "Select only a source returned by the latest gridmap inspection: "
+            "existing_gridmap for an existing map path, generated_from_pcd for "
+            "synchronized PCD inputs, or projection_ready for already prepared inputs."
+        )
+    )
 
 
 class CalibrationDecision(DecisionBase):
@@ -78,9 +84,25 @@ class CalibrationDecision(DecisionBase):
         "hardcoded_with_user_confirmation",
         "selected_profile",
         "annotation_snapshot",
-    ]
-    selected_sensor_source: str | None
-    requires_user_confirmation: bool
+    ] = Field(
+        description=(
+            "Use selected_profile for a calibration inventory profile (the source "
+            "may be deferred to structured user confirmation), annotation_snapshot "
+            "only when a tracked Annotation Job reports a processing snapshot, and "
+            "hardcoded_with_user_confirmation only with an explicit observed source."
+        )
+    )
+    selected_sensor_source: str | None = Field(
+        description=(
+            "Exact observed calibration inventory source. May be null only for "
+            "annotation_snapshot or a selected_profile deferred to confirmation."
+        )
+    )
+    requires_user_confirmation: bool = Field(
+        description=(
+            "True only when the Plan includes confirm_navigation_calibration_params."
+        )
+    )
 
     @model_validator(mode="after")
     def validate_source_contract(self) -> "CalibrationDecision":
@@ -228,6 +250,13 @@ FinishProcessingStepInput = Annotated[
     | ValidateOutputsStep,
     Field(discriminator="action"),
 ]
+ApplicationFinishProcessingStepInput = Annotated[
+    ConfirmCalibrationStep
+    | AnnotationTrackingWorkflowStep
+    | AnnotationPostprocessingWorkflowStep
+    | ValidateOutputsStep,
+    Field(discriminator="action"),
+]
 TrajectoryReviewStepInput = Annotated[
     OpenTrajectoryFixWorkbenchStep | ValidateTrajectoryReviewOutcomeStep,
     Field(discriminator="action"),
@@ -262,6 +291,13 @@ class ExtractSyncPlanInput(StrictModel):
 class FinishProcessingPlanInput(StrictModel):
     decisions: FinishProcessingDecisions
     steps: list[FinishProcessingStepInput] = Field(min_length=1)
+
+
+class ApplicationFinishProcessingPlanInput(StrictModel):
+    """Model-facing finish Plan limited to Annotation Application Service actions."""
+
+    decisions: FinishProcessingDecisions
+    steps: list[ApplicationFinishProcessingStepInput] = Field(min_length=1)
 
 
 class TrajectoryReviewPlanInput(StrictModel):

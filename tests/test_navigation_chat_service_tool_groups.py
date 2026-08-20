@@ -801,10 +801,8 @@ async def test_plan_acceptance_switches_to_execution_within_same_reply(
 
     planning_names = schema_names(model.invocations[0].tools)
     execution_names = schema_names(model.invocations[1].tools)
-    assert {
-        "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
-    } <= planning_names
+    assert "submit_extract_sync_plan_tool" in planning_names
+    assert "submit_finish_processing_plan_tool" not in planning_names
     assert "prepare_raw_data_tool" not in planning_names
     assert {"get_current_plan_step_tool", "prepare_raw_data_tool"} <= execution_names
     assert "describe_processing_action_tool" not in execution_names
@@ -847,10 +845,8 @@ async def test_failed_plan_submission_keeps_planning_surface_in_same_reply(
     )
 
     next_names = schema_names(model.invocations[1].tools)
-    assert {
-        "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
-    } <= next_names
+    assert "submit_extract_sync_plan_tool" in next_names
+    assert "submit_finish_processing_plan_tool" not in next_names
     assert EXECUTION_TOOL_NAMES.isdisjoint(next_names)
     assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(next_names)
     result = latest_tool_result_json(storage.updated_state.context)
@@ -864,7 +860,7 @@ async def test_failed_plan_submission_keeps_planning_surface_in_same_reply(
             "allowed_values": [],
         }
     ]
-    assert result["retry"] == "resubmit_complete_plan"
+    assert result["retry"] == "refresh_planning_context"
     assert services.plan_store.get_active_for_task(built.task.task_id) is None
     model.assert_exhausted()
 
@@ -992,12 +988,10 @@ async def test_final_extract_action_switches_back_to_planning_in_same_reply(
     )
 
     after_final_names = schema_names(model.invocations[1].tools)
-    assert {
-        "inspect_navigation_artifact_state_tool",
-        "inspect_navigation_raw_metadata_tool",
-        "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
-    } <= after_final_names
+    assert "inspect_navigation_artifact_state_tool" in after_final_names
+    assert "inspect_navigation_raw_metadata_tool" not in after_final_names
+    assert "submit_extract_sync_plan_tool" not in after_final_names
+    assert "submit_finish_processing_plan_tool" not in after_final_names
     assert EXECUTION_TOOL_NAMES.isdisjoint(after_final_names)
     assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(after_final_names)
     assert processing_spy.calls == [("prepare_raw_data", 1)]
@@ -1026,6 +1020,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
             monkeypatch,
             tmp_path,
             web_session_id="web-two-stage",
+            annotation_gateway=AnnotationGatewaySpy(),
         )
     )
     extract_plan = _activate_extract_plan(services, built, one_step=True)
@@ -1082,6 +1077,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         "inspect_navigation_runtime_assets_tool",
         "inspect_navigation_calibration_inventory_tool",
         "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_annotation_job_facts_tool",
     ):
         model.enqueue_tool(name, {})
     model.enqueue_tool("get_navigation_task_context_tool", {})
@@ -1175,12 +1171,12 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     )
     for invocation in model.invocations[second_run_start : finish_submission_index + 1]:
         names = schema_names(invocation.tools)
-        assert {
-            "submit_extract_sync_plan_tool",
-            "submit_finish_processing_plan_tool",
-        } <= names
+        assert "submit_extract_sync_plan_tool" not in names
         assert EXECUTION_TOOL_NAMES.isdisjoint(names)
         assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(names)
+    assert "submit_finish_processing_plan_tool" in schema_names(
+        model.invocations[finish_submission_index].tools
+    )
     human_decision_index = _invocation_index_for_tool(
         model,
         "confirm_navigation_calibration_params_tool",
@@ -1205,11 +1201,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     assert "submit_extract_sync_plan_tool" not in finish_execution_names
     assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(finish_execution_names)
     after_finish_names = schema_names(model.invocations[after_finish_index].tools)
-    assert {
-        "inspect_navigation_artifact_state_tool",
-        "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
-    } <= after_finish_names
+    assert after_finish_names == set()
     assert EXECUTION_TOOL_NAMES.isdisjoint(after_finish_names)
     assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(after_finish_names)
     assert processing_spy.calls == [

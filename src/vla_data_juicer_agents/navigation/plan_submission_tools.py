@@ -18,6 +18,7 @@ from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
 from vla_data_juicer_agents.navigation.plan_models import (
+    ApplicationFinishProcessingPlanInput,
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
     PlanSubmissionAttempt,
@@ -135,11 +136,24 @@ def _compact_failure(
     report: PlanValidationReport,
 ) -> dict[str, Any]:
     errors = [issue.model_dump(mode="json") for issue in report.errors]
+    codes = {issue.code for issue in report.errors}
+    retry = "resubmit_complete_plan"
+    if "stale_planning_context_revision" in codes:
+        retry = "refresh_planning_context"
+    elif "stale_required_observation" in codes:
+        retry = "reinspect_required_observations"
+    elif "unobserved_gridmap_source" in codes:
+        retry = "reinspect_gridmap_artifacts"
+    elif {
+        "missing_required_observation",
+        "missing_required_observation_payload",
+    } & codes:
+        retry = "complete_required_observations"
     result = {
         "ok": False,
         "error_type": error_type,
         "errors": errors,
-        "retry": "resubmit_complete_plan",
+        "retry": retry,
     }
     if len(_canonical_json(result)) <= MAX_PLAN_VALIDATION_FAILURE_CHARS:
         return result
@@ -213,6 +227,7 @@ def build_navigation_plan_submission_tools(
         plan: (
             ExtractSyncPlanInput
             | FinishProcessingPlanInput
+            | ApplicationFinishProcessingPlanInput
             | TrajectoryReviewPlanInput
             | dict[str, Any]
         ),
@@ -237,11 +252,21 @@ def build_navigation_plan_submission_tools(
         if context_report.ok:
             model = {
                 "extract_sync": ExtractSyncPlanInput,
-                "finish_processing": FinishProcessingPlanInput,
+                "finish_processing": ApplicationFinishProcessingPlanInput,
                 "trajectory_review": TrajectoryReviewPlanInput,
             }[phase]
             try:
-                canonical_plan = model.model_validate(candidate)
+                parsed_plan = model.model_validate(candidate)
+                canonical_plan = (
+                    FinishProcessingPlanInput.model_validate(
+                        parsed_plan.model_dump(mode="json")
+                    )
+                    if isinstance(
+                        parsed_plan,
+                        ApplicationFinishProcessingPlanInput,
+                    )
+                    else parsed_plan
+                )
             except ValidationError as error:
                 validation = _structure_report(error)
                 error_type = "plan_validation_failed"
@@ -258,6 +283,16 @@ def build_navigation_plan_submission_tools(
                     plan=canonical_plan,
                     evidence=evidence,
                     capabilities=capabilities,
+                    minimum_finish_observation_revision=(
+                        plan_store.get_finish_observation_revision_floor(
+                            task.task_id
+                        )
+                        if phase == "finish_processing"
+                        else 0
+                    ),
+                    require_finish_annotation_facts=(
+                        phase == "finish_processing"
+                    ),
                 )
                 error_type = "plan_validation_failed"
 
@@ -330,7 +365,7 @@ def build_navigation_plan_submission_tools(
 
     def submit_finish_processing_plan_tool(
         planning_context_revision: str,
-        plan: FinishProcessingPlanInput,
+        plan: ApplicationFinishProcessingPlanInput,
     ) -> dict[str, Any]:
         """Validate and atomically activate one complete finish-processing plan."""
         return _submit_complete_plan(

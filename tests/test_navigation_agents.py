@@ -322,7 +322,7 @@ def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path,
         name.startswith("inspect_navigation_") for name in resolved_tool_names[0]
     )
     assert "submit_extract_sync_plan_tool" in resolved_tool_names[0]
-    assert "submit_finish_processing_plan_tool" in resolved_tool_names[0]
+    assert "submit_finish_processing_plan_tool" not in resolved_tool_names[0]
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,7 @@ FINISH_INSPECTIONS = [
     "inspect_navigation_runtime_assets_tool",
     "inspect_navigation_calibration_inventory_tool",
     "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_annotation_job_facts_tool",
 ]
 
 
@@ -66,6 +67,22 @@ def _evidence_by_kind(services, task_id):
         descriptor.kind: descriptor.ref
         for descriptor in services.observation_store.list_evidence(task_id, limit=50)
     }
+
+
+def _missing_annotation_gateway():
+    return SimpleNamespace(
+        get_processing_facts=lambda **_kwargs: {
+            "job_status": "missing",
+            "segment_count": 0,
+            "tracked_count": 0,
+            "skipped_count": 0,
+            "annotated_count": 0,
+            "ready_for_postprocessing": False,
+            "ready_for_trajectory_review": False,
+            "processing_calibration_snapshot_available": False,
+            "reviews": {},
+        }
+    )
 
 
 def _activate_extract_plan(services, task, session_id, web_session_id="direct-flow"):
@@ -115,10 +132,10 @@ def _finish_plan(evidence):
                 "evidence_refs": [evidence["gridmap_artifacts"]],
             },
             "calibration": {
-                "mode": "hardcoded_with_user_confirmation",
-                "selected_sensor_source": "NoobScenes/params/selected/sensors",
+                "mode": "selected_profile",
+                "selected_sensor_source": None,
                 "requires_user_confirmation": True,
-                "reason": "Use the observed selected calibration directory.",
+                "reason": "Defer the observed profile choice to confirmation.",
                 "evidence_refs": [evidence["calibration_inventory"]],
             },
         },
@@ -133,65 +150,29 @@ def _finish_plan(evidence):
                 "decision_refs": ["calibration"],
             },
             {
-                "step_id": "assemble_finish",
-                "action": "assemble_finish_temp",
-                "variant": "default",
+                "step_id": "annotation_tracking",
+                "action": "run_annotation_tracking_workflow",
+                "variant": "durable_web_handoff",
                 "arguments": {},
                 "depends_on": ["confirm_calibration"],
                 "failure_policy": "stop",
-                "decision_refs": ["calibration"],
+                "decision_refs": ["calibration", "localization"],
             },
             {
-                "step_id": "preprocess",
-                "action": "run_noobscene_preprocessing",
-                "variant": "default",
+                "step_id": "annotation_postprocessing",
+                "action": "run_annotation_postprocessing_workflow",
+                "variant": "plan_bound_runtime",
                 "arguments": {},
-                "depends_on": ["assemble_finish"],
+                "depends_on": ["annotation_tracking"],
                 "failure_policy": "stop",
-                "decision_refs": ["localization"],
-            },
-            {
-                "step_id": "initial_annotation",
-                "action": "run_initial_annotation_gui",
-                "variant": "human_gui",
-                "arguments": {},
-                "depends_on": ["preprocess"],
-                "failure_policy": "stop",
-                "decision_refs": ["calibration"],
-            },
-            {
-                "step_id": "tracking",
-                "action": "run_tracking",
-                "variant": "default",
-                "arguments": {},
-                "depends_on": ["initial_annotation"],
-                "failure_policy": "stop",
-                "decision_refs": ["localization"],
-            },
-            {
-                "step_id": "prepare_gridmap",
-                "action": "prepare_gridmap_for_projection",
-                "variant": "copy_existing_gridmap",
-                "arguments": {},
-                "depends_on": ["tracking"],
-                "failure_policy": "stop",
-                "decision_refs": ["gridmap"],
-            },
-            {
-                "step_id": "projection",
-                "action": "run_projection_and_trajectory",
-                "variant": "cjl_0525_with_gridmap",
-                "arguments": {},
-                "depends_on": ["prepare_gridmap"],
-                "failure_policy": "stop",
-                "decision_refs": ["localization", "gridmap"],
+                "decision_refs": ["calibration", "localization", "gridmap"],
             },
             {
                 "step_id": "validate_outputs",
                 "action": "validate_navigation_outputs",
                 "variant": "expect_gridmap",
                 "arguments": {},
-                "depends_on": ["projection"],
+                "depends_on": ["annotation_postprocessing"],
                 "failure_policy": "stop",
                 "decision_refs": ["gridmap"],
             },
@@ -426,6 +407,7 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
 ):
     tmp_path, _data_root, _processing_root = navigation_environment
     runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    runtime.set_annotation_gateway(_missing_annotation_gateway())
     task, session_id = await _create_navigation_attempt(
         runtime, "web-same", "处理这批导航数据"
     )
@@ -494,6 +476,16 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
     )
     for name in FINISH_INSPECTIONS:
         model.enqueue_tool(name, {})
+    model.enqueue_text("finish 事实已刷新，准备读取最新上下文。")
+    inspection_events = await run_reply(agent, "依据已记录的确认刷新 finish 事实。")
+    assert text_deltas(inspection_events) == "finish 事实已刷新，准备读取最新上下文。"
+
+    _refresh_direct_flat_tools(
+        runtime,
+        agent,
+        "web-same",
+        session_id,
+    )
     model.enqueue_tool("get_navigation_task_context_tool", {})
     model.enqueue_tool(
         "submit_finish_processing_plan_tool",
@@ -505,7 +497,7 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
         },
     )
     model.enqueue_text("完整 finish-processing Plan 已接受。")
-    continued_events = await run_reply(agent, "依据已记录的确认继续重检并规划。")
+    continued_events = await run_reply(agent, "依据最新事实提交 finish Plan。")
     submit_result = json.loads(tool_result_outputs(agent)[-1])
     assert submit_result["ok"] is True, submit_result
 
@@ -528,6 +520,7 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
 ):
     tmp_path, _data_root, _processing_root = navigation_environment
     runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    runtime.set_annotation_gateway(_missing_annotation_gateway())
     services = runtime._navigation_services()
     old = services.task_store.create_task_attempt(
         request="historical completed attempt",
@@ -558,6 +551,19 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
     )
     for name in FINISH_INSPECTIONS:
         model.enqueue_tool(name, {})
+    model.enqueue_text("finish 事实已核验。")
+    inspection_events = await run_reply(
+        agent,
+        "同步已完成，请先核验当前 finish 事实。",
+    )
+    assert text_deltas(inspection_events) == "finish 事实已核验。"
+
+    _refresh_direct_flat_tools(
+        runtime,
+        agent,
+        "web-new",
+        session_id,
+    )
     model.enqueue_tool("get_navigation_task_context_tool", {})
     model.enqueue_tool(
         "submit_finish_processing_plan_tool",
@@ -570,7 +576,7 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
     )
     model.enqueue_text("当前事实支持 finish-processing Plan。")
 
-    events = await run_reply(agent, "同步已完成，请继续处理，数据为室外场景。")
+    events = await run_reply(agent, "基于刚核验的事实继续规划。")
 
     calls = tool_call_names(agent)
     assert calls == [

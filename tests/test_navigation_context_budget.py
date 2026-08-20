@@ -555,7 +555,7 @@ def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
     assert NAVIGATION_PLAN_AUTHORING not in recovery.active_group_names
     assert {
         tool.name for tool in recovery.group(NAVIGATION_EXECUTION_STATE).tools
-    } == EXECUTION_STATE_SCHEMA_NAMES
+    } == {"get_current_plan_step_tool"}
 
     for activity, surface in surfaces.items():
         assert surface.activity == activity

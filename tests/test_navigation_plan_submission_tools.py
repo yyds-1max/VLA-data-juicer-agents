@@ -13,6 +13,7 @@ from vla_data_juicer_agents.navigation.catalog import (
 )
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
     CalibrationInventoryObservation,
     EvidenceWrite,
@@ -29,7 +30,6 @@ from vla_data_juicer_agents.navigation.observation_models import (
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
-from vla_data_juicer_agents.navigation.plan_models import PlanValidationIssue
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.plan_submission_tools import (
     build_navigation_plan_submission_tools,
@@ -257,6 +257,12 @@ def build_services(
                     available_sources=["odom"], conversion_available=True
                 ),
             ),
+            (
+                "annotation_job_facts",
+                AnnotationJobFactsObservation(
+                    job_status="missing",
+                ),
+            ),
         ]
 
     for kind, payload in facts:
@@ -374,10 +380,10 @@ def valid_finish_plan_payload(services: Services) -> dict:
                 "evidence_refs": [refs["gridmap_artifacts"]],
             },
             "calibration": {
-                "mode": "hardcoded_with_user_confirmation",
-                "selected_sensor_source": "fisheye_front",
+                "mode": "selected_profile",
+                "selected_sensor_source": None,
                 "requires_user_confirmation": True,
-                "reason": "The measured calibration source requires confirmation.",
+                "reason": "Defer the observed profile choice to confirmation.",
                 "evidence_refs": [refs["calibration_inventory"]],
             },
         },
@@ -392,65 +398,29 @@ def valid_finish_plan_payload(services: Services) -> dict:
                 "decision_refs": ["calibration"],
             },
             {
-                "step_id": "assemble_finish",
-                "action": "assemble_finish_temp",
-                "variant": "default",
+                "step_id": "annotation_tracking",
+                "action": "run_annotation_tracking_workflow",
+                "variant": "durable_web_handoff",
                 "arguments": {},
                 "depends_on": ["confirm_calibration"],
                 "failure_policy": "stop",
-                "decision_refs": ["calibration"],
+                "decision_refs": ["calibration", "localization"],
             },
             {
-                "step_id": "preprocess",
-                "action": "run_noobscene_preprocessing",
-                "variant": "default",
+                "step_id": "annotation_postprocessing",
+                "action": "run_annotation_postprocessing_workflow",
+                "variant": "plan_bound_runtime",
                 "arguments": {},
-                "depends_on": ["assemble_finish"],
+                "depends_on": ["annotation_tracking"],
                 "failure_policy": "stop",
-                "decision_refs": ["localization"],
-            },
-            {
-                "step_id": "initial_annotation",
-                "action": "run_initial_annotation_gui",
-                "variant": "human_gui",
-                "arguments": {},
-                "depends_on": ["preprocess"],
-                "failure_policy": "stop",
-                "decision_refs": ["calibration"],
-            },
-            {
-                "step_id": "tracking",
-                "action": "run_tracking",
-                "variant": "default",
-                "arguments": {},
-                "depends_on": ["initial_annotation"],
-                "failure_policy": "stop",
-                "decision_refs": ["localization"],
-            },
-            {
-                "step_id": "prepare_gridmap",
-                "action": "prepare_gridmap_for_projection",
-                "variant": "copy_existing_gridmap",
-                "arguments": {},
-                "depends_on": ["tracking"],
-                "failure_policy": "stop",
-                "decision_refs": ["gridmap"],
-            },
-            {
-                "step_id": "projection",
-                "action": "run_projection_and_trajectory",
-                "variant": "cjl_0525_with_gridmap",
-                "arguments": {},
-                "depends_on": ["prepare_gridmap"],
-                "failure_policy": "stop",
-                "decision_refs": ["localization", "gridmap"],
+                "decision_refs": ["localization", "gridmap", "calibration"],
             },
             {
                 "step_id": "validate_outputs",
                 "action": "validate_navigation_outputs",
                 "variant": "expect_gridmap",
                 "arguments": {},
-                "depends_on": ["projection"],
+                "depends_on": ["annotation_postprocessing"],
                 "failure_policy": "stop",
                 "decision_refs": ["gridmap"],
             },
@@ -514,8 +484,12 @@ def test_builder_exposes_all_phase_specific_complete_typed_schemas(tmp_path):
     review_serialized = json.dumps(review_schema)
     assert "ExtractSyncPlanInput" in extract_serialized
     assert "FinishProcessingPlanInput" not in extract_serialized
-    assert "FinishProcessingPlanInput" in finish_serialized
+    assert "ApplicationFinishProcessingPlanInput" in finish_serialized
     assert "ExtractSyncPlanInput" not in finish_serialized
+    assert "run_annotation_tracking_workflow" in finish_serialized
+    assert "run_annotation_postprocessing_workflow" in finish_serialized
+    assert "assemble_finish_temp" not in finish_serialized
+    assert "run_initial_annotation_gui" not in finish_serialized
     assert "TrajectoryReviewPlanInput" in review_serialized
     assert "FinishProcessingPlanInput" not in review_serialized
 
@@ -556,6 +530,29 @@ def test_valid_finish_plan_does_not_require_nested_topic_params_copy(tmp_path):
     assert stored_task.accepted_plan_phase == "finish_processing"
 
 
+def test_finish_submission_rejects_legacy_desktop_runtime_actions(tmp_path):
+    services = build_services(tmp_path, "finish_processing")
+    payload = valid_finish_plan_payload(services)
+    payload["steps"][1] = {
+        "step_id": "legacy_assemble",
+        "action": "assemble_finish_temp",
+        "variant": "default",
+        "arguments": {},
+        "depends_on": ["confirm_calibration"],
+        "failure_policy": "stop",
+        "decision_refs": ["calibration"],
+    }
+
+    result = call_submit_finish(services, payload)
+
+    assert result["ok"] is False
+    assert any(issue["code"] == "unknown_action" for issue in result["errors"])
+    assert services.plan_store.get_active(
+        services.task.task_id,
+        "finish_processing",
+    ) is None
+
+
 def test_invalid_complete_submission_never_creates_partial_state(tmp_path):
     services = build_services(tmp_path, "finish_processing")
     payload = valid_finish_plan_payload(services)
@@ -592,8 +589,39 @@ def test_stale_context_revision_is_audited_and_cannot_activate(tmp_path):
     assert set(result) == FAILURE_KEYS
     assert result["error_type"] == "planning_context_mismatch"
     assert result["errors"][0]["code"] == "stale_planning_context_revision"
+    assert result["retry"] == "refresh_planning_context"
     assert len(_audit_rows(services)) == 1
     assert services.plan_store.get_active(services.task.task_id, "extract_sync") is None
+
+
+def test_unobserved_gridmap_source_requests_reinspection(tmp_path, monkeypatch):
+    services = build_services(tmp_path, "finish_processing")
+    observed = services.observation_store.latest(services.task.task_id)
+    assert observed is not None
+    without_gridmap_source = observed.model_copy(
+        update={
+            "payloads": [
+                GridmapArtifactsObservation()
+                if isinstance(payload, GridmapArtifactsObservation)
+                else payload
+                for payload in observed.payloads
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        services.observation_store,
+        "latest",
+        lambda _task_id: without_gridmap_source,
+    )
+
+    result = call_submit_finish(services, valid_finish_plan_payload(services))
+
+    assert result["ok"] is False
+    assert any(
+        issue["code"] == "unobserved_gridmap_source"
+        for issue in result["errors"]
+    )
+    assert result["retry"] == "reinspect_gridmap_artifacts"
 
 
 def test_invalid_retry_requires_a_complete_replacement_and_only_retry_activates(tmp_path):
@@ -726,7 +754,7 @@ def test_completed_markers_without_required_payloads_are_audited_and_never_activ
     assert len(_audit_rows(services)) == 1
 
 
-def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeeds(
+def test_application_finish_does_not_depend_on_legacy_gui_runtime(
     tmp_path,
     monkeypatch,
 ):
@@ -750,38 +778,10 @@ def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeed
         lambda _task_id: unavailable,
     )
 
-    blocked = call_submit_finish(services, payload)
-
-    assert blocked["ok"] is False
-    assert PlanValidationIssue.model_validate(
-        next(
-            issue
-            for issue in blocked["errors"]
-            if issue["code"] == "runtime_action_unavailable"
-        )
-        ) == PlanValidationIssue(
-            path="plan.steps.3.action",
-        code="runtime_action_unavailable",
-        message="Manual annotation GUI is unavailable in observed runtime assets",
-        allowed_values=[
-            f"evidence_ref:{services.evidence_refs['runtime_assets']}"
-        ],
-    )
-    assert services.plan_store.get_active(
-        services.task.task_id,
-        "finish_processing",
-    ) is None
-    assert _ledger_count(services) == 0
-
-    monkeypatch.setattr(
-        services.observation_store,
-        "latest",
-        lambda _task_id: available,
-    )
     accepted = call_submit_finish(services, payload)
 
     assert accepted["ok"] is True
-    assert accepted["step_count"] == 8
+    assert accepted["step_count"] == 4
 
 
 def test_audit_failure_prevents_activation_and_returns_stable_internal_failure(

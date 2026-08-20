@@ -82,15 +82,41 @@ M2_FINISH_REQUIRED_OBSERVATIONS = frozenset(
 )
 
 
+def stale_finish_observation_kinds(
+    observation: NavigationObservationRevision | None,
+    *,
+    latest_evidence_revisions: dict[str, int] | None = None,
+    minimum_observation_revision: int = 0,
+) -> frozenset[ObservationKind]:
+    """Identify finish facts that were not refreshed past an extract fence."""
+    if observation is None or minimum_observation_revision <= 0:
+        return frozenset()
+    revisions = latest_evidence_revisions or {}
+    return frozenset(
+        kind
+        for kind in M2_FINISH_REQUIRED_OBSERVATIONS
+        if revisions.get(kind, 0) <= minimum_observation_revision
+    )
+
+
 def m2_finish_observations_complete(
     observation: NavigationObservationRevision | None,
+    *,
+    latest_evidence_revisions: dict[str, int] | None = None,
+    minimum_observation_revision: int = 0,
 ) -> bool:
     """Return whether the explicit M2 finish surface has all typed fact families."""
     if observation is None:
         return False
     completed_kinds = set(observation.completed_kinds)
     payload_kinds = {payload.kind for payload in observation.payloads}
-    return M2_FINISH_REQUIRED_OBSERVATIONS <= completed_kinds & payload_kinds
+    if not M2_FINISH_REQUIRED_OBSERVATIONS <= completed_kinds & payload_kinds:
+        return False
+    return not stale_finish_observation_kinds(
+        observation,
+        latest_evidence_revisions=latest_evidence_revisions,
+        minimum_observation_revision=minimum_observation_revision,
+    )
 
 
 def m2_annotation_ready_for_postprocessing(
@@ -134,6 +160,8 @@ def build_navigation_task_context(
     observation: NavigationObservationRevision | None,
     evidence: Sequence[EvidenceDescriptor] | None = None,
     capabilities: Sequence[ToolCapability] | dict[str, Any],
+    minimum_finish_observation_revision: int = 0,
+    latest_evidence_revisions: dict[str, int] | None = None,
 ) -> NavigationTaskContext:
     if observation is not None and observation.task_id != task.task_id:
         raise PermissionError("observation belongs to another task")
@@ -153,6 +181,23 @@ def build_navigation_task_context(
     observed_kinds = (
         list(observation.completed_kinds) if observation is not None else []
     )
+    stale_finish_kinds = stale_finish_observation_kinds(
+        observation,
+        latest_evidence_revisions=latest_evidence_revisions,
+        minimum_observation_revision=minimum_finish_observation_revision,
+    )
+    if stale_finish_kinds:
+        payloads = [
+            payload for payload in payloads if payload.kind not in stale_finish_kinds
+        ]
+        observed_kinds = [
+            kind for kind in observed_kinds if kind not in stale_finish_kinds
+        ]
+        descriptors = [
+            descriptor
+            for descriptor in descriptors
+            if descriptor.kind not in stale_finish_kinds
+        ]
     if task.target == "trajectory_review":
         descriptors = [
             descriptor

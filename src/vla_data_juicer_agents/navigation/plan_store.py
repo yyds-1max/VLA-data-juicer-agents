@@ -561,6 +561,37 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
         return self._record_from_row(row) if row is not None else None
 
+    def get_finish_observation_revision_floor(self, task_id: str) -> int:
+        """Return the observation fence created by the latest completed extract Plan.
+
+        Finish facts captured at or before this revision may describe artifacts
+        while extract/sync was still running, so they must be refreshed.
+        """
+        with self._connect() as connection:
+            plan_row = connection.execute(
+                """
+                SELECT updated_at
+                FROM navigation_plans
+                WHERE task_id = ?
+                  AND phase = 'extract_sync'
+                  AND status = 'completed'
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if plan_row is None:
+                return 0
+            observation_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(revision), 0) AS revision
+                FROM navigation_observation_revisions
+                WHERE task_id = ? AND julianday(created_at) <= julianday(?)
+                """,
+                (task_id, plan_row["updated_at"]),
+            ).fetchone()
+        return int(observation_row["revision"])
+
     def read_execution_snapshot(
         self,
         *,
@@ -1649,13 +1680,14 @@ class SqliteNavigationPlanRepository:
                     (plan_id,),
                 ).fetchone()
                 if remaining is None:
+                    plan_completed_at = datetime.now(UTC).isoformat()
                     connection.execute(
                         """
                         UPDATE navigation_plans
                         SET status = 'completed', updated_at = ?
                         WHERE plan_id = ? AND status = 'active'
                         """,
-                        (utc_now(), plan_id),
+                        (plan_completed_at, plan_id),
                     )
                     plan_row = connection.execute(
                         "SELECT phase, task_id FROM navigation_plans WHERE plan_id = ?",

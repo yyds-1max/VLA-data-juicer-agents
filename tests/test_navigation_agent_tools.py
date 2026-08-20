@@ -37,7 +37,11 @@ from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvide
 from vla_data_juicer_agents.navigation.observation_models import (
     AnnotationJobFactsObservation,
     ArtifactStateObservation,
+    CalibrationInventoryObservation,
     EvidenceWrite,
+    GridmapArtifactsObservation,
+    LocalizationSourcesObservation,
+    RuntimeAssetsObservation,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -81,7 +85,6 @@ PLANNING_TOOL_NAMES = {
     "record_navigation_user_guidance_tool",
     "complete_navigation_task_tool",
     "submit_extract_sync_plan_tool",
-    "submit_finish_processing_plan_tool",
     "submit_trajectory_review_plan_tool",
 }
 TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
@@ -515,6 +518,25 @@ def _append_annotation_job_facts(services, task, *, ready):
     )
 
 
+def _append_observed_fact(services, task, kind, payload):
+    return services.observation_store.append(
+        task.task_id,
+        kind,
+        [payload],
+        [
+            EvidenceWrite(
+                kind=kind,
+                source_tool=f"inspect_navigation_{kind}_tool",
+                payload=payload.model_dump(mode="json"),
+                summary=f"Current {kind} facts.",
+            )
+        ],
+        services.evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+
+
 def _terminalize_plan(services, plan, session_id):
     for step in plan.plan.steps:
         assert services.plan_store.claim_step(
@@ -623,9 +645,7 @@ def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
     assert planning is not None
     assert {
         tool.name for tool in planning.flatten_active_tools()
-    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES - {
-        "submit_finish_processing_plan_tool",
-    }
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
     assert {
         "inspect_navigation_raw_metadata_tool",
         "inspect_navigation_sensor_candidates_tool",
@@ -974,6 +994,123 @@ def test_grouped_surface_reverse_transition_returns_completed_extract_to_plannin
         planning.group(NAVIGATION_EXECUTION_ACTIONS)
 
 
+def test_auto_extract_completion_requires_fresh_finish_facts_before_one_submit(
+    tmp_path,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    stale_facts = [
+        (
+            "gridmap_artifacts",
+            GridmapArtifactsObservation(),
+        ),
+        (
+            "runtime_assets",
+                RuntimeAssetsObservation(
+                    pcd_gridmap_tool_available=True,
+                    manual_annotation_gui_available=False,
+                    projection_variants={"cjl_0525_with_gridmap": True},
+                    noobscene_localization_variants={"odom": True},
+                    speed_direction_variants={"odom": True},
+                ),
+        ),
+        (
+            "calibration_inventory",
+            CalibrationInventoryObservation(sensor_sources=["fisheye_front"]),
+        ),
+        (
+            "localization_sources",
+            LocalizationSourcesObservation(
+                available_sources=["odom"],
+                conversion_available=True,
+            ),
+        ),
+        (
+            "annotation_job_facts",
+            AnnotationJobFactsObservation(job_status="missing"),
+        ),
+    ]
+    for kind, payload in stale_facts:
+        _append_observed_fact(services, task, kind, payload)
+
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        observation.revision,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    _terminalize_plan(services, active, "as-session-1")
+    _set_scene_mode(services, task.task_id, "out")
+
+    floor = services.plan_store.get_finish_observation_revision_floor(task.task_id)
+    assert floor == observation.revision
+    guarded = _surface(services, "as-session-1")
+    assert guarded is not None
+    guarded_tools = {tool.name: tool for tool in guarded.flatten_active_tools()}
+    assert "submit_extract_sync_plan_tool" not in guarded_tools
+    assert "submit_finish_processing_plan_tool" not in guarded_tools
+    stale_context = _decode_tool_payload(
+        asyncio.run(guarded_tools["get_navigation_task_context_tool"]())
+    )
+    assert {
+        "artifact_state",
+        "gridmap_artifacts",
+        "runtime_assets",
+        "calibration_inventory",
+        "localization_sources",
+        "annotation_job_facts",
+    }.isdisjoint(stale_context["observed_kinds"])
+
+    fresh_facts = [
+        (
+            "artifact_state",
+            ArtifactStateObservation(
+                snapshot=NavigationArtifactSnapshot(
+                    date=task.date,
+                    segments=task.segments or [],
+                    raw_input_exists=True,
+                    sync_data_exists=True,
+                )
+            ),
+        ),
+        (
+            "gridmap_artifacts",
+            GridmapArtifactsObservation(
+                existing_gridmap_paths=["/data/grid_map.pcd"],
+                pcd_sources=["/data/sync/000001.pcd"],
+                projection_ready=False,
+            ),
+        ),
+        *stale_facts[1:],
+    ]
+    for kind, payload in fresh_facts:
+        revision = _append_observed_fact(services, task, kind, payload)
+        built.evidence_refs[kind] = revision.evidence_refs[0]
+
+    ready = _surface(services, "as-session-1")
+    assert ready is not None
+    ready_tools = {tool.name: tool for tool in ready.flatten_active_tools()}
+    assert "submit_finish_processing_plan_tool" in ready_tools
+    context = _decode_tool_payload(
+        asyncio.run(ready_tools["get_navigation_task_context_tool"]())
+    )
+    result = _decode_tool_payload(
+        asyncio.run(
+            ready_tools["submit_finish_processing_plan_tool"](
+                planning_context_revision=context["planning_context_revision"],
+                plan=valid_finish_plan_payload(built),
+            )
+        )
+    )
+    assert result["ok"] is True, result
+    assert services.plan_store.get_active_for_task(task.task_id).phase == (
+        "finish_processing"
+    )
+
+
 def test_grouped_surface_finish_plan_completion_has_no_execution_actions(tmp_path):
     services, task, built = _resolver_services_from_complete(
         tmp_path,
@@ -1091,7 +1228,7 @@ def test_direct_attempt_resolver_uses_durable_exact_pair_not_id_shape(tmp_path):
 
     assert any(name.startswith("inspect_navigation_") for name in names)
     assert "submit_extract_sync_plan_tool" in names
-    assert "submit_finish_processing_plan_tool" in names
+    assert "submit_finish_processing_plan_tool" not in names
 
 
 def test_cross_web_session_without_bound_attempt_exposes_no_task_mutation(tmp_path):
@@ -1540,14 +1677,6 @@ def test_new_attempt_fences_every_mutating_tool_from_captured_planning_toolkit(
             )
         )
     )
-    finish = _decode_tool_payload(
-        asyncio.run(
-            tools_a["submit_finish_processing_plan_tool"](
-                planning_context_revision=context["planning_context_revision"],
-                plan={},
-            )
-        )
-    )
     inspection = _decode_tool_payload(
         asyncio.run(tools_a["inspect_navigation_artifact_state_tool"]())
     )
@@ -1562,8 +1691,6 @@ def test_new_attempt_fences_every_mutating_tool_from_captured_planning_toolkit(
 
     assert extract["ok"] is False
     assert extract["error_type"] == "submission_audit_failed"
-    assert finish["ok"] is False
-    assert finish["error_type"] == "submission_audit_failed"
     assert inspection["ok"] is False
     assert inspection["error_type"] == "permission_error"
     assert guidance["ok"] is False
@@ -1869,7 +1996,6 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "record_navigation_user_guidance_tool",
         "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
-            "submit_finish_processing_plan_tool",
             "submit_trajectory_review_plan_tool",
     }
     assert services.task_store.get_task(task.task_id) == before
@@ -1889,7 +2015,7 @@ def test_activity_resolver_without_bound_attempt_fails_closed(tmp_path):
     assert tools == []
 
 
-def test_completed_extract_plan_returns_to_stage_neutral_planning_tools(tmp_path):
+def test_completed_extract_plan_enters_guarded_finish_planning_tools(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     active = services.plan_store.activate(
         task,
@@ -1919,8 +2045,9 @@ def test_completed_extract_plan_returns_to_stage_neutral_planning_tools(tmp_path
         )
     }
 
-    assert "submit_extract_sync_plan_tool" in names
-    assert "submit_finish_processing_plan_tool" in names
+    assert "submit_extract_sync_plan_tool" not in names
+    assert "submit_finish_processing_plan_tool" not in names
+    assert "inspect_navigation_raw_metadata_tool" not in names
     assert "inspect_navigation_artifact_state_tool" in names
     assert "get_plan_execution_overview_tool" not in names
     assert "get_current_plan_step_tool" not in names

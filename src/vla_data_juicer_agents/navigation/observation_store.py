@@ -397,6 +397,23 @@ class SqliteNavigationObservationStore:
             ).fetchall()
         return [EvidenceDescriptor.model_validate(dict(row)) for row in rows]
 
+    def latest_evidence_revisions(self, task_id: str) -> dict[str, int]:
+        """Return the newest durable observation revision for each fact kind."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT kind, MAX(observation_revision) AS observation_revision
+                FROM navigation_evidence
+                WHERE task_id = ?
+                GROUP BY kind
+                """,
+                (task_id,),
+            ).fetchall()
+        return {
+            str(row["kind"]): int(row["observation_revision"])
+            for row in rows
+        }
+
     @staticmethod
     def _merge_payloads(
         previous: NavigationObservationRevision | None,
