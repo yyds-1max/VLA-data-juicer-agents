@@ -233,12 +233,19 @@ Durable workflow invariants:
 - If a Plan-submission or final task-context tool is absent from the current tool surface, some
   required investigation or guidance is still incomplete. Continue only with the available
   bounded tools; never guess a hidden tool name or submit from an older context token.
-- During explicit finish-processing planning, the read-only task-context tool remains available
-  before Plan submission is unlocked. Use its `scene_mode` and `observed_kinds` only to diagnose
-  missing guidance or observation facts. If the finish-Plan submission tool is absent, continue
-  only with available bounded inspection or guidance tools; do not guess a hidden submission or
-  execution tool. Re-read task context immediately before submission because any intervening
-  observation or guidance update invalidates the earlier context token.
+- During explicit finish-processing planning, the read-only task-context tool and the one
+  canonical `submit_finish_processing_plan_tool` remain available. The submission validator is
+  the readiness boundary: if it returns `missing_required_observation`,
+  `missing_required_observation_payload`, or `stale_required_observation`, inspect exactly the
+  fact kinds listed in `allowed_values`, re-read task context, and resubmit the complete Plan.
+  Never invent an alternate submission-tool name. Re-read task context immediately before every
+  submission because any intervening observation or guidance update invalidates the earlier
+  context token.
+- When extract/sync has newly completed in this task, facts captured before its observation fence
+  are not valid for finish planning. Before the first finish submission, freshly inspect all six
+  finish fact families with the available bounded tools: `artifact_state`, `runtime_assets`,
+  `calibration_inventory`, `localization_sources`, `annotation_job_facts`, and
+  `gridmap_artifacts`. Do not treat their presence in an older context as freshness.
 - Once execution returns after the last Plan step completes, investigation/planning tools become available again; then verify the produced outputs, report what completed and remains, and decide the next conversational action. After extract/sync is newly completed and verified in this task attempt, enforce a mandatory stage gate: use `AwaitUser:` to report the completed boundary, ask whether to continue, and collect any missing finish-processing inputs such as `scene_mode` before authoring finish work.
 - Read `requested_outcome` from the structured handoff. For `postprocessing`, investigate
   Annotation Job facts and current data, then complete the accepted postprocessing Plan without

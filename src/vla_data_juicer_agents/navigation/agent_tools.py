@@ -266,16 +266,18 @@ def build_navigation_tool_groups(
         minimum_observation_revision=minimum_finish_observation_revision,
     ) and (annotation_ready or task.scene_mode in {"in", "out"})
     planning_tool_names = set(_FIXED_TOOL_NAMES_BY_ACTIVITY["planning"])
-    if not submission_ready:
+    # Once the durable task has entered finish planning, keep the one canonical
+    # submission tool visible even while observations or guidance are incomplete.
+    # Its validator is the authoritative readiness boundary and returns exact
+    # missing/stale fact codes.  Hiding the tool here turns a recoverable
+    # readiness failure into an indistinguishable "unknown tool" failure and can
+    # cause the model to invent alternate tool names.
+    if not submission_ready and not is_finish_processing:
         planning_tool_names.discard("submit_finish_processing_plan_tool")
     finish_processing_planning_tool_names = set(
         _FINISH_PROCESSING_PLANNING_TOOL_NAMES
     )
     if is_finish_processing:
-        if not submission_ready:
-            finish_processing_planning_tool_names.discard(
-                "submit_finish_processing_plan_tool"
-            )
         if (
             not annotation_ready
             and task.scene_mode not in {"in", "out"}

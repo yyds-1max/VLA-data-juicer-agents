@@ -991,7 +991,7 @@ async def test_final_extract_action_switches_back_to_planning_in_same_reply(
     assert "inspect_navigation_artifact_state_tool" in after_final_names
     assert "inspect_navigation_raw_metadata_tool" not in after_final_names
     assert "submit_extract_sync_plan_tool" not in after_final_names
-    assert "submit_finish_processing_plan_tool" not in after_final_names
+    assert "submit_finish_processing_plan_tool" in after_final_names
     assert EXECUTION_TOOL_NAMES.isdisjoint(after_final_names)
     assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(after_final_names)
     assert processing_spy.calls == [("prepare_raw_data", 1)]
@@ -1320,7 +1320,7 @@ async def test_missing_annotation_job_requires_scene_guidance_before_creation_ha
     guidance_names = schema_names(model.invocations[guidance_index].tools)
     assert "record_navigation_user_guidance_tool" in guidance_names
     assert "get_navigation_task_context_tool" in guidance_names
-    assert "submit_finish_processing_plan_tool" not in guidance_names
+    assert "submit_finish_processing_plan_tool" in guidance_names
     diagnostic_context_index = _invocation_index_for_tool(
         model,
         "get_navigation_task_context_tool",
