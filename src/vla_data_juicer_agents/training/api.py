@@ -2179,7 +2179,7 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
             "current_step": int(stage.get("current_step", 0)),
             "total_steps": int(stage.get("total_steps", 0)),
             "current_epoch": float(stage.get("current_epoch", 0)),
-            "total_epochs": float(stage.get("total_epochs", 3)),
+            "total_epochs": float(stage.get("total_epochs", 0)),
             "parameters": stage.get("parameters", {}),
             "run_spec": (
                 _run_spec_projection(stage["run_spec"])
@@ -2230,7 +2230,7 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "current_step": int(run.get("current_step", 0)),
         "total_steps": int(run.get("total_steps", 0)),
         "current_epoch": float(run.get("current_epoch", 0)),
-        "total_epochs": float(run.get("total_epochs", 3)),
+        "total_epochs": float(run.get("total_epochs", 0)),
         "latest_metric": run.get("latest_metric"),
         "failure_code": run.get("failure_code", failure.get("code")),
         "failure_message": run.get("failure_message", failure.get("message")),

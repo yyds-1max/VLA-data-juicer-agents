@@ -2951,6 +2951,40 @@ class TrainingStore:
             items.append(projected)
         return {"items": items[:limit], "next_after": items[limit-1]["seq"] if len(items) > limit else None}
 
+    def list_recent_metrics(
+        self, run_ref: str, limit: int, stage_ref: str | None = None
+    ) -> dict[str, Any]:
+        """Return the latest metric window without loading a long run in full."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT id FROM training_runs WHERE run_ref=?", (run_ref,)
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "run_not_found", "Training run was not found."
+                )
+            values: list[Any] = [row["id"]]
+            stage_join = ""
+            stage_clause = ""
+            if stage_ref is not None:
+                stage_join = " JOIN training_stages AS stage ON stage.id=metric.stage_id"
+                stage_clause = " AND stage.stage_ref=?"
+                values.append(stage_ref)
+            latest_seq = int(
+                db.execute(
+                    f"""SELECT COALESCE(MAX(metric.seq),0)
+                    FROM metric_samples AS metric{stage_join}
+                    WHERE metric.run_id=?{stage_clause}""",
+                    tuple(values),
+                ).fetchone()[0]
+            )
+        return self.list_metrics(
+            run_ref,
+            max(0, latest_seq - max(1, limit)),
+            max(1, limit),
+            stage_ref=stage_ref,
+        )
+
     def list_events(self, after_seq: int, limit: int) -> dict[str, Any]:
         with self.connection() as db:
             rows = db.execute("SELECT * FROM training_events WHERE seq>? ORDER BY seq LIMIT ?", (after_seq, limit + 1)).fetchall()

@@ -8,6 +8,7 @@ import {
   FileText,
   Cpu,
   HardDrive,
+  Info,
   Play,
   Plus,
   RefreshCw,
@@ -51,6 +52,7 @@ import { ConsoleCard } from "../../components/console/ConsoleCard";
 import { ProgressBar } from "../../components/console/ProgressBar";
 import { StatusTag } from "../../components/console/StatusTag";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
+import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../../components/ui/tooltip";
 import { cn } from "../../lib/utils";
 import type { StatusTone, TabItem } from "../console/consoleTypes";
@@ -160,6 +162,34 @@ function availablePercent(available: number, total: number) {
 }
 function can(capabilities: TrainingCapabilities | null, permission: TrainingCapabilities["permissions"][number]) { return capabilities?.permissions.includes(permission) ?? false; }
 function runModelDisplayName(run: TrainingRun) { return `${run.family_name} ${run.version_label}`; }
+
+function currentRunStage(run: TrainingRun) {
+  return run.stages.find((stage) => stage.stage_number === run.current_stage_number) ?? run.stages.at(-1);
+}
+
+function positiveParameter(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function usesStepLimit(run: TrainingRun) {
+  return positiveParameter(currentRunStage(run)?.parameters?.max_steps);
+}
+
+function formatEpoch(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return "--";
+  return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+function runProgressSummary(run: TrainingRun) {
+  const stage = currentRunStage(run);
+  const stagePrefix = `阶段 ${run.current_stage_number ?? "-"}/${run.stage_count}`;
+  if (usesStepLimit(run)) {
+    return `${stagePrefix} · Step ${stage?.current_step ?? 0}/${stage?.total_steps ?? 0}`;
+  }
+  const currentEpoch = stage?.current_epoch ?? run.current_epoch;
+  const totalEpochs = stage?.total_epochs ?? run.total_epochs;
+  return `${stagePrefix} · Epoch ${formatEpoch(currentEpoch)}/${totalEpochs > 0 ? formatEpoch(totalEpochs) : "--"}`;
+}
 
 function formatTrainingTime(value: string | null | undefined) {
   if (!value) return "--";
@@ -518,7 +548,8 @@ function RunDetail({ run, canStop, onRunChange }: { run: TrainingRun; canStop: b
   const gpuUtilizationData = gpuUtilizationMetrics.length ? { labels: gpuUtilizationMetrics.map(metricLabel), data: gpuUtilizationMetrics.map((item) => item.gpu_utilization_percent ?? 0), label: "GPU 利用率", color: "#0284c7" } : null;
   const gpuMemoryData = gpuMemoryMetrics.length ? { labels: gpuMemoryMetrics.map(metricLabel), data: gpuMemoryMetrics.map((item) => item.gpu_memory_mib ?? 0), label: "GPU 显存 MiB", color: "#059669" } : null;
   const stageArtifacts = (run.artifacts ?? []).filter((artifact) => !selectedStage || !artifact.stage_ref || artifact.stage_ref === selectedStage.stage_ref);
-  return <div className="space-y-4"><ConsoleCard className="shadow-none"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2"><h2 className="text-lg font-semibold text-console-text">{runModelDisplayName(run)}</h2><StatusTag tone={statusMeta[run.status].tone}>{statusMeta[run.status].label}</StatusTag></div><p className="mt-1 text-sm text-console-muted">任务 {run.run_ref}</p></div>{canStop && activeStatuses.has(run.status) ? <ConsoleButton variant="ghost" onClick={() => void stop()} disabled={busy}><Square className="h-4 w-4" />停止训练</ConsoleButton> : null}</div>{run.execution_mode === "real" && run.execution_control_status && run.execution_control_status !== "connected" ? <div role="status" className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"><span className="font-medium">Worker 状态待确认：</span>{run.execution_control_status === "unresolved" ? "Worker 重启后尚未确认训练进程身份，平台不会擅自启动新的进程或释放资源。" : "Worker 与中心服务暂时失联，训练可能仍在节点继续执行。"}{run.execution_control_message ? ` ${run.execution_control_message}` : ""}</div> : null}{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<div className="mt-5 grid divide-y divide-console-line border-y border-console-line sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4"><div className="py-3 sm:px-4 sm:first:pl-0"><p className="text-xs text-console-muted">Epoch</p><p className="text-xl font-semibold tabular-nums text-console-text">{run.current_epoch}/{run.total_epochs}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">Step</p><p className="text-xl font-semibold tabular-nums text-console-text">{run.current_step}/{run.total_steps}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">最新 Loss</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.loss)}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">学习率</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.learning_rate, 7)}</p></div></div><ProgressBar className="mt-4" value={run.progress_percent} tone="purple" label={`训练进度 ${run.progress_percent.toFixed(1)}%`} /></ConsoleCard>
+  const stepLimited = usesStepLimit(run);
+  return <div className="space-y-4"><ConsoleCard className="shadow-none"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2"><h2 className="text-lg font-semibold text-console-text">{runModelDisplayName(run)}</h2><StatusTag tone={statusMeta[run.status].tone}>{statusMeta[run.status].label}</StatusTag></div><p className="mt-1 text-sm text-console-muted">任务 {run.run_ref}</p></div>{canStop && activeStatuses.has(run.status) ? <ConsoleButton variant="ghost" onClick={() => void stop()} disabled={busy}><Square className="h-4 w-4" />停止训练</ConsoleButton> : null}</div>{run.execution_mode === "real" && run.execution_control_status && run.execution_control_status !== "connected" ? <div role="status" className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"><span className="font-medium">Worker 状态待确认：</span>{run.execution_control_status === "unresolved" ? "Worker 重启后尚未确认训练进程身份，平台不会擅自启动新的进程或释放资源。" : "Worker 与中心服务暂时失联，训练可能仍在节点继续执行。"}{run.execution_control_message ? ` ${run.execution_control_message}` : ""}</div> : null}{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<div className="mt-4 rounded-md border border-console-line bg-console-panel2 px-3 py-3"><p className="text-xs font-medium text-console-muted">本次训练说明</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-console-text">{run.version_description?.trim() || "历史任务未填写训练说明。"}</p></div><div className={cn("mt-5 grid divide-y divide-console-line border-y border-console-line sm:grid-cols-2 sm:divide-x sm:divide-y-0", stepLimited ? "xl:grid-cols-3" : "xl:grid-cols-4")}>{!stepLimited ? <div className="py-3 sm:px-4 sm:first:pl-0"><p className="text-xs text-console-muted">Epoch</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatEpoch(run.current_epoch)}/{run.total_epochs > 0 ? formatEpoch(run.total_epochs) : "--"}</p></div> : null}<div className="py-3 sm:px-4 sm:first:pl-0"><p className="text-xs text-console-muted">Step</p><p className="text-xl font-semibold tabular-nums text-console-text">{run.current_step}/{run.total_steps}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">最新 Loss</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.loss)}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">学习率</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.learning_rate, 7)}</p></div></div><ProgressBar className="mt-4" value={run.progress_percent} tone="purple" label={`训练进度 ${run.progress_percent.toFixed(1)}%`} /></ConsoleCard>
     <ConsoleCard><div className="flex flex-wrap gap-2" role="tablist" aria-label="任务训练阶段">{run.stages.map((stage) => <button key={stage.stage_ref} type="button" role="tab" aria-selected={selectedStage?.stage_ref === stage.stage_ref} className={cn("rounded-md border px-3 py-2 text-sm", selectedStage?.stage_ref === stage.stage_ref ? "border-console-cyan bg-blue-50 text-console-cyan" : "border-console-line text-console-muted")} onClick={() => setSelectedStageRef(stage.stage_ref)}>{stage.stage_name} · {stageStatusLabels[stage.status]}</button>)}</div>{selectedStage ? <><div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm text-console-muted"><span>阶段进度 <b className="text-console-text">{(selectedStage.progress_percent ?? (selectedStage.progress ?? 0) * 100).toFixed(1)}%</b></span><span>输出目录 <b className="font-mono text-console-text">{selectedStage.output_directory ?? "尚未生成"}</b></span></div>{selectedStage.failure_message ? <div role="alert" className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"><span className="font-medium">阶段失败：</span>{selectedStage.failure_message}</div> : null}</> : null}{run.version_model ? <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"><span className="font-medium">版本模型：</span><span className="font-mono">{run.version_model.output_directory}</span></div> : null}</ConsoleCard>
     <div className="grid gap-4 xl:grid-cols-2">{lossData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">{selectedStage?.stage_name} · Loss</h3><MiniChart type="line" title="Loss" data={lossData} /></ConsoleCard> : <ConsoleCard><p className="text-sm text-console-muted">当前阶段暂无指标。</p></ConsoleCard>}{lrData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">学习率</h3><MiniChart type="line" title="学习率" data={lrData} /></ConsoleCard> : null}</div>
     <div className="grid gap-4 xl:grid-cols-2">{gpuUtilizationData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">GPU 利用率</h3><MiniChart type="line" title="GPU 利用率" data={gpuUtilizationData} /></ConsoleCard> : null}{gpuMemoryData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">GPU 显存</h3><MiniChart type="line" title="GPU 显存" data={gpuMemoryData} /></ConsoleCard> : null}</div>
@@ -526,6 +557,23 @@ function RunDetail({ run, canStop, onRunChange }: { run: TrainingRun; canStop: b
     <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">训练产物</h3><div className="grid gap-2 text-sm sm:grid-cols-2">{stageArtifacts.map((artifact, index) => <div key={artifact.artifact_ref ?? `${artifact.kind}-${artifact.relative_path ?? artifact.output_directory ?? artifact.path ?? index}`} className="rounded-md bg-console-panel2 p-2"><p className="font-medium text-console-text">{artifact.kind === "checkpoint" ? "Checkpoint" : artifact.kind === "version_model" ? "版本模型" : "阶段输出"}{artifact.step != null ? ` · step ${artifact.step}` : ""}</p><p className="mt-1 break-all font-mono text-xs text-console-muted">{artifact.relative_path ?? artifact.output_directory ?? artifact.path ?? "路径待 Worker 上报"}</p></div>)}{!stageArtifacts.length && run.version_model ? <div className="rounded-md bg-console-panel2 p-2"><p className="font-medium text-console-text">版本模型</p><p className="mt-1 break-all font-mono text-xs text-console-muted">{run.version_model.output_directory}</p></div> : null}{!stageArtifacts.length && !run.version_model ? <p className="text-console-muted">当前阶段尚未上报训练产物。</p> : null}</div></ConsoleCard>
     <ConsoleCard><div className="mb-3 flex items-center gap-2"><Terminal className="h-4 w-4 text-console-cyan" /><h3 className="font-semibold text-console-text">{selectedStage?.stage_name}训练日志</h3></div><div className="max-h-64 overflow-auto rounded-md bg-slate-950 p-3 font-mono text-xs leading-6 text-slate-100">{stageLogs.length ? stageLogs.map((item) => <p key={item.seq}><span className="text-slate-500">[{item.seq}]</span> {item.message}</p>) : "等待日志…"}</div></ConsoleCard>
   </div>;
+}
+
+function TrainingRunDescriptionPopover({ run }: { run: TrainingRun }) {
+  return <Popover>
+    <PopoverTrigger asChild>
+      <button type="button" aria-label={`${runModelDisplayName(run)} 版本说明`} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-console-muted transition-colors hover:bg-blue-50 hover:text-console-cyan focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/30">
+        <Info className="h-3.5 w-3.5" aria-hidden="true" />说明
+      </button>
+    </PopoverTrigger>
+    <PopoverContent align="center" sideOffset={8} className="w-[min(22rem,calc(100vw-2rem))] rounded-xl border-console-line p-0 shadow-xl shadow-slate-950/8">
+      <div className="border-b border-console-line px-4 py-3">
+        <p className="truncate text-sm font-semibold text-console-text">{runModelDisplayName(run)}</p>
+        <p className="mt-0.5 text-xs text-console-muted">版本说明</p>
+      </div>
+      <p className="whitespace-pre-wrap break-words px-4 py-4 text-sm leading-6 text-console-text">{run.version_description?.trim() || "历史任务未填写版本说明。"}</p>
+    </PopoverContent>
+  </Popover>;
 }
 
 function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; canCreate: boolean; onCreate: () => void; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
@@ -589,16 +637,17 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
       </header>
 
       <div className="overflow-x-auto border-t border-console-line">
-        <table className="w-full min-w-[980px] table-fixed text-left text-sm">
+        <table className="w-full min-w-[1080px] table-fixed text-left text-sm">
           <thead className="bg-console-panel2 text-xs font-medium text-console-muted">
             <tr>
-              <th className="w-[24%] px-4 py-3">任务 / 模型</th>
-              <th className="w-[13%] px-4 py-3">服务器 / GPU</th>
+              <th className="w-[21%] px-4 py-3">任务 / 模型</th>
+              <th className="w-[12%] px-4 py-3">服务器 / GPU</th>
               <th className="w-[23%] px-4 py-3">训练进度</th>
-              <th className="w-[11%] px-4 py-3">最新 Loss</th>
-              <th className="w-[11%] px-4 py-3">状态</th>
+              <th className="w-[9%] px-4 py-3">版本说明</th>
+              <th className="w-[9%] px-4 py-3">最新 Loss</th>
+              <th className="w-[9%] px-4 py-3">状态</th>
               <th className="w-[12%] px-4 py-3">更新时间</th>
-              <th className="w-[6%] px-4 py-3 text-right">操作</th>
+              <th className="w-[5%] px-4 py-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -616,13 +665,14 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
                 </td>
                 <td className="px-4 py-3.5 align-middle">
                   <div className="flex items-center justify-between gap-3 text-xs">
-                    <span className="text-console-muted">阶段 {run.current_stage_number ?? "-"}/{run.stage_count} · Epoch {run.current_epoch}/{run.total_epochs}</span>
+                    <span className="text-console-muted">{runProgressSummary(run)}</span>
                     <span className="tabular-nums text-console-text">{run.progress_percent.toFixed(1)}%</span>
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100" role="progressbar" aria-label={`${runModelDisplayName(run)} 训练进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={run.progress_percent}>
                     <span className="block h-full rounded-full bg-console-cyan transition-[width] duration-200 motion-reduce:transition-none" style={{ width: `${Math.max(0, Math.min(100, run.progress_percent))}%` }} />
                   </div>
                 </td>
+                <td className="px-4 py-3.5 align-middle"><TrainingRunDescriptionPopover run={run} /></td>
                 <td className="px-4 py-3.5 align-middle font-mono text-xs tabular-nums text-console-text">{formatNumber(run.latest_metric?.loss)}</td>
                 <td className="px-4 py-3.5 align-middle"><StatusTag tone={statusMeta[run.status].tone}>{statusMeta[run.status].label}</StatusTag></td>
                 <td className="px-4 py-3.5 align-middle text-xs text-console-muted">{formatTrainingTime(run.finished_at ?? run.started_at ?? run.created_at)}</td>

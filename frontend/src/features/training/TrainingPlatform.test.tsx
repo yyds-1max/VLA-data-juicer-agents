@@ -40,8 +40,8 @@ const secondaryResources: TrainingServerResources = { server: secondaryServer, s
 const launchTemplate = { domain: "vla", server_ref: "fake-local", working_directory: "/workspace/project", launcher_kind: "direct" as const, executable: "python", entrypoint: "train.py", fixed_argv: ["--deepspeed", "configs/zero3.json"], output_root: "/workspace/outputs", output_flag: "--output_dir", runtime_environment: { kind: "system" as const }, monitoring: { source: "stdout" as const, format: "plain" as const } };
 const model: TrainingModel = { family_ref: "navila-family", family_name: "NaVILA", status: "draft", edit_revision: 1, trained_version_count: 0, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", configuration: { fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
 const runSpec = { contract_version: 1 as const, execution_mode: "simulation" as const, launcher_kind: "direct" as const, server_ref: "fake-local", gpu_uuids: ["GPU-0"], nnodes: 1 as const, master_addr: null, master_port: null, node_rank: null, nproc_per_node: 1, environment: { CUDA_VISIBLE_DEVICES: "0" }, parameters: { num_video_frames: 8, learning_rate: 0.0001 }, argv: ["python", "train.py"] };
-const runningStage = { stage_ref: "stage-1", stage_number: 1, stage_name: "第一阶段", stage_input_source: "manual" as const, status: "running" as const, progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, parameters: { num_video_frames: 8, learning_rate: 0.0001 }, run_spec: runSpec, output_directory: "/workspace/outputs/navila-family/v1-20260806/stage-01" };
-const runningRun: TrainingRun = { run_ref: "run-running", family_ref: "navila-family", family_name: "NaVILA", version_ref: "version-1", version_number: 1, version_date: "20260806", version_label: "v1-20260806", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, stage_count: 1, current_stage_number: 1, stages: [runningStage], created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
+const runningStage = { stage_ref: "stage-1", stage_number: 1, stage_name: "第一阶段", stage_input_source: "manual" as const, status: "running" as const, progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, parameters: { num_video_frames: 8, learning_rate: 0.0001, max_steps: 20, num_train_epochs: 3 }, run_spec: runSpec, output_directory: "/workspace/outputs/navila-family/v1-20260806/stage-01" };
+const runningRun: TrainingRun = { run_ref: "run-running", family_ref: "navila-family", family_name: "NaVILA", version_ref: "version-1", version_number: 1, version_date: "20260806", version_label: "v1-20260806", version_description: "加入 8 月新增数据，并调整轨迹损失权重。", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, stage_count: 1, current_stage_number: 1, stages: [runningStage], created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", version_ref: "version-2", version_number: 2, version_label: "v2-20260806", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20, stages: [{ ...runningStage, status: "succeeded", progress_percent: 100, current_step: 20 }] };
 const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: null, status: "pending_enrollment", state_revision: 1, heartbeat_revision: 0, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
 
@@ -1373,11 +1373,40 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByRole("table")).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "任务 / 模型" })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "训练进度" })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "版本说明" })).toBeVisible();
+    expect(screen.getByText("阶段 1/1 · Step 8/20")).toBeVisible();
+    expect(within(screen.getByRole("table")).queryByText(/Epoch/)).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "训练概览" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "NaVILA v1-20260806 版本说明" }));
+    const description = await screen.findByRole("dialog");
+    expect(within(description).getByText("版本说明")).toBeVisible();
+    expect(within(description).getByText("加入 8 月新增数据，并调整轨迹损失权重。")).toBeVisible();
 
     fireEvent.change(screen.getByLabelText("搜索训练任务"), { target: { value: "run-succeeded" } });
     expect(screen.queryByText("NaVILA v1-20260806")).not.toBeInTheDocument();
     expect(screen.getByText("NaVILA v2-20260806")).toBeVisible();
+  });
+
+  it("shows an epoch total only when the run is governed by epochs", async () => {
+    const epochStage = {
+      ...runningStage,
+      current_epoch: 1.5,
+      total_epochs: 4,
+      parameters: { num_video_frames: 8, num_train_epochs: 4 },
+    };
+    const epochRun: TrainingRun = {
+      ...runningRun,
+      current_epoch: 1.5,
+      total_epochs: 4,
+      stages: [epochStage],
+    };
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([epochRun]);
+    renderPlatform();
+
+    expect(await screen.findByText("阶段 1/1 · Epoch 1.5/4")).toBeVisible();
+    expect(screen.queryByText(/Epoch 1.5（参考）/)).not.toBeInTheDocument();
   });
 
   it("switches between independently loaded server resource cards", async () => {
@@ -1426,6 +1455,9 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByText("NaVILA v1-20260806"));
     expect(await screen.findByText("第一阶段参数快照")).toBeVisible();
+    expect(screen.getByText("本次训练说明")).toBeVisible();
+    expect(screen.getByText("加入 8 月新增数据，并调整轨迹损失权重。")).toBeVisible();
+    expect(screen.queryByText("Epoch")).not.toBeInTheDocument();
     expect(screen.getAllByText("num_video_frames")[0]).toBeVisible();
     expect(screen.getByText("模拟训练已启动 · 2026-08-06T00:01:00Z")).toBeVisible();
     expect(screen.getByRole("heading", { name: "GPU 利用率" })).toBeVisible();

@@ -1083,10 +1083,107 @@ class TrainingService:
         )
 
     def _project_run(self, run: dict[str, Any]) -> dict[str, Any]:
-        metric_page = self.store.list_metrics(run["run_ref"], 0, 2000)
-        latest = metric_page["items"][-1] if metric_page["items"] else None
-        current_epoch = (latest.get("epoch") if latest else None) or 0
-        return {**run, "progress_percent": round(run["progress"] * 100, 2), "current_epoch": current_epoch, "total_epochs": 3, "latest_metric": latest, "failure_code": run.get("failure", {}).get("code") if run.get("failure") else None, "failure_message": run.get("failure", {}).get("message") if run.get("failure") else None, "audit_events": self.store.list_audit_events(run["run_ref"])}
+        metric_page = self.store.list_recent_metrics(run["run_ref"], 2000)
+        metrics = metric_page["items"]
+        current_stage_number = run.get("current_stage_number")
+        current_stage = next(
+            (
+                stage
+                for stage in run.get("stages", [])
+                if stage.get("stage_number") == current_stage_number
+            ),
+            run.get("stages", [])[-1] if run.get("stages") else None,
+        )
+        current_stage_ref = current_stage.get("stage_ref") if current_stage else None
+        current_stage_metrics = [
+            metric
+            for metric in metrics
+            if current_stage_ref is None or metric.get("stage_ref") == current_stage_ref
+        ]
+
+        # GPU-only samples intentionally omit trainer fields.  Do not let a
+        # later resource sample erase the most recent loss/epoch summary.
+        trainer_fields = ("step", "epoch", "loss", "learning_rate", "grad_norm")
+        latest_trainer_metric = next(
+            (
+                metric
+                for metric in reversed(current_stage_metrics)
+                if any(metric.get(field) is not None for field in trainer_fields)
+            ),
+            None,
+        )
+        latest = dict(latest_trainer_metric) if latest_trainer_metric else None
+        if latest is not None:
+            for field in trainer_fields + ("total_steps", "elapsed_seconds"):
+                recent_value = next(
+                    (
+                        metric.get(field)
+                        for metric in reversed(current_stage_metrics)
+                        if metric.get(field) is not None
+                    ),
+                    None,
+                )
+                latest[field] = recent_value
+
+        projected_stages: list[dict[str, Any]] = []
+        for stage in run.get("stages", []):
+            stage_metrics = [
+                metric
+                for metric in metrics
+                if metric.get("stage_ref") == stage.get("stage_ref")
+            ]
+            epoch_metric = next(
+                (
+                    metric
+                    for metric in reversed(stage_metrics)
+                    if metric.get("epoch") is not None
+                ),
+                None,
+            )
+            raw_total_epochs = stage.get("parameters", {}).get("num_train_epochs")
+            try:
+                total_epochs = max(0.0, float(raw_total_epochs))
+            except (TypeError, ValueError):
+                total_epochs = 0.0
+            projected_stages.append(
+                {
+                    **stage,
+                    "current_epoch": float(epoch_metric["epoch"]) if epoch_metric else 0.0,
+                    "total_epochs": total_epochs,
+                }
+            )
+
+        projected_current_stage = next(
+            (
+                stage
+                for stage in projected_stages
+                if stage.get("stage_number") == current_stage_number
+            ),
+            projected_stages[-1] if projected_stages else None,
+        )
+        return {
+            **run,
+            "stages": projected_stages,
+            "progress_percent": round(run["progress"] * 100, 2),
+            "current_epoch": (
+                projected_current_stage.get("current_epoch", 0.0)
+                if projected_current_stage
+                else 0.0
+            ),
+            "total_epochs": (
+                projected_current_stage.get("total_epochs", 0.0)
+                if projected_current_stage
+                else 0.0
+            ),
+            "latest_metric": latest,
+            "failure_code": (
+                run.get("failure", {}).get("code") if run.get("failure") else None
+            ),
+            "failure_message": (
+                run.get("failure", {}).get("message") if run.get("failure") else None
+            ),
+            "audit_events": self.store.list_audit_events(run["run_ref"]),
+        }
 
     def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:
         page = self.store.list_runs(status=status, after=after, limit=limit); page["items"] = [self._project_run(item) for item in page["items"]]; return page

@@ -1135,9 +1135,57 @@ def test_metrics_stop_release_leases_and_event_cursor(service: TrainingService) 
         "first metric",
     )
     assert stepped["current_step"] == 1
+    with service.store.transaction() as db:
+        stored_run = db.execute(
+            "SELECT id FROM training_runs WHERE run_ref=?", (run["run_ref"],)
+        ).fetchone()
+        assert stored_run is not None
+        stage = db.execute(
+            "SELECT id,parameters_json FROM training_stages WHERE run_id=?",
+            (stored_run["id"],),
+        ).fetchone()
+        assert stage is not None
+        parameters = json.loads(stage["parameters_json"])
+        parameters["num_train_epochs"] = 1
+        db.execute(
+            "UPDATE training_stages SET parameters_json=? WHERE id=?",
+            (json.dumps(parameters), stage["id"]),
+        )
+        # A later step-only update should advance progress without erasing
+        # the most recent loss, and a GPU-only sample must erase neither.
+        db.execute(
+            """INSERT INTO metric_samples(
+            run_id,seq,step,total_steps,epoch,loss,learning_rate,grad_norm,
+            elapsed_seconds,gpu_json,created_at,stage_id,metric_payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                stored_run["id"], 2, 2, 2, 0, 0, 0, 0, 0, "[]",
+                "2026-08-20T11:59:59+00:00", stage["id"],
+                '{"step":2,"total_steps":2}',
+            ),
+        )
+        db.execute(
+            """INSERT INTO metric_samples(
+            run_id,seq,step,total_steps,epoch,loss,learning_rate,grad_norm,
+            elapsed_seconds,gpu_json,created_at,stage_id,metric_payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                stored_run["id"], 3, 0, 0, 0, 0, 0, 0, 0,
+                '[{"uuid":"fake-a100-02","utilization_percent":80}]',
+                "2026-08-20T12:00:00+00:00", stage["id"], "{}",
+            ),
+        )
+    projected = service.get_run(str(run["run_ref"]))
+    assert projected["current_epoch"] == 1.5
+    assert projected["total_epochs"] == 1
+    assert projected["stages"][0]["current_epoch"] == 1.5
+    assert projected["stages"][0]["total_epochs"] == 1
+    assert projected["latest_metric"]["step"] == 2
+    assert projected["latest_metric"]["loss"] == 0.5
+    assert projected["version_description"] == "Regression training run"
     metrics = client.get(f"/api/training/runs/{run['run_ref']}/metrics?after_seq=0")
     assert metrics.status_code == 200
-    assert [item["seq"] for item in metrics.json()["metrics"]] == [1]
+    assert [item["seq"] for item in metrics.json()["metrics"]] == [1, 2, 3]
     assert client.get(f"/api/training/runs/{run['run_ref']}/logs?after_seq=0").json()["logs"]
 
     stop = client.post(
