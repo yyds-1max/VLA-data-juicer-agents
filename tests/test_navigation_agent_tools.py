@@ -680,12 +680,7 @@ def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
     assert planning is not None
     assert {
         tool.name for tool in planning.flatten_active_tools()
-    } == (
-        FINISH_PROCESSING_PLANNING_TOOL_NAMES
-        - {
-            "submit_finish_processing_plan_tool",
-        }
-    ) | {
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES | {
         "record_navigation_user_guidance_tool",
     }
 
@@ -708,7 +703,7 @@ def test_finish_context_diagnoses_missing_scene_then_refreshes_before_submit(
     }
     assert "get_navigation_task_context_tool" in before_tools
     assert "record_navigation_user_guidance_tool" in before_tools
-    assert "submit_finish_processing_plan_tool" not in before_tools
+    assert "submit_finish_processing_plan_tool" in before_tools
 
     diagnostic_context = _decode_tool_payload(
         asyncio.run(before_tools["get_navigation_task_context_tool"]())
@@ -1051,7 +1046,7 @@ def test_auto_extract_completion_requires_fresh_finish_facts_before_one_submit(
     assert guarded is not None
     guarded_tools = {tool.name: tool for tool in guarded.flatten_active_tools()}
     assert "submit_extract_sync_plan_tool" not in guarded_tools
-    assert "submit_finish_processing_plan_tool" not in guarded_tools
+    assert "submit_finish_processing_plan_tool" in guarded_tools
     stale_context = _decode_tool_payload(
         asyncio.run(guarded_tools["get_navigation_task_context_tool"]())
     )
@@ -1064,7 +1059,7 @@ def test_auto_extract_completion_requires_fresh_finish_facts_before_one_submit(
         "annotation_job_facts",
     }.isdisjoint(stale_context["observed_kinds"])
 
-    fresh_facts = [
+    fresh_facts_except_runtime_assets = [
         (
             "artifact_state",
             ArtifactStateObservation(
@@ -1084,11 +1079,51 @@ def test_auto_extract_completion_requires_fresh_finish_facts_before_one_submit(
                 projection_ready=False,
             ),
         ),
-        *stale_facts[1:],
+        *stale_facts[2:],
     ]
-    for kind, payload in fresh_facts:
+    for kind, payload in fresh_facts_except_runtime_assets:
         revision = _append_observed_fact(services, task, kind, payload)
         built.evidence_refs[kind] = revision.evidence_refs[0]
+
+    waiting_for_runtime_assets = _surface(services, "as-session-1")
+    assert waiting_for_runtime_assets is not None
+    waiting_tools = {
+        tool.name: tool
+        for tool in waiting_for_runtime_assets.flatten_active_tools()
+    }
+    assert "submit_finish_processing_plan_tool" in waiting_tools
+    waiting_context = _decode_tool_payload(
+        asyncio.run(waiting_tools["get_navigation_task_context_tool"]())
+    )
+    assert "runtime_assets" not in waiting_context["observed_kinds"]
+
+    stale_submission = _decode_tool_payload(
+        asyncio.run(
+            waiting_tools["submit_finish_processing_plan_tool"](
+                planning_context_revision=(
+                    waiting_context["planning_context_revision"]
+                ),
+                plan=valid_finish_plan_payload(built),
+            )
+        )
+    )
+    assert stale_submission["ok"] is False
+    assert stale_submission["retry"] == "reinspect_required_observations"
+    stale_issues = [
+        issue
+        for issue in stale_submission["errors"]
+        if issue["code"] == "stale_required_observation"
+    ]
+    assert len(stale_issues) == 1
+    assert stale_issues[0]["allowed_values"] == ["runtime_assets"]
+
+    runtime_revision = _append_observed_fact(
+        services,
+        task,
+        "runtime_assets",
+        stale_facts[1][1],
+    )
+    built.evidence_refs["runtime_assets"] = runtime_revision.evidence_refs[0]
 
     ready = _surface(services, "as-session-1")
     assert ready is not None
@@ -2046,7 +2081,7 @@ def test_completed_extract_plan_enters_guarded_finish_planning_tools(tmp_path):
     }
 
     assert "submit_extract_sync_plan_tool" not in names
-    assert "submit_finish_processing_plan_tool" not in names
+    assert "submit_finish_processing_plan_tool" in names
     assert "inspect_navigation_raw_metadata_tool" not in names
     assert "inspect_navigation_artifact_state_tool" in names
     assert "get_plan_execution_overview_tool" not in names

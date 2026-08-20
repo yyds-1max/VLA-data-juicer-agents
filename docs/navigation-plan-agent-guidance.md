@@ -57,6 +57,11 @@ Existence is not completeness. Check the requested clip inventory and validation
 - End blocking text questions with `AwaitUser:`. The model supplies purpose, fields, and question; Runtime owns state. A safe, concise `Answer:` summary may precede it and joins the same final. Calibration uses `confirm_navigation_calibration_params_tool`.
 - If the user explicitly declines later processing after extract/sync was verified, call `complete_navigation_task_tool` instead of authoring another Plan. This closes the task successfully while retaining every completed extract/sync product. Summarize the completed boundary and the intentionally unperformed finish work; do not describe this choice as a pause, cancellation, or failure.
 - Inspect finish inputs, localization sources/conversions, gridmap sources/preparation, calibration inventory, and relevant runtime assets. A native Ins source normally skips odom conversion. An odom source normally requires the supported odom-to-Ins conversion before consumers that expect Ins-formatted data.
+- After this task newly completes extract/sync, freshly inspect all six finish facts after its
+  observation fence: `artifact_state`, `runtime_assets`, `calibration_inventory`,
+  `localization_sources`, `annotation_job_facts`, and `gridmap_artifacts`. On a missing/stale
+  error, inspect its exact `allowed_values`, refresh context, and retry the canonical finish
+  submission tool; never guess another tool name.
 - Keep the downstream localization pipeline consistent: native Ins uses `main_smart.py`, `4_speed_direction_Ins.py`, and `cjl_with_gridmap`; odom uses conversion/resize, `main_smart_odom.py`, `4_speed_direction_odom.py`, and `cjl_0525_with_gridmap`.
 - If an extracted gridmap already exists, inspect and reuse it when valid. If the platform has no recorded gridmap but synchronized lidar point clouds exist, select generation from PCD. Do not claim PCD/gridmap availability before extract/sync outputs contain the required files.
 - For a ready tracked Annotation Job, set calibration `mode` to
