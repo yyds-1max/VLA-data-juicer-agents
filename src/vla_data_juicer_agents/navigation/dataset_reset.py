@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,6 +155,7 @@ def reset_navigation_dataset(
     annotation_store: AnnotationStore,
     task_store: SqliteNavigationTaskStore,
     settings: NavigationSettings | None = None,
+    on_tasks_cancelled: Callable[[tuple[str, ...]], None] | None = None,
 ) -> dict[str, object]:
     """Reset one unreleased date to its original raw-data state."""
 
@@ -186,20 +188,16 @@ def reset_navigation_dataset(
 
     annotation_store.dataset_reset_preflight(dataset_date=dataset_date)
     _require_original_raw_data(dataset_date, settings)
-    if task_store.find_nonterminal_for_date(dataset_date) is not None:
-        raise AnnotationConflictError(
-            "navigation_task_active",
-            "The dataset has an active DataPilot task and cannot be reset.",
-        )
     staged: list[_StagedArtifact] = []
     try:
         with navigation_writer_lock():
-            if task_store.find_nonterminal_for_date(dataset_date) is not None:
-                raise AnnotationConflictError(
-                    "navigation_task_active",
-                    "The dataset has an active DataPilot task and cannot be reset.",
-                )
             annotation_store.dataset_reset_preflight(dataset_date=dataset_date)
+            cancelled_task_ids = task_store.cancel_nonterminal_for_dataset_reset(
+                dataset_date,
+                reset_ref=reset_ref,
+            )
+            if cancelled_task_ids and on_tasks_cancelled is not None:
+                on_tasks_cancelled(cancelled_task_ids)
             staged = _stage_artifacts(
                 _reset_targets(dataset_date, settings),
                 reset_ref=reset_ref,

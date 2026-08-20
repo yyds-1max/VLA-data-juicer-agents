@@ -350,6 +350,92 @@ class SqliteNavigationTaskStore:
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
 
+    def cancel_nonterminal_for_dataset_reset(
+        self,
+        date: str,
+        *,
+        reset_ref: str,
+    ) -> tuple[str, ...]:
+        """Terminalize active work before an operator resets one dataset date.
+
+        Dataset reset is an explicit destructive operator action, so it bypasses
+        the interactive two-step cancellation transition.  The writer lock held
+        by the caller guarantees that no navigation writer is still running.
+        Invalidating active plans and fencing task revisions prevents a paused or
+        planning turn from resuming against the newly reset raw-only dataset.
+        """
+
+        if not self.db_path.exists():
+            return ()
+        terminal = sorted(status.value for status in TERMINAL_NAVIGATION_TASK_STATUSES)
+        terminal_placeholders = ", ".join("?" for _ in terminal)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                f"""SELECT task_id FROM navigation_tasks
+                    WHERE date = ? AND status NOT IN ({terminal_placeholders})
+                    ORDER BY created_at, rowid""",
+                (date, *terminal),
+            ).fetchall()
+            task_ids = tuple(str(row["task_id"]) for row in rows)
+            if not task_ids:
+                connection.commit()
+                return ()
+
+            task_placeholders = ", ".join("?" for _ in task_ids)
+            timestamp = utc_now()
+            reason = f"dataset_reset:{reset_ref}"
+            connection.execute(
+                f"""UPDATE navigation_human_decision_handoffs
+                    SET status = 'quarantined', delivery_status = 'quarantined',
+                        delivery_owner = NULL, delivery_token = NULL,
+                        recovery_reason_code = 'dataset_reset',
+                        recovery_reason = ?, recovered_at = ?, updated_at = ?
+                    WHERE task_id IN ({task_placeholders})
+                      AND plan_id IN (
+                          SELECT plan_id FROM navigation_plans
+                          WHERE status = 'active'
+                      )""",
+                (reason, timestamp, timestamp, *task_ids),
+            )
+            connection.execute(
+                f"""DELETE FROM navigation_step_result_outbox
+                    WHERE task_id IN ({task_placeholders})""",
+                task_ids,
+            )
+            connection.execute(
+                f"""UPDATE navigation_task_steps
+                    SET status = 'failed', finished_at = COALESCE(finished_at, ?)
+                    WHERE task_id IN ({task_placeholders})
+                      AND status != 'completed'
+                      AND plan_id IN (
+                          SELECT plan_id FROM navigation_plans
+                          WHERE status = 'active'
+                      )""",
+                (timestamp, *task_ids),
+            )
+            connection.execute(
+                f"""UPDATE navigation_plans
+                    SET status = 'invalidated', invalidation_reason = ?, updated_at = ?
+                    WHERE task_id IN ({task_placeholders}) AND status = 'active'""",
+                (reason, timestamp, *task_ids),
+            )
+            connection.execute(
+                f"""UPDATE navigation_tasks
+                    SET status = 'cancelled', updated_at = ?,
+                        state_revision = state_revision + 1
+                    WHERE task_id IN ({task_placeholders})""",
+                (timestamp, *task_ids),
+            )
+            connection.commit()
+            return task_ids
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_task(self, task_id: str) -> NavigationTask | None:
         with self._connect() as connection:
             row = connection.execute(

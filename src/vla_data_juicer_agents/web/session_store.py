@@ -4307,6 +4307,29 @@ class WebSessionStore:
             latest_public_update=latest_public_update,
         )
 
+    def close_task_bindings_for_dataset_reset(
+        self,
+        task_ids: tuple[str, ...],
+    ) -> int:
+        """Release Web task slots terminalized by an operator dataset reset."""
+
+        if not task_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in task_ids)
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""UPDATE conversation_task_bindings
+                    SET status = 'cancelled', slot_state = 'closed',
+                        state_revision = state_revision + 1,
+                        latest_public_update = '数据集已重置，原任务已取消。',
+                        updated_at = ?, terminal_at = ?
+                    WHERE task_id IN ({placeholders}) AND slot_state = 'open'""",
+                (timestamp, timestamp, *task_ids),
+            )
+        return cursor.rowcount
+
     def create_turn_run(
         self,
         *,

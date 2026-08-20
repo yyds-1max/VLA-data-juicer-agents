@@ -410,6 +410,20 @@ def create_app(
             ).routes,
         )
 
+        def close_navigation_tasks_for_dataset_reset(
+            task_ids: tuple[str, ...],
+        ) -> None:
+            run_cancellation = getattr(agentscope_runtime, "run_cancellation", None)
+            if callable(run_cancellation):
+                for task_id in task_ids:
+                    binding = store.get_task_binding(task_id)
+                    if binding is None:
+                        continue
+                    cancellation = run_cancellation(binding.navigation_session_id)
+                    if cancellation is not None:
+                        cancellation.cancel()
+            store.close_task_bindings_for_dataset_reset(task_ids)
+
         @app.exception_handler(RequestValidationError)
         async def safe_annotation_validation_error(
             request: Request,
@@ -639,6 +653,7 @@ def create_app(
                     idempotency_key=idempotency_key,
                     annotation_store=annotation_store,
                     task_store=annotation_gateway.task_store,
+                    on_tasks_cancelled=close_navigation_tasks_for_dataset_reset,
                 )
             except AnnotationConflictError as exc:
                 raise HTTPException(

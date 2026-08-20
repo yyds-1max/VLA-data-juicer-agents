@@ -589,6 +589,7 @@ test("data management resets an unreleased date only after typed confirmation", 
   fireEvent.click(resetButton);
 
   const dialog = screen.getByRole("dialog", { name: "重置 20270515" });
+  expect(within(dialog).getByText(/活动中的 DataPilot 任务会一并取消/)).toBeVisible();
   const confirmButton = within(dialog).getByRole("button", { name: "确认重置" });
   expect(confirmButton).toBeDisabled();
   fireEvent.change(within(dialog).getByRole("textbox", { name: "输入日期确认重置" }), {

@@ -1726,7 +1726,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
           </DialogHeader>
           <div className="space-y-3">
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-              已发布或正在处理的数据不会被重置。此操作不会自动启动新的处理任务。
+              已发布数据不可重置。活动中的 DataPilot 任务会一并取消；此操作不会自动启动新的处理任务。
             </div>
             <label className="block space-y-1.5 text-sm font-medium text-slate-700">
               输入日期 <span className="font-mono">{resetDate?.date}</span> 确认

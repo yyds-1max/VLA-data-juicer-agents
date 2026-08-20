@@ -809,6 +809,28 @@ def test_navigation_dataset_reset_api_keeps_raw_data_and_removes_outputs(
         str(lock_root / "navigation.lock"),
     )
     client = make_client(tmp_path)
+    web_session = client.app.state.store.create_session("reset active task")
+    task_id = "nav_" + "6" * 32
+    navigation_session_id = "agentscope-reset-session"
+    client.app.state.annotation_gateway.task_store._init_schema()
+    client.app.state.annotation_gateway.task_store.create_task_attempt(
+        task_id=task_id,
+        request="process data",
+        target="all",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id=web_session.id,
+        agentscope_session_id=navigation_session_id,
+    )
+    client.app.state.store.create_task_binding(
+        web_session.id,
+        task_id=task_id,
+        task_ref="task_public_reset",
+        navigation_session_id=navigation_session_id,
+        scope={"date": "20270623"},
+    )
 
     response = client.post(
         "/api/navigation/datasets/20270623/reset",
@@ -826,6 +848,13 @@ def test_navigation_dataset_reset_api_keeps_raw_data_and_removes_outputs(
     ]
     assert raw_clip.is_dir()
     assert all(not path.exists() for path in derived)
+    cancelled_task = client.app.state.annotation_gateway.task_store.get_task(task_id)
+    cancelled_binding = client.app.state.store.get_task_binding(task_id)
+    assert cancelled_task is not None
+    assert cancelled_task.status.value == "cancelled"
+    assert cancelled_binding is not None
+    assert cancelled_binding.status == "cancelled"
+    assert cancelled_binding.slot_state == "closed"
     refreshed = client.get("/api/navigation/datasets/20270623")
     assert refreshed.status_code == 200
     assert refreshed.json()["status"] == "raw_only"

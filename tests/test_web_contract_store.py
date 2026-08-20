@@ -175,6 +175,29 @@ def test_terminal_task_releases_slot_but_keeps_focus(tmp_path: Path):
     assert store.get_focused_task_binding(session_id) == second.binding
 
 
+def test_dataset_reset_closes_matching_task_slots_in_bulk(tmp_path: Path):
+    store, session_id = _v1_store(tmp_path)
+    first = _binding(store, session_id)
+
+    closed_count = store.close_task_bindings_for_dataset_reset(
+        (first.binding.task_id, "missing-task"),
+    )
+
+    closed = store.get_task_binding(first.binding.task_id)
+    assert closed_count == 1
+    assert closed is not None
+    assert closed.status == "cancelled"
+    assert closed.slot_state == "closed"
+    assert closed.latest_public_update == "数据集已重置，原任务已取消。"
+    replacement = store.create_task_binding(
+        session_id,
+        task_id="task-internal-2",
+        task_ref="task_public_c3d4",
+        navigation_session_id="as-navigation-2",
+    )
+    assert replacement.created is True
+
+
 def test_response_authority_handover_allows_exactly_one_final(tmp_path: Path):
     store, session_id = _v1_store(tmp_path)
     turn = store.begin_user_turn(session_id, "处理导航数据").turn
