@@ -13,6 +13,7 @@ from vla_data_juicer_agents.training.api import create_training_router
 from vla_data_juicer_agents.training.auth import TrainingSettings
 from vla_data_juicer_agents.training.errors import TrainingValidationError
 from vla_data_juicer_agents.training.migrations import (
+    LATEST_TRAINING_SCHEMA_VERSION,
     _MIGRATION_001,
     _MIGRATION_002,
     _MIGRATION_003,
@@ -215,18 +216,8 @@ def test_existing_m1_database_is_upgraded_without_recreating_training_data(
             WHERE type='table' AND name='training_nodes'"""
         ).fetchone()
     assert versions == [
-        (1,),
-        (2,),
-        (3,),
-        (4,),
-        (5,),
-        (6,),
-        (7,),
-        (8,),
-        (9,),
-            (10,),
-            (11,),
-        ]
+        (version,) for version in range(1, LATEST_TRAINING_SCHEMA_VERSION + 1)
+    ]
     assert model_name == "Existing"
     assert node_table == ("training_nodes",)
 

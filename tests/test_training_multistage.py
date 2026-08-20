@@ -284,7 +284,7 @@ def test_v6_to_v7_keeps_nodes_and_latest_family_configuration_but_clears_runs(
             assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         assert db.execute(
             "SELECT version,name FROM training_schema_migrations ORDER BY version DESC LIMIT 1"
-            ).fetchone() == (11, "dataset_transfer_pause_cancel_m11")
+            ).fetchone() == (12, "real_training_execution_m12")
 
 
 def test_model_registration_creates_an_editable_family_without_public_version(

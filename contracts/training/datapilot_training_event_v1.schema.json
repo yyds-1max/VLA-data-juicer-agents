@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datapilot.local/contracts/training/datapilot_training_event_v1.schema.json",
+  "title": "DataPilot Training Event v1",
+  "oneOf": [
+    { "$ref": "#/$defs/metric" },
+    { "$ref": "#/$defs/checkpoint" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["contract", "type"],
+      "properties": {
+        "contract": { "const": "datapilot_training_event_v1" },
+        "type": { "type": "string" }
+      }
+    },
+    "metric": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract", "type", "step"],
+          "properties": {
+            "contract": { "const": "datapilot_training_event_v1" },
+            "type": { "const": "metric" },
+            "step": { "type": "integer", "minimum": 0 },
+            "total_steps": { "type": "integer", "minimum": 0 },
+            "epoch": { "type": "number", "minimum": 0 },
+            "loss": { "type": "number" },
+            "learning_rate": { "type": "number", "minimum": 0 },
+            "grad_norm": { "type": "number", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "checkpoint": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract", "type", "relative_path"],
+          "properties": {
+            "contract": { "const": "datapilot_training_event_v1" },
+            "type": { "const": "checkpoint" },
+            "step": { "type": "integer", "minimum": 0 },
+            "relative_path": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)(?:\\.{1,2})(?:/|$))[^\\r\\n\\u0000]+$" }
+          }
+        }
+      ]
+    }
+  }
+}

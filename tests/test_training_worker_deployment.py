@@ -178,6 +178,7 @@ def test_system_deployment_is_fixed_complete_and_idempotent() -> None:
     assert "Group=research" in unit
     assert "ProtectSystem=strict" not in unit
     assert "ProtectHome=true" not in unit
+    assert "KillMode=process" in unit
     assert WORKER_STATE_ROOT in unit
     assert WORKER_CONFIG_ROOT in WORKER_ENVIRONMENT_PATH
     assert WORKER_CURRENT_LINK in unit

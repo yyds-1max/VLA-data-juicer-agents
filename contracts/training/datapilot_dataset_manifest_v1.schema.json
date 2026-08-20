@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datapilot.local/contracts/training/datapilot_dataset_manifest_v1.schema.json",
+  "title": "DataPilot Dataset Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "snapshot_ref", "run_ref", "family_ref", "splits"],
+  "properties": {
+    "contract": { "const": "datapilot_dataset_manifest_v1" },
+    "snapshot_ref": { "type": "string", "minLength": 1 },
+    "run_ref": { "type": ["string", "null"] },
+    "family_ref": { "type": "string", "minLength": 1 },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "test"],
+      "properties": {
+        "train": {
+          "allOf": [{ "$ref": "#/$defs/replicas" }],
+          "minItems": 1
+        },
+        "test": { "$ref": "#/$defs/replicas" }
+      }
+    }
+  },
+  "$defs": {
+    "replicas": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dataset_date", "release_ref", "replica_ref", "local_root", "inventory_sha256"],
+        "properties": {
+          "dataset_date": { "type": "string", "pattern": "^[0-9]{8}$" },
+          "release_ref": { "type": "string", "minLength": 1 },
+          "replica_ref": { "type": "string", "minLength": 1 },
+          "local_root": { "type": "string", "pattern": "^/" },
+          "inventory_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }
+        }
+      }
+    }
+  }
+}

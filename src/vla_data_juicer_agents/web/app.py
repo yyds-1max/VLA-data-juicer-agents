@@ -224,6 +224,7 @@ def create_app(
             training_store,
             training_provider,
             simulation_enabled=training_settings.simulation_enabled,
+            real_execution_enabled=training_settings.real_execution_enabled,
             node_deployment_manager=node_deployment_manager,
             dataset_catalog=resolved_training_dataset_catalog,
         )

@@ -378,7 +378,7 @@ export type TrainingRunPreviewRequest = TrainingRunPayload & {
 };
 
 export type TrainingRunRequest = TrainingRunPayload & {
-  execution_mode: "simulation";
+  execution_mode: "simulation" | "real";
 };
 
 export async function previewTrainingRun(payload: TrainingRunPreviewRequest): Promise<TrainingRunPreview> {

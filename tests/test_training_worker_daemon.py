@@ -15,6 +15,7 @@ from vla_data_juicer_agents.training_worker.client import (
     CenterClientError,
     HttpCenterClient,
     OfflineCenterClient,
+    capability_payload,
 )
 from vla_data_juicer_agents.training_worker.daemon import TrainingWorkerDaemon
 from vla_data_juicer_agents.training_worker.identity import (
@@ -55,6 +56,22 @@ def test_worker_identity_is_stable_private_and_not_publicly_serialized(tmp_path:
     if os.name == "posix":
         identity_mode = stat.S_IMODE((state_dir / "identity.json").stat().st_mode)
         assert identity_mode == 0o600
+
+
+def test_enrollment_capabilities_explicitly_advertise_real_training() -> None:
+    payload = capability_payload(
+        {
+            "host": {
+                "hostname": "train-host",
+                "os": "Linux",
+                "os_release": "6",
+                "architecture": "x86_64",
+            }
+        }
+    )
+
+    assert payload["training_execution_v1"] is True
+    assert "training_execution_v1" in payload["worker_features"]
 
 
 def test_worker_identity_rejects_symlink(tmp_path: Path) -> None:
@@ -236,7 +253,7 @@ def test_nvidia_smi_fallback_never_uses_shell(monkeypatch: pytest.MonkeyPatch) -
         worker_resources._run_fixed_nvidia_smi(("echo", "unsafe"), 5.0)
 
 
-def test_daemon_health_payload_has_no_secret_and_no_execution(tmp_path: Path) -> None:
+def test_daemon_health_payload_has_no_secret_and_advertises_fixed_execution(tmp_path: Path) -> None:
     state_dir = tmp_path / "worker-state"
     identity = load_or_create_identity(state_dir)
     ledger = WorkerLedger(state_dir / "ledger.sqlite")
@@ -261,8 +278,9 @@ def test_daemon_health_payload_has_no_secret_and_no_execution(tmp_path: Path) ->
     assert payload["worker_id"] == identity.worker_id
     assert payload["sequence"] == 1
     assert payload["health"]["status"] == "degraded"  # type: ignore[index]
-    assert payload["health"]["execution_enabled"] is False  # type: ignore[index]
-    assert payload["capabilities"]["training_execution"] is False  # type: ignore[index]
+    assert payload["health"]["execution_enabled"] is True  # type: ignore[index]
+    assert payload["capabilities"]["training_execution"] is True  # type: ignore[index]
+    assert payload["capabilities"]["training_execution_v1"] is True  # type: ignore[index]
     assert payload["capabilities"]["arbitrary_command_execution"] is False  # type: ignore[index]
     assert identity.credential not in serialized
 
@@ -312,6 +330,50 @@ def test_model_configuration_verification_is_read_only_and_reports_failures(
         if check["status"] == "failed"
     }
     assert {"entrypoint", "executable", "output_root"} <= failed_codes
+
+
+def test_model_verification_resolves_relative_launcher_inside_workdir(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    launcher = project / "venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    (project / "train.py").write_text("print('ok')\n", encoding="utf-8")
+
+    result = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": "./venv/bin/python",
+            "entrypoint": "train.py",
+            "output_root": str(tmp_path / "outputs"),
+            "runtime_environment": {"kind": "system"},
+        }
+    )
+
+    checks = {check["code"]: check for check in result["checks"]}  # type: ignore[index]
+    assert result["status"] == "succeeded"
+    assert checks["executable"]["status"] == "passed"
+
+    outside = tmp_path / "outside-python"
+    outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    outside.chmod(0o700)
+    (project / "escaped-python").symlink_to(outside)
+    rejected = verify_model_configuration(
+        {
+            "working_directory": str(project),
+            "executable": "./escaped-python",
+            "entrypoint": "train.py",
+            "output_root": str(tmp_path / "outputs"),
+            "runtime_environment": {"kind": "system"},
+        }
+    )
+    rejected_checks = {
+        check["code"]: check for check in rejected["checks"]  # type: ignore[index]
+    }
+    assert rejected["status"] == "failed"
+    assert rejected_checks["executable"]["status"] == "failed"
 
 
 def test_model_verification_resolves_launcher_inside_selected_conda_environment(
@@ -579,6 +641,54 @@ def test_http_center_client_posts_worker_command_result_to_fixed_origin(tmp_path
     body = json.loads(request.data)
     assert body["worker_instance_id"] == identity.worker_id
     assert "worker_token" not in body
+
+
+def test_http_center_client_uses_dedicated_training_action_and_update_endpoints(
+    tmp_path: Path,
+) -> None:
+    identity = load_or_create_identity(tmp_path / "state")
+    token = "worker_" + "t" * 48
+    client = HttpCenterClient(
+        center_base_url="https://center.example/base",
+        worker_token=token,
+        node_ref="node_123",
+        timeout_seconds=4,
+    )
+    opener = _RecordingOpener(
+        [
+            {"actions": []},
+            {"action_ref": "action_1", "status": "succeeded"},
+            {"accepted_through_seq": 1},
+        ]
+    )
+    client._opener = opener  # type: ignore[assignment]
+
+    client.poll_training_actions(identity, wait_seconds=20, limit=1)
+    client.publish_training_action_result(
+        identity,
+        "action_1",
+        {"claim_token": "claim_123", "status": "succeeded"},
+    )
+    client.publish_run_updates(
+        identity,
+        "run_1",
+        {
+            "owner_epoch": 1,
+            "worker_seq": 1,
+            "updates": [{"kind": "heartbeat", "stage_ref": "stage_1"}],
+        },
+    )
+
+    urls = [request.full_url for request, _timeout in opener.requests]
+    assert urls[0].endswith("/api/training/nodes/node_123/training-actions/poll")
+    assert urls[1].endswith(
+        "/api/training/nodes/node_123/training-actions/action_1/result"
+    )
+    assert urls[2].endswith("/api/training/nodes/node_123/runs/run_1/updates")
+    assert all(
+        request.get_header("Authorization") == f"Bearer {token}"
+        for request, _timeout in opener.requests
+    )
 
 
 def test_http_center_client_rejects_redirect_without_leaking_token(tmp_path: Path) -> None:

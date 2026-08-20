@@ -52,6 +52,28 @@ class WorkerCenterClient(Protocol):
         limit: int = 1,
     ) -> Mapping[str, object]: ...
 
+    def poll_training_actions(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]: ...
+
+    def publish_training_action_result(
+        self,
+        identity: WorkerIdentity,
+        action_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
+    def publish_run_updates(
+        self,
+        identity: WorkerIdentity,
+        run_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
     def fetch_dataset_manifest_page(
         self,
         release_ref: str,
@@ -195,6 +217,60 @@ class HttpCenterClient:
             },
             bearer_token=self.worker_token,
             timeout_seconds=max(self.timeout_seconds, float(wait_seconds + 5)),
+        )
+
+    def poll_training_actions(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        if wait_seconds < 0 or wait_seconds > 30 or limit < 1 or limit > 10:
+            raise CenterClientError("worker training action poll options are invalid")
+        return self._post_json(
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/training-actions/poll",
+            {
+                "worker_instance_id": identity.worker_id,
+                "wait_seconds": wait_seconds,
+                "limit": limit,
+            },
+            bearer_token=self.worker_token,
+            timeout_seconds=max(self.timeout_seconds, float(wait_seconds + 5)),
+        )
+
+    def publish_training_action_result(
+        self,
+        identity: WorkerIdentity,
+        action_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        action_ref = _validated_wire_ref(action_ref)
+        return self._post_json(
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/training-actions/"
+            f"{quote(action_ref, safe='')}/result",
+            {"worker_instance_id": identity.worker_id, **dict(payload)},
+            bearer_token=self.worker_token,
+        )
+
+    def publish_run_updates(
+        self,
+        identity: WorkerIdentity,
+        run_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if not self.worker_token or not self.node_ref:
+            raise CenterClientError("worker is not enrolled")
+        run_ref = _validated_wire_ref(run_ref)
+        return self._post_json(
+            f"/api/training/nodes/{quote(self.node_ref, safe='')}/runs/"
+            f"{quote(run_ref, safe='')}/updates",
+            {"worker_instance_id": identity.worker_id, **dict(payload)},
+            bearer_token=self.worker_token,
         )
 
     def fetch_dataset_manifest_page(
@@ -379,6 +455,31 @@ class OfflineCenterClient:
     ) -> Mapping[str, object]:
         return {"commands": []}
 
+    def poll_training_actions(
+        self,
+        identity: WorkerIdentity,
+        *,
+        wait_seconds: int = 25,
+        limit: int = 1,
+    ) -> Mapping[str, object]:
+        return {"actions": []}
+
+    def publish_training_action_result(
+        self,
+        identity: WorkerIdentity,
+        action_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return {}
+
+    def publish_run_updates(
+        self,
+        identity: WorkerIdentity,
+        run_ref: str,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return {}
+
     def fetch_dataset_manifest_page(
         self,
         release_ref: str,
@@ -417,12 +518,14 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
         "nvidia_driver_version": None,
         "cuda_version": None,
         "conda_environments": [],
+        "training_execution_v1": True,
         "worker_features": [
             "resource_inventory",
             "restart_reconciliation",
             "model_configuration_verification",
             "directory_browser_v1",
             "dataset_transfer_v1",
+            "training_execution_v1",
         ],
     }
 

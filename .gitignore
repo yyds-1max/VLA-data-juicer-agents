@@ -55,6 +55,7 @@ checkpoints/
 !/deployment/systemd/README.md
 !/runtime/navigation_odom_v1/README.md
 !/docs/navigation-plan-agent-guidance.md
+!/docs/training-model-integration.md
 /DATAPILOT_ROUTING_SINGLE_AGENT_HANDOFF.md
 
 # 数据

@@ -220,9 +220,10 @@ def test_existing_v9_database_migrates_commands_and_old_cancellation_to_pause(tm
         migrated_transfer = db.execute(
             "SELECT transfer_ref,status,bytes_transferred FROM dataset_transfers"
         ).fetchone()
-    assert ledger[-2:] == [
+    assert ledger[-3:] == [
         (10, "training_node_command_claim_tokens_m10"),
         (11, "dataset_transfer_pause_cancel_m11"),
+        (12, "real_training_execution_m12"),
     ]
     assert "claim_token_sha256" in columns
     assert existing == [("command_existing", "queued")]

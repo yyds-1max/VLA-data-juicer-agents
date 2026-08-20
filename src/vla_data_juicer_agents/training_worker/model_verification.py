@@ -169,11 +169,25 @@ def _nearest_existing_parent(path: Path) -> Path | None:
 def _find_system_executable(executable: str, workdir: Path) -> str | None:
     candidate = Path(executable)
     if candidate.is_absolute() or "/" in executable:
-        if not candidate.is_absolute():
+        relative_candidate = not candidate.is_absolute()
+        if relative_candidate:
+            if ".." in candidate.parts:
+                return None
             candidate = workdir / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if relative_candidate:
+            try:
+                resolved.relative_to(workdir.resolve(strict=True))
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if resolved == workdir.resolve(strict=True):
+                return None
         return (
-            str(candidate)
-            if candidate.is_file() and os.access(candidate, os.X_OK)
+            str(resolved)
+            if resolved.is_file() and os.access(resolved, os.X_OK)
             else None
         )
     return shutil.which(executable)

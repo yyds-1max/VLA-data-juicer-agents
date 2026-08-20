@@ -17,6 +17,7 @@ from .identity import WorkerIdentity
 from .ledger import WorkerLedger
 from .resources import ResourceCollector
 from .model_verification import verify_model_configuration
+from .execution import TrainingExecutionManager
 
 
 class TrainingWorkerDaemon:
@@ -45,18 +46,26 @@ class TrainingWorkerDaemon:
         self._stop_event = threading.Event()
         self._reconciled = False
         self._command_thread: threading.Thread | None = None
+        self._training_action_thread: threading.Thread | None = None
+        self._training_monitor_thread: threading.Thread | None = None
         self._transfer_manager = DatasetTransferManager(
             source_client=self.center_client,
             publish_result=self._publish_dataset_result,
+            monotonic_clock=monotonic_clock,
+        )
+        self._execution_manager = TrainingExecutionManager(
+            identity=identity,
+            ledger=ledger,
+            center_client=self.center_client,
+            resource_collector=resource_collector,
+            state_dir=ledger.path.parent,
             monotonic_clock=monotonic_clock,
         )
 
     def run_once(self) -> dict[str, object]:
         reconciliation_payload: list[dict[str, str]] = []
         if not self._reconciled:
-            reconciliation_payload = [
-                result.to_payload() for result in self.ledger.reconcile_active_runs()
-            ]
+            reconciliation_payload = self._execution_manager.reconciliation_updates()
             self._reconciled = True
         self._sequence += 1
         resource_payload = self.resource_collector.collect()
@@ -70,7 +79,7 @@ class TrainingWorkerDaemon:
             "health": {
                 "status": "degraded" if degraded else "healthy",
                 "uptime_seconds": round(self._clock() - self._started_at, 3),
-                "execution_enabled": False,
+                "execution_enabled": True,
                 "ledger_state_counts": self.ledger.state_counts(),
             },
             "capabilities": {
@@ -78,7 +87,8 @@ class TrainingWorkerDaemon:
                 "restart_reconciliation": True,
                 "directory_browser_v1": True,
                 "dataset_transfer_v1": True,
-                "training_execution": False,
+                "training_execution": True,
+                "training_execution_v1": True,
                 "arbitrary_command_execution": False,
             },
             "resources": resource_payload,
@@ -247,6 +257,45 @@ class TrainingWorkerDaemon:
             except CenterClientError:
                 self._stop_event.wait(min(self.interval_seconds, 5.0))
 
+    def _poll_training_actions_forever(self) -> None:
+        poll = getattr(self.center_client, "poll_training_actions", None)
+        publish = getattr(self.center_client, "publish_training_action_result", None)
+        if not callable(poll) or not callable(publish):
+            return
+        while not self._stop_event.is_set():
+            try:
+                response = poll(self.identity, wait_seconds=25, limit=1)
+                raw_actions = response.get("actions")
+                actions = raw_actions if isinstance(raw_actions, list) else []
+                singular = response.get("action")
+                if isinstance(singular, dict):
+                    actions.append(singular)
+                for action in actions:
+                    if not isinstance(action, dict):
+                        continue
+                    result = self._execution_manager.handle_action(action)
+                    action_ref = result.pop("action_ref", None)
+                    if isinstance(action_ref, str):
+                        publish(self.identity, action_ref, result)
+                if not actions:
+                    self._stop_event.wait(0.25)
+            except CenterClientError:
+                self._stop_event.wait(min(self.interval_seconds, 5.0))
+            except Exception:
+                # Malformed actions must not terminate the node daemon.  The
+                # center will expire and retry an unacknowledged claim.
+                self._stop_event.wait(1.0)
+
+    def _monitor_training_forever(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._execution_manager.tick()
+            except Exception:
+                # Individual run errors are reported through the durable
+                # outbox; an unexpected monitoring error is retried.
+                pass
+            self._stop_event.wait(1.0)
+
     def run_forever(self) -> None:
         if self._command_thread is None:
             self._command_thread = threading.Thread(
@@ -255,6 +304,20 @@ class TrainingWorkerDaemon:
                 daemon=True,
             )
             self._command_thread.start()
+        if self._training_action_thread is None:
+            self._training_action_thread = threading.Thread(
+                target=self._poll_training_actions_forever,
+                name="datapilot-worker-training-action-poll",
+                daemon=True,
+            )
+            self._training_action_thread.start()
+        if self._training_monitor_thread is None:
+            self._training_monitor_thread = threading.Thread(
+                target=self._monitor_training_forever,
+                name="datapilot-worker-training-monitor",
+                daemon=True,
+            )
+            self._training_monitor_thread.start()
         while not self._stop_event.is_set():
             try:
                 self.run_once()

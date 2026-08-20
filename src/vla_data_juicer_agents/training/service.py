@@ -68,6 +68,7 @@ class TrainingService:
         provider: FakeResourceProvider | TrainingResourceProvider,
         *,
         simulation_enabled: bool = True,
+        real_execution_enabled: bool = False,
         node_deployment_manager: TrainingNodeDeploymentManager | None = None,
         repair_heartbeat_timeout_seconds: float = 8.0,
         heartbeat_poll_interval_seconds: float = 0.25,
@@ -77,6 +78,7 @@ class TrainingService:
     ) -> None:
         self.store, self.provider = store, provider
         self.simulation_enabled = simulation_enabled
+        self.real_execution_enabled = real_execution_enabled
         self.node_deployment_manager = node_deployment_manager
         self.repair_heartbeat_timeout_seconds = max(
             0.0, float(repair_heartbeat_timeout_seconds)
@@ -119,7 +121,19 @@ class TrainingService:
 
     def capabilities(self, principal: Any) -> dict[str, Any]:
         deployment_enabled = self.node_deployment_manager is not None
-        return {**principal.public_projection(), "simulation_enabled": self.simulation_enabled, "real_execution_enabled": False, "real_execution_disabled_reason": "Real training is intentionally disabled until server paths and credentials are verified.", "node_deployment_enabled": deployment_enabled, "node_deployment_disabled_reason": None if deployment_enabled else "Training Worker deployment requires a configured HTTPS center URL."}
+        return {
+            **principal.public_projection(),
+            "simulation_enabled": self.simulation_enabled,
+            "real_execution_enabled": self.real_execution_enabled,
+            "training_execution_v1": self.real_execution_enabled,
+            "real_execution_disabled_reason": None
+            if self.real_execution_enabled
+            else "Real training is disabled by deployment configuration.",
+            "node_deployment_enabled": deployment_enabled,
+            "node_deployment_disabled_reason": None
+            if deployment_enabled
+            else "Training Worker deployment requires a configured HTTPS center URL.",
+        }
 
     def list_servers(self) -> list[dict[str, Any]]: return self.provider.list_servers()
     def get_server_resources(self, server_ref: str) -> dict[str, Any]: return self.provider.resources(server_ref)
@@ -148,6 +162,7 @@ class TrainingService:
         self, node_ref: str, expected_revision: int, principal: Any
     ) -> None:
         self._require(principal, TRAINING_MANAGE_NODES)
+        self.store.assert_node_has_no_active_real_runs(node_ref)
         self.store.delete_node(node_ref, expected_revision, principal.subject)
 
     def create_enrollment_token(
@@ -179,6 +194,7 @@ class TrainingService:
         self, node_ref: str, payload: Any, principal: Any
     ) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_NODES)
+        self.store.assert_node_has_no_active_real_runs(node_ref)
         if self.node_deployment_manager is None:
             raise TrainingUnavailableError(
                 "training_node_deployment_unavailable",
@@ -335,6 +351,7 @@ class TrainingService:
         self, node_ref: str, payload: Any, principal: Any
     ) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_NODES)
+        self.store.assert_node_has_no_active_real_runs(node_ref)
         if self.node_deployment_manager is None:
             raise TrainingUnavailableError(
                 "training_node_deployment_unavailable",
@@ -697,6 +714,62 @@ class TrainingService:
         self.store.authorize_source_download(node_ref, item["release_ref"])
         return item
 
+    def poll_training_actions(
+        self, node_ref: str, worker_token: str, payload: Any
+    ) -> dict[str, Any]:
+        data = self._data(payload)
+        wait_seconds = max(0, min(int(data.get("wait_seconds") or 0), 30))
+        deadline = self._monotonic_clock() + wait_seconds
+        while True:
+            result = self.store.poll_training_actions(
+                node_ref,
+                worker_token,
+                str(data["worker_instance_id"]),
+                int(data.get("limit") or 1),
+            )
+            if result["actions"] or self._monotonic_clock() >= deadline:
+                return result
+            self._sleeper(min(0.25, deadline - self._monotonic_clock()))
+
+    def finish_training_action(
+        self,
+        node_ref: str,
+        action_ref: str,
+        worker_token: str,
+        payload: Any,
+    ) -> dict[str, Any]:
+        data = self._data(payload)
+        return self.store.finish_training_action(
+            node_ref,
+            worker_token,
+            action_ref,
+            worker_instance_id=str(data["worker_instance_id"]),
+            claim_token=str(data["claim_token"]),
+            status=str(data["status"]),
+            result=dict(data.get("result") or {}),
+            error=dict(data.get("error") or {}) if data.get("error") else None,
+        )
+
+    def update_training_run(
+        self,
+        node_ref: str,
+        run_ref: str,
+        worker_token: str,
+        payload: Any,
+    ) -> dict[str, Any]:
+        data = self._data(payload)
+        return self._project_run(
+            self.store.apply_training_run_updates(
+                node_ref,
+                worker_token,
+                run_ref,
+                worker_instance_id=str(data["worker_instance_id"]),
+                owner_epoch=int(data["owner_epoch"]),
+                worker_seq=int(data["worker_seq"]),
+                updates=list(data["updates"]),
+            )
+        )
+
     def _prepare(
         self,
         payload: Any,
@@ -723,10 +796,10 @@ class TrainingService:
                     "真实训练尚未启用；真实训练节点当前只允许生成预览。",
                 )
         else:
-            if not allow_real_preview:
+            if not allow_real_preview and not self.real_execution_enabled:
                 raise TrainingValidationError(
                     "real_execution_disabled",
-                    "真实训练尚未启用；当前只能生成真实 RunSpec 预览。",
+                    "Real training is disabled by deployment configuration.",
                 )
             if server is not None and server.get("kind") != "training_node":
                 raise TrainingValidationError(
@@ -742,6 +815,28 @@ class TrainingService:
             raise TrainingValidationError("model_unavailable", "The selected model family is disabled.")
         if model["launch_template"]["server_ref"] != data["server_ref"]:
             raise TrainingValidationError("server_mismatch", "The model template belongs to another server.")
+        if execution_mode == "real" and not allow_real_preview:
+            if model["status"] != "verified":
+                raise TrainingValidationError(
+                    "real_training_model_not_verified",
+                    "The current model configuration must be verified before real training.",
+                )
+            node = self.store.get_node(data["server_ref"])
+            capabilities = node.get("capabilities") or {}
+            features = set(capabilities.get("worker_features") or [])
+            if node.get("status") != "online":
+                raise TrainingValidationError(
+                    "real_training_node_unavailable",
+                    "The selected Training Worker node must be online.",
+                )
+            if not (
+                capabilities.get("training_execution_v1") is True
+                or "training_execution_v1" in features
+            ):
+                raise TrainingValidationError(
+                    "real_training_worker_upgrade_required",
+                    "Update the Training Worker before starting real training.",
+                )
 
         data_access_mode = model.get("data_access_mode", "self_managed")
         selection = data.get("dataset_selection")
@@ -827,8 +922,12 @@ class TrainingService:
             for definition in definitions:
                 resolve(definition)
             total_steps = int(normalized.get("max_steps", 20))
-            if total_steps < 1 or total_steps > 10_000:
-                raise TrainingValidationError("invalid_max_steps", "Simulation max_steps must be between 1 and 10000.")
+            maximum_steps = 10_000 if execution_mode == "simulation" else 10_000_000
+            if total_steps < 1 or total_steps > maximum_steps:
+                raise TrainingValidationError(
+                    "invalid_max_steps",
+                    f"max_steps must be between 1 and {maximum_steps}.",
+                )
             return {"parameters": normalized, "sensitive_parameters": sensitive, "stage_input_source": source, "total_steps": total_steps}
 
         for index, stage in enumerate(data["stages"], start=1):
@@ -909,12 +1008,12 @@ class TrainingService:
                 preview_check = "simulation_only" if execution_mode == "simulation" else "real_preview_only"
                 ready_code = "simulation_ready" if execution_mode == "simulation" else "real_preview_ready"
                 ready_message = "Simulation inputs and GPU availability are valid." if execution_mode == "simulation" else "真实节点、GPU 和参数已通过预览校验；未创建任务、租约或进程。"
-                private = {**public, "version": 2, "mode": execution_mode, "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": [preview_check, "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
+                private = {**public, "version": 2, "mode": execution_mode, "model_ref": model["model_ref"], "internal_model_revision": model["internal_revision"], "revision_ref": model["revision_ref"], "gpu_indexes": indexes, "parameters": parameters, "sensitive_parameters": source_stage["sensitive_parameters"], "working_directory": template["working_directory"], "entrypoint": template["entrypoint"], "output_root": template["output_root"], "output_directory": output, "argv": argv, "preflight": {"ok": True, "checks": [preview_check, "gpu_available", "parameters_valid"]}, "safe_command_preview": shlex.join(safe_argv), "public_spec": public}
                 built_stages.append({"stage_number": stage_number, "stage_name": stage_names[stage_number - 1], "stage_input_source": source_stage["stage_input_source"], "parameters": parameters, "private_spec": private, "run_spec": public, "command_preview": private["safe_command_preview"], "output_directory": output, "total_steps": source_stage["total_steps"], "preflight": [{"ok": True, "code": ready_code, "message": ready_message}]})
                 previous_output = output
             return {"stages": built_stages, "total_steps": sum(stage["total_steps"] for stage in built_stages), "dataset_manifest": dataset_manifest, "dataset_manifest_path": dataset_manifest_path}
 
-        prepared = {"family_ref": model["family_ref"], "model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "stages": normalized_stages, "total_steps": sum(stage["total_steps"] for stage in normalized_stages), "requires_master_port": uses_torchrun, "data_access_mode": data_access_mode, "dataset_splits": dataset_splits, "version_description": str(data.get("version_description") or "").strip()}
+        prepared = {"family_ref": model["family_ref"], "model_ref": model["model_ref"], "revision_ref": model["revision_ref"], "server_ref": data["server_ref"], "gpu_uuids": data["gpu_uuids"], "stages": normalized_stages, "total_steps": sum(stage["total_steps"] for stage in normalized_stages), "requires_master_port": uses_torchrun, "data_access_mode": data_access_mode, "dataset_splits": dataset_splits, "version_description": str(data.get("version_description") or "").strip(), "execution_mode": execution_mode}
         return prepared, build
 
     def preview_run(self, payload: Any, principal: Any) -> dict[str, Any]:
@@ -986,7 +1085,7 @@ class TrainingService:
     def _project_run(self, run: dict[str, Any]) -> dict[str, Any]:
         metric_page = self.store.list_metrics(run["run_ref"], 0, 2000)
         latest = metric_page["items"][-1] if metric_page["items"] else None
-        current_epoch = latest["epoch"] if latest else 0
+        current_epoch = (latest.get("epoch") if latest else None) or 0
         return {**run, "progress_percent": round(run["progress"] * 100, 2), "current_epoch": current_epoch, "total_epochs": 3, "latest_metric": latest, "failure_code": run.get("failure", {}).get("code") if run.get("failure") else None, "failure_message": run.get("failure", {}).get("message") if run.get("failure") else None, "audit_events": self.store.list_audit_events(run["run_ref"])}
 
     def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:

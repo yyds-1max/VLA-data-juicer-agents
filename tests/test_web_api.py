@@ -110,6 +110,19 @@ def test_https_center_configuration_enables_worker_deployment(
     assert capabilities.json()["node_deployment_disabled_reason"] is None
 
 
+def test_real_training_switch_reaches_training_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLA_TRAINING_REAL_EXECUTION_ENABLED", "true")
+    client = make_client(tmp_path)
+
+    capabilities = client.get("/api/training/capabilities")
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["real_execution_enabled"] is True
+    assert capabilities.json()["real_execution_disabled_reason"] is None
+
+
 def test_submit_turn_returns_turn_id(tmp_path: Path):
     client = make_client(tmp_path)
     session_id = _create_session(client)

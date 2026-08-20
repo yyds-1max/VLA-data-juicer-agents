@@ -47,6 +47,7 @@ class TrainingSettings:
     """Security-sensitive training switches sourced from deployment settings."""
 
     simulation_enabled: bool = True
+    real_execution_enabled: bool = False
     development_admin: bool = False
     center_base_url: str | None = None
     center_ca_certificate_path: str | None = None
@@ -97,6 +98,9 @@ class TrainingSettings:
     def from_env(cls) -> TrainingSettings:
         return cls(
             simulation_enabled=_env_bool("VLA_TRAINING_SIMULATION_ENABLED", True),
+            real_execution_enabled=_env_bool(
+                "VLA_TRAINING_REAL_EXECUTION_ENABLED", False
+            ),
             development_admin=_env_bool("VLA_TRAINING_DEV_ADMIN", False),
             center_base_url=(
                 os.environ.get("VLA_TRAINING_CENTER_BASE_URL", "").strip() or None

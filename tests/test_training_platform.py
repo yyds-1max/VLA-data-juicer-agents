@@ -309,7 +309,8 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         (8, "training_node_deletion_history_m8"),
         (9, "training_datasets_m9"),
         (10, "training_node_command_claim_tokens_m10"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "dataset_transfer_pause_cancel_m11"),
+        (11, "dataset_transfer_pause_cancel_m11"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "real_training_execution_m12"),
     ]
 
 
@@ -1039,7 +1040,8 @@ def test_real_training_node_can_preview_without_creating_a_run_or_lease(
         headers={"Idempotency-Key": "real-preview-must-not-run"},
         json=preview_payload,
     )
-    assert create.status_code == 422
+    assert create.status_code == 400
+    assert create.json()["detail"]["code"] == "real_execution_disabled"
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM training_runs").fetchone()[0] == 0
 

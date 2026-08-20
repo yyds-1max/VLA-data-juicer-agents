@@ -241,7 +241,7 @@ class RunRequest(BaseModel):
     server_ref: str = Field(default="fake-local", min_length=1, max_length=128)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
-    mode: Literal["simulation"] = "simulation"
+    execution_mode: Literal["simulation", "real"] = "simulation"
     version_description: str = Field(default="", max_length=500)
     dataset_selection: dict[str, list[str]] | None = None
 

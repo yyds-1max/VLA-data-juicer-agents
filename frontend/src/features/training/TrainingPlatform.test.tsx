@@ -846,6 +846,51 @@ describe("TrainingPlatform", () => {
     expect(trainingApi.createTrainingRun).not.toHaveBeenCalled();
   });
 
+  it("starts a verified real training run only after the execution capability is available", async () => {
+    const realServer: TrainingServer = { server_ref: "node-real", name: "NaVILA 训练节点", kind: "training_node", gpu_count: 1, status: "online", online: true, available: true, stale: false };
+    const realResources: TrainingServerResources = { server: realServer, sampled_at: "2026-08-20T08:00:00Z", stale: false, gpus: [{ gpu_uuid: "GPU-real-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 2048, utilization_percent: 3, temperature_c: 42, externally_occupied: false }] };
+    const realModel: TrainingModel = { ...model, family_ref: "navila-real-exec", status: "verified", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };
+    const realNode: TrainingNode = {
+      ...pendingNode,
+      node_ref: realServer.server_ref,
+      status: "online",
+      capabilities: {
+        training_execution_v1: false,
+        worker_features: ["training_execution_v1"],
+      },
+    };
+    const enabledCapabilities: TrainingCapabilities = { ...adminCapabilities, real_execution_enabled: true, real_execution_disabled_reason: "" };
+    const createdRun: TrainingRun = { ...runningRun, run_ref: "run-real", execution_mode: "real", server_ref: realServer.server_ref, gpu_uuids: ["GPU-real-0"] };
+    mockApi(enabledCapabilities, [realModel]);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([realServer]);
+    vi.mocked(trainingApi.listTrainingNodes).mockResolvedValue([realNode]);
+    vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === realServer.server_ref ? realResources : resources);
+    vi.mocked(trainingApi.previewTrainingRun).mockResolvedValue({ stages: [{ stage_number: 1, stage_name: "第一阶段", command_preview: "python train.py", output_directory: "/workspace/outputs/navila-real/stage-01", run_spec: { ...runSpec, execution_mode: "real", server_ref: realServer.server_ref, gpu_uuids: ["GPU-real-0"] }, preflight: [{ ok: true, message: "准备就绪" }] }] });
+    vi.mocked(trainingApi.createTrainingRun).mockResolvedValue(createdRun);
+    renderPlatform();
+
+    await openNewTraining();
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择 GPU 0" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
+    await screen.findByText("python train.py");
+    fireEvent.change(screen.getByLabelText("本次训练说明"), { target: { value: "真实训练 smoke" } });
+    fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
+    await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenLastCalledWith(expect.objectContaining({ execution_mode: "real" })));
+    fireEvent.click(screen.getByRole("button", { name: "开始训练" }));
+    await waitFor(() => expect(trainingApi.createTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ execution_mode: "real", family_ref: realModel.family_ref })));
+  });
+
+  it("shows a non-destructive warning when a real Worker connection cannot be confirmed", async () => {
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([{ ...runningRun, execution_mode: "real", execution_control_status: "unreachable" }]);
+    vi.mocked(trainingApi.getTrainingRun).mockResolvedValue({ ...runningRun, execution_mode: "real", execution_control_status: "unreachable" });
+    vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
+    vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
+    renderPlatform("/model/runs/run-running");
+    expect(await screen.findByText(/Worker 状态待确认/)).toBeVisible();
+    expect(screen.getByText(/训练可能仍在节点继续执行/)).toBeVisible();
+  });
+
   it("requests Worker verification for a real model family and shows its checks", async () => {
     const realServer: TrainingServer = { server_ref: "node-real", name: "NaVILA 训练节点", kind: "training_node", gpu_count: 1, status: "online", online: true, available: true, stale: false };
     const realModel: TrainingModel = { ...model, family_ref: "navila-real", configuration: { ...model.configuration!, launch_template: { ...launchTemplate, server_ref: realServer.server_ref } } };

@@ -17,6 +17,7 @@ from .daemon import TrainingWorkerDaemon
 from .identity import load_or_create_identity, load_worker_token, store_worker_token
 from .ledger import WorkerLedger
 from .resources import ResourceCollector
+from .supervisor import run_supervisor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,11 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Collect one payload as JSON and exit without contacting a center.",
     )
+    parser.add_argument(
+        "--supervise-spec",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.supervise_spec is not None:
+        return run_supervisor(args.supervise_spec)
     identity = load_or_create_identity(args.state_dir)
     ledger = WorkerLedger(args.state_dir / "worker-ledger.sqlite")
     collector = ResourceCollector(disk_paths=args.disk_paths)

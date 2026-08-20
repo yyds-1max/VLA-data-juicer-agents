@@ -66,6 +66,7 @@ ExecStart=/usr/bin/python3 /opt/datapilot-training-worker/current/datapilot-trai
 WorkingDirectory=/var/lib/datapilot-training-worker
 Restart=on-failure
 RestartSec=5s
+KillMode=process
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

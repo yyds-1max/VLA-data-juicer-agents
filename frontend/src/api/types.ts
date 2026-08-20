@@ -338,6 +338,7 @@ export interface NavigationSyncImageListing {
 export type TrainingPermission = "training:view" | "training:manage_models" | "training:manage_nodes" | "training:create_runs" | "training:stop_runs";
 export type TrainingModelStatus = "draft" | "verified" | "disabled";
 export type TrainingRunStatus = "queued" | "preparing" | "running" | "stop_requested" | "succeeded" | "failed" | "cancelled" | "lost";
+export type TrainingExecutionControlStatus = "connected" | "unreachable" | "unresolved";
 export type TrainingParameterType = "integer" | "number" | "boolean" | "enum" | "string";
 export type TrainingArgumentStyle = "value" | "explicit_boolean" | "flag_when_true";
 export type TrainingDataAccessMode = "datapilot_managed" | "self_managed";
@@ -347,7 +348,7 @@ export interface TrainingCapabilities {
   authentication_mode: "read_only" | "development_admin" | string;
   simulation_enabled: boolean;
   real_execution_enabled: boolean;
-  real_execution_disabled_reason: string;
+  real_execution_disabled_reason: string | null;
   node_deployment_enabled?: boolean;
   node_deployment_disabled_reason?: string | null;
 }
@@ -675,11 +676,11 @@ export interface TrainingMetricSample {
   stage_ref?: string | null;
   stage_number?: number | null;
   created_at: string;
-  step: number;
-  total_steps: number;
-  epoch: number;
-  loss: number;
-  learning_rate: number;
+  step: number | null;
+  total_steps?: number | null;
+  epoch?: number | null;
+  loss?: number | null;
+  learning_rate?: number | null;
   grad_norm?: number | null;
   elapsed_seconds?: number | null;
   gpu_utilization_percent?: number | null;
@@ -706,6 +707,11 @@ export interface TrainingRun {
   version_description?: string | null;
   dataset_snapshot?: Record<string, unknown> | null;
   status: TrainingRunStatus;
+  execution_mode?: "simulation" | "real";
+  /** Real Worker connection state. It is omitted by older/simulation runs. */
+  execution_control_status?: TrainingExecutionControlStatus | null;
+  execution_control_message?: string | null;
+  last_execution_heartbeat_at?: string | null;
   state_revision: number;
   server_ref: string;
   gpu_uuids: string[];
@@ -726,7 +732,21 @@ export interface TrainingRun {
   parameters?: Record<string, string | number | boolean>;
   run_spec?: TrainingRunSpec;
   audit_events?: Array<{ created_at: string; action: string; summary: string }>;
+  artifacts?: TrainingArtifact[];
   version_model?: { kind: "version_model"; output_directory: string } | null;
+}
+
+export interface TrainingArtifact {
+  artifact_ref?: string;
+  kind: "stage_output" | "checkpoint" | "version_model";
+  stage_ref?: string | null;
+  stage_number?: number | null;
+  step?: number | null;
+  /** Path relative to the relevant stage output directory, when applicable. */
+  relative_path?: string | null;
+  path?: string | null;
+  output_directory?: string | null;
+  created_at?: string | null;
 }
 
 export interface TrainingStage {

@@ -1,8 +1,8 @@
 """Node-local Training Worker primitives.
 
-The Worker inventories the host, persists its identity, reconciles process
-observations, and executes the fixed managed-dataset protocol. It still does
-not start, stop, or signal training processes.
+The Worker inventories the host, persists its identity, executes fixed managed
+data operations, and supervises structured real-training actions without a
+shell.
 """
 
 from .daemon import TrainingWorkerDaemon
@@ -13,12 +13,14 @@ from .identity import (
     store_worker_token,
 )
 from .ledger import ReconciliationResult, WorkerLedger
+from .execution import TrainingExecutionManager
 from .resources import ResourceCollector
 
 __all__ = [
     "ReconciliationResult",
     "ResourceCollector",
     "TrainingWorkerDaemon",
+    "TrainingExecutionManager",
     "WorkerIdentity",
     "WorkerLedger",
     "load_or_create_identity",

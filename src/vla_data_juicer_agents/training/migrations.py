@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 11
+LATEST_TRAINING_SCHEMA_VERSION = 12
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -103,6 +103,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(11,?,?)",
             ("dataset_transfer_pause_cancel_m11", applied_at),
+        )
+        connection.commit()
+        versions.append(11)
+    if 12 not in versions:
+        connection.executescript(_MIGRATION_012)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(12,?,?)",
+            ("real_training_execution_m12", applied_at),
         )
         connection.commit()
 
@@ -699,5 +707,79 @@ FROM dataset_transfers_m10;
 DROP TABLE dataset_transfers_m10;
 CREATE INDEX idx_dataset_transfers_node_status
   ON dataset_transfers(node_id,status,id DESC);
+COMMIT;
+"""
+
+
+_MIGRATION_012 = """
+BEGIN IMMEDIATE;
+
+-- ``mode`` is retained as the v1 compatibility column whose original CHECK
+-- only admitted simulation.  ``execution_mode`` is the authoritative field
+-- from v12 onward and lets existing databases migrate without rebuilding the
+-- heavily referenced run table.
+ALTER TABLE training_runs ADD COLUMN execution_mode TEXT NOT NULL
+  DEFAULT 'simulation' CHECK(execution_mode IN ('simulation','real'));
+ALTER TABLE training_runs ADD COLUMN execution_control_status TEXT
+  CHECK(execution_control_status IN ('connected','unreachable','unresolved'));
+ALTER TABLE training_runs ADD COLUMN execution_worker_instance_id TEXT;
+ALTER TABLE training_runs ADD COLUMN execution_owner_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE training_runs ADD COLUMN execution_update_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE training_runs ADD COLUMN execution_last_heartbeat_at TEXT;
+
+ALTER TABLE metric_samples ADD COLUMN metric_payload_json TEXT;
+
+CREATE TABLE training_execution_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action_ref TEXT NOT NULL UNIQUE,
+  run_id INTEGER NOT NULL,
+  stage_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('start_training_stage','stop_training_run')),
+  status TEXT NOT NULL CHECK(status IN (
+    'queued','running','succeeded','failed','cancelled'
+  )),
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  worker_instance_id TEXT,
+  claim_token_sha256 TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  FOREIGN KEY(run_id) REFERENCES training_runs(id),
+  FOREIGN KEY(stage_id) REFERENCES training_stages(id)
+);
+CREATE INDEX idx_training_execution_actions_claim
+  ON training_execution_actions(node_ref_snapshot,status,kind,id);
+CREATE INDEX idx_training_execution_actions_run
+  ON training_execution_actions(run_id,id);
+
+CREATE TABLE training_checkpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  checkpoint_ref TEXT NOT NULL UNIQUE,
+  version_id INTEGER NOT NULL,
+  stage_id INTEGER NOT NULL,
+  relative_path TEXT NOT NULL,
+  step INTEGER,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  UNIQUE(stage_id,relative_path),
+  FOREIGN KEY(version_id) REFERENCES model_versions(id),
+  FOREIGN KEY(stage_id) REFERENCES training_stages(id)
+);
+CREATE INDEX idx_training_checkpoints_version
+  ON training_checkpoints(version_id,id);
+
+CREATE TABLE training_run_log_storage (
+  run_id INTEGER PRIMARY KEY,
+  stored_lines INTEGER NOT NULL DEFAULT 0 CHECK(stored_lines >= 0),
+  stored_bytes INTEGER NOT NULL DEFAULT 0 CHECK(stored_bytes >= 0),
+  truncated INTEGER NOT NULL DEFAULT 0 CHECK(truncated IN (0,1)),
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES training_runs(id) ON DELETE CASCADE
+);
+
 COMMIT;
 """

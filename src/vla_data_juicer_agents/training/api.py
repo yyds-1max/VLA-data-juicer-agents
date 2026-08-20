@@ -118,6 +118,9 @@ class TrainingServiceProtocol(Protocol):
     def remove_dataset_replica(self, replica_ref: str, principal: TrainingPrincipal) -> dict[str, Any]: ...
     def source_manifest_page(self, node_ref: str, release_ref: str, worker_token: str, *, cursor: int, limit: int) -> dict[str, Any]: ...
     def source_file(self, node_ref: str, file_ref: str, worker_token: str) -> dict[str, Any]: ...
+    def poll_training_actions(self, node_ref: str, worker_token: str, payload: Any) -> dict[str, Any]: ...
+    def finish_training_action(self, node_ref: str, action_ref: str, worker_token: str, payload: Any) -> dict[str, Any]: ...
+    def update_training_run(self, node_ref: str, run_ref: str, worker_token: str, payload: Any) -> dict[str, Any]: ...
 
     def list_models(
         self, *, include_private: bool = False
@@ -369,6 +372,7 @@ class NodeCapabilities(StrictRequest):
     cuda_version: str | None = Field(default=None, max_length=64)
     conda_environments: list[str] = Field(default_factory=list, max_length=100)
     worker_features: list[str] = Field(default_factory=list, max_length=100)
+    training_execution_v1: bool = False
 
     @field_validator(
         "hostname",
@@ -1001,7 +1005,7 @@ class RunRequest(StrictRequest):
     server_ref: str = Field(min_length=1, max_length=200)
     gpu_uuids: list[str] = Field(min_length=1, max_length=8)
     stages: list[RunStageRequest] = Field(min_length=1, max_length=10)
-    execution_mode: Literal["simulation"]
+    execution_mode: Literal["simulation", "real"]
     version_description: str = Field(default="", max_length=500)
     dataset_selection: DatasetSelectionRequest | None = None
 
@@ -1038,13 +1042,135 @@ class RunRequest(StrictRequest):
 class PreviewRunRequest(RunRequest):
     """Preview-only execution target.
 
-    Real execution remains forbidden on the persistent run endpoint until the
-    Worker runner is available.  Keeping the broader mode on this request only
-    lets development users validate the exact future RunSpec without creating
-    a task, lease, model version, or process.
+    Previewing a real RunSpec never creates a task, lease, model version or
+    process, and remains useful while deployment-level real execution is off.
     """
 
     execution_mode: Literal["simulation", "real"]
+
+
+class PollTrainingActionsRequest(StrictRequest):
+    worker_instance_id: str = Field(min_length=1, max_length=200)
+    wait_seconds: Annotated[int, Field(strict=True, ge=0, le=30)] = 20
+    limit: Annotated[int, Field(strict=True, ge=1, le=10)] = 1
+
+
+class TrainingActionResultRequest(StrictRequest):
+    worker_instance_id: str = Field(min_length=1, max_length=200)
+    claim_token: str = Field(min_length=32, max_length=512)
+    status: Literal["succeeded", "failed"]
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: dict[str, Any] | None = None
+
+
+class TrainingRunUpdateRequest(StrictRequest):
+    worker_instance_id: str = Field(min_length=1, max_length=200)
+    owner_epoch: Annotated[int, Field(strict=True, ge=1)]
+    worker_seq: Annotated[int, Field(strict=True, ge=1)]
+    updates: list[dict[str, Any]] = Field(min_length=1, max_length=200)
+
+    @field_validator("updates")
+    @classmethod
+    def validate_updates(cls, values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if len(json.dumps(values, ensure_ascii=False).encode("utf-8")) > 524288:
+            raise ValueError("training update batch exceeds 512 KiB")
+        allowed = {
+            "accepted", "started", "heartbeat", "log", "metric",
+            "checkpoint", "exited", "reconciliation",
+        }
+        for value in values:
+            if value.get("kind") not in allowed:
+                raise ValueError("training update contains an unsupported kind")
+            stage_ref = value.get("stage_ref")
+            if stage_ref is not None and (
+                not isinstance(stage_ref, str) or not _SAFE_REF.fullmatch(stage_ref)
+            ):
+                raise ValueError("training update contains an invalid stage_ref")
+            kind = value.get("kind")
+            if kind == "log":
+                messages: list[str] = []
+                if value.get("message") is not None:
+                    if not isinstance(value["message"], str):
+                        raise ValueError("log message must be text")
+                    messages.append(value["message"])
+                lines = value.get("lines")
+                if lines is not None:
+                    if not isinstance(lines, list) or len(lines) > 200:
+                        raise ValueError("log lines must contain at most 200 items")
+                    for line in lines:
+                        message = line.get("message") if isinstance(line, dict) else line
+                        if not isinstance(message, str):
+                            raise ValueError("log line must be text")
+                        messages.append(message)
+                if len(messages) > 200:
+                    raise ValueError("log update must contain at most 200 lines")
+                if not messages or any(len(message.encode("utf-8")) > 16384 for message in messages):
+                    raise ValueError("log lines must be between 1 and 16384 bytes")
+                if sum(len(message.encode("utf-8")) for message in messages) > 262144:
+                    raise ValueError("log update exceeds the 256 KiB batch limit")
+            elif kind == "metric":
+                for key in (
+                    "step", "total_steps", "epoch", "loss", "learning_rate",
+                    "grad_norm", "elapsed_seconds",
+                ):
+                    number = value.get(key)
+                    if number is not None and (
+                        isinstance(number, bool) or not isinstance(number, (int, float))
+                        or not math.isfinite(float(number))
+                    ):
+                        raise ValueError("metric fields must be finite numbers")
+                for key in ("step", "total_steps"):
+                    number = value.get(key)
+                    if number is not None and (
+                        not isinstance(number, int)
+                        or isinstance(number, bool)
+                        or number < 0
+                    ):
+                        raise ValueError("metric step fields must be non-negative integers")
+                gpus = value.get("gpus", [])
+                if not isinstance(gpus, list) or len(gpus) > 8:
+                    raise ValueError("metric GPU samples must contain at most 8 items")
+                gpu_uuids: set[str] = set()
+                allowed_gpu_fields = {
+                    "uuid", "index", "utilization_percent", "gpu_memory_mib",
+                    "temperature_celsius",
+                }
+                for gpu in gpus:
+                    if not isinstance(gpu, dict) or not set(gpu) <= allowed_gpu_fields:
+                        raise ValueError("metric GPU sample has unsupported fields")
+                    gpu_uuid = gpu.get("uuid")
+                    index = gpu.get("index")
+                    if (
+                        not isinstance(gpu_uuid, str)
+                        or not _SAFE_REF.fullmatch(gpu_uuid)
+                        or gpu_uuid in gpu_uuids
+                        or not isinstance(index, int)
+                        or isinstance(index, bool)
+                        or index < 0
+                    ):
+                        raise ValueError("metric GPU sample identity is invalid")
+                    gpu_uuids.add(gpu_uuid)
+                    for field in (
+                        "utilization_percent", "gpu_memory_mib", "temperature_celsius"
+                    ):
+                        number = gpu.get(field)
+                        if number is not None and (
+                            isinstance(number, bool)
+                            or not isinstance(number, (int, float))
+                            or not math.isfinite(float(number))
+                        ):
+                            raise ValueError("metric GPU values must be finite numbers")
+                    utilization = gpu.get("utilization_percent")
+                    memory = gpu.get("gpu_memory_mib")
+                    if utilization is not None and not 0 <= float(utilization) <= 100:
+                        raise ValueError("metric GPU utilization is outside 0..100")
+                    if memory is not None and float(memory) < 0:
+                        raise ValueError("metric GPU memory must not be negative")
+            elif kind == "checkpoint":
+                relative_path = value.get("relative_path")
+                if not isinstance(relative_path, str) or len(relative_path) > 1024:
+                    raise ValueError("checkpoint relative_path is invalid")
+        return values
 
 
 class StopRunRequest(StrictRequest):
@@ -1329,6 +1455,49 @@ def create_training_router(
             service.finish_node_command,
             node_ref,
             command_ref,
+            _worker_bearer_token(authorization),
+            request,
+        )
+
+    @router.post("/nodes/{node_ref}/training-actions/poll")
+    def poll_training_actions(
+        node_ref: str,
+        request: PollTrainingActionsRequest,
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.poll_training_actions,
+            node_ref,
+            _worker_bearer_token(authorization),
+            request,
+        )
+
+    @router.post("/nodes/{node_ref}/training-actions/{action_ref}/result")
+    def finish_training_action(
+        node_ref: str,
+        action_ref: str,
+        request: TrainingActionResultRequest,
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.finish_training_action,
+            node_ref,
+            action_ref,
+            _worker_bearer_token(authorization),
+            request,
+        )
+
+    @router.post("/nodes/{node_ref}/runs/{run_ref}/updates")
+    def update_training_run(
+        node_ref: str,
+        run_ref: str,
+        request: TrainingRunUpdateRequest,
+        authorization: Annotated[str | None, Header(alias="Authorization", max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.update_training_run,
+            node_ref,
+            run_ref,
             _worker_bearer_token(authorization),
             request,
         )
@@ -2050,6 +2219,10 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "version_description": run.get("version_description"),
         "dataset_snapshot": run.get("dataset_snapshot"),
         "status": run["status"],
+        "execution_mode": run.get("execution_mode", run.get("mode", "simulation")),
+        "execution_control_status": run.get("execution_control_status"),
+        "execution_control_message": run.get("execution_control_message"),
+        "last_execution_heartbeat_at": run.get("last_execution_heartbeat_at"),
         "state_revision": int(run.get("state_revision", 1)),
         "server_ref": run.get("server_ref", ""),
         "gpu_uuids": run.get("gpu_uuids", []),
@@ -2070,6 +2243,7 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "current_stage_number": run.get("current_stage_number"),
         "stages": stages,
         "version_model": run.get("version_model", run.get("version_model_output")),
+        "artifacts": run.get("artifacts", []),
     }
     if isinstance(run_spec, dict):
         result["run_spec"] = _run_spec_projection(run_spec)
@@ -2239,6 +2413,7 @@ def _run_projection(
     projected.pop("run_spec", None)
     projected.pop("version_model", None)
     projected.pop("dataset_snapshot", None)
+    projected.pop("artifacts", None)
     stages = projected.get("stages")
     if isinstance(stages, list):
         projected["stages"] = [
