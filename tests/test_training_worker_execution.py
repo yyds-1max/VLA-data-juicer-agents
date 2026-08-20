@@ -356,6 +356,30 @@ def test_jsonl_checkpoint_requires_safe_relative_path() -> None:
     ) == {"kind": "checkpoint", "relative_path": "checkpoint-10"}
 
 
+def test_transformers_metric_accepts_tqdm_prefixed_python_dict() -> None:
+    assert _parse_event(
+        "\r100%|██████████| 2/2 [00:03<00:00, 1.81s/it] "
+        "{'loss': 0.25, 'learning_rate': 1e-5, 'epoch': 0.5, "
+        "'step': 2, 'total_steps': 2}",
+        "transformers",
+    ) == {
+        "kind": "metric",
+        "step": 2,
+        "total_steps": 2,
+        "epoch": 0.5,
+        "loss": 0.25,
+        "learning_rate": 1e-5,
+    }
+
+
+def test_jsonl_metric_does_not_accept_prefixed_payload() -> None:
+    assert _parse_event(
+        'progress {"contract":"datapilot_training_event_v1",'
+        '"type":"metric","step":1,"loss":0.5}',
+        "jsonl",
+    ) is None
+
+
 def test_real_executor_rejects_output_root_symlink_escape(tmp_path: Path) -> None:
     manager, _ledger, _center = _manager(tmp_path)
     outside = tmp_path / "outside"

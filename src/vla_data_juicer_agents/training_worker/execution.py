@@ -968,15 +968,31 @@ def _parse_event(line: str, monitoring_format: str) -> dict[str, object] | None:
     candidate = line.strip()
     if candidate.startswith("DATAPILOT_EVENT "):
         candidate = candidate[len("DATAPILOT_EVENT ") :]
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        if monitoring_format != "transformers":
-            return None
+    parsed: object | None = None
+    candidates = [candidate]
+    if monitoring_format == "transformers":
+        # Trainer normally prints a Python dict, and tqdm may prefix that dict
+        # with a carriage-return progress bar.  Keep JSONL strict, but accept
+        # flat embedded Trainer dictionaries such as
+        # ``100%|...| {'loss': 0.4, 'learning_rate': 1e-5}``.
+        candidates.extend(
+            match.group(0)
+            for match in re.finditer(r"\{[^{}\r\n]*\}", candidate)
+            if match.group(0) != candidate
+        )
+    for item in candidates:
         try:
-            parsed = ast.literal_eval(candidate)
-        except (ValueError, SyntaxError):
-            return None
+            parsed = json.loads(item)
+        except json.JSONDecodeError:
+            if monitoring_format != "transformers":
+                return None
+            try:
+                parsed = ast.literal_eval(item)
+            except (ValueError, SyntaxError):
+                continue
+        if isinstance(parsed, dict):
+            break
+        parsed = None
     if not isinstance(parsed, dict):
         return None
     if parsed.get("contract") == "datapilot_training_event_v1":
