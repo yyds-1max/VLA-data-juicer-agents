@@ -372,6 +372,21 @@ def test_transformers_metric_accepts_tqdm_prefixed_python_dict() -> None:
     }
 
 
+def test_transformers_metric_uses_tqdm_progress_when_dict_omits_step() -> None:
+    assert _parse_event(
+        "\r  1%|▏         | 1/100 [00:03<05:20, 3.24s/it] "
+        "{'loss': 0.5, 'learning_rate': 9e-6, 'epoch': 0.03}",
+        "transformers",
+    ) == {
+        "kind": "metric",
+        "step": 1,
+        "total_steps": 100,
+        "epoch": 0.03,
+        "loss": 0.5,
+        "learning_rate": 9e-6,
+    }
+
+
 def test_jsonl_metric_does_not_accept_prefixed_payload() -> None:
     assert _parse_event(
         'progress {"contract":"datapilot_training_event_v1",'

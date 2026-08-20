@@ -1024,6 +1024,16 @@ def _parse_event(line: str, monitoring_format: str) -> dict[str, object] | None:
             and math.isfinite(float(value))
         ):
             metric[key] = value
+    if monitoring_format == "transformers" and "step" not in metric:
+        prefix = candidate.partition("{")[0]
+        progress_matches = list(
+            re.finditer(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)", prefix)
+        )
+        if progress_matches:
+            current, total = (int(part) for part in progress_matches[-1].groups())
+            if 0 <= current <= total:
+                metric["step"] = current
+                metric["total_steps"] = total
     return {"kind": "metric", **metric} if metric else None
 
 
