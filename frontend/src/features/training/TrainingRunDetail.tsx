@@ -4,7 +4,9 @@ import {
   ChevronDown,
   Database,
   FileOutput,
+  History,
   RefreshCw,
+  Search,
   Square,
   Terminal,
   Wifi,
@@ -37,6 +39,10 @@ import type { StatusTone } from "../console/consoleTypes";
 import { MiniChart } from "../console/visuals/MiniChart";
 
 const activeStatuses = new Set<TrainingRun["status"]>(["queued", "preparing", "running", "stop_requested"]);
+const recentLogLimit = 200;
+const liveLogWindowLimit = 600;
+const expandedLogWindowLimit = 2000;
+const metricWindowLimit = 2000;
 
 const runStatusMeta: Record<TrainingRun["status"], { label: string; tone: StatusTone }> = {
   queued: { label: "排队中", tone: "warning" },
@@ -120,6 +126,37 @@ function usesStepLimit(stage: TrainingStage | undefined) {
 
 function metricLabel(item: TrainingMetricSample) {
   return item.step != null ? String(item.step) : formatClock(item.created_at);
+}
+
+type ChartWindow = "5m" | "15m" | "1h" | "all";
+
+function metricWindowStart(window: ChartWindow) {
+  const milliseconds = window === "5m" ? 5 * 60_000 : window === "15m" ? 15 * 60_000 : window === "1h" ? 60 * 60_000 : 0;
+  return milliseconds ? Date.now() - milliseconds : null;
+}
+
+function normalizeDistributedLog(message: string) {
+  return message
+    .replace(/^\[(?:rank|local[_ -]?rank)\s*[:=]?\s*\d+\]\s*/i, "")
+    .replace(/^\[rank\d+\][:\s]*/i, "")
+    .replace(/^(?:rank|local[_ -]?rank)\s*[:=]\s*\d+\s*[|:-]\s*/i, "");
+}
+
+type CollapsedTrainingLog = TrainingRunLog & { repeatCount: number };
+
+function collapseDistributedLogs(items: TrainingRunLog[]): CollapsedTrainingLog[] {
+  const collapsed: CollapsedTrainingLog[] = [];
+  for (const item of items) {
+    const previous = collapsed[collapsed.length - 1];
+    if (previous && previous.level === item.level && normalizeDistributedLog(previous.message) === normalizeDistributedLog(item.message)) {
+      previous.repeatCount += 1;
+      previous.seq = item.seq;
+      previous.created_at = item.created_at;
+      continue;
+    }
+    collapsed.push({ ...item, repeatCount: 1 });
+  }
+  return collapsed;
 }
 
 function chartData(
@@ -208,7 +245,7 @@ function MetricCard({ title, value, data, emptyText = "当前阶段尚未上报�
       <h3 className="text-sm font-semibold text-console-text">{title}</h3>
       <span className="font-mono text-sm font-semibold tabular-nums text-console-text">{value ?? "--"}</span>
     </div>
-    {data ? <MiniChart type="line" title={title} data={data} /> : <div className="flex h-36 items-center justify-center rounded-md border border-dashed border-console-line bg-white text-sm text-console-muted">{emptyText}</div>}
+    {data ? <MiniChart type="line" title={title} data={data} showXAxisLabels={false} densePointThreshold={60} /> : <div className="flex h-36 items-center justify-center rounded-md border border-dashed border-console-line bg-white text-sm text-console-muted">{emptyText}</div>}
   </ConsoleCard>;
 }
 
@@ -261,39 +298,57 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
   const [refreshRevision, setRefreshRevision] = useState(0);
   const [followLogs, setFollowLogs] = useState(true);
+  const [olderLogCursor, setOlderLogCursor] = useState<number | null>(null);
+  const [loadingOlderLogs, setLoadingOlderLogs] = useState(false);
+  const [logQuery, setLogQuery] = useState("");
+  const [importantLogsOnly, setImportantLogsOnly] = useState(false);
+  const [searchingHistoricalLogs, setSearchingHistoricalLogs] = useState(false);
+  const [diagnosticLogs, setDiagnosticLogs] = useState<TrainingRunLog[]>([]);
+  const [chartWindow, setChartWindow] = useState<ChartWindow>(activeStatuses.has(run.status) ? "15m" : "all");
   const logViewportRef = useRef<HTMLDivElement>(null);
   const lastLogSeq = useRef(0);
   const lastMetricSeq = useRef(0);
+  const initialWindowLoaded = useRef(false);
 
   useEffect(() => {
     setLogs([]);
     setMetrics([]);
     lastLogSeq.current = 0;
     lastMetricSeq.current = 0;
+    initialWindowLoaded.current = false;
     setLoadError(null);
     setSelectedStageRef("");
     setFollowLogs(true);
+    setOlderLogCursor(null);
+    setLogQuery("");
+    setImportantLogsOnly(false);
+    setSearchingHistoricalLogs(false);
+    setDiagnosticLogs([]);
+    setChartWindow(activeStatuses.has(run.status) ? "15m" : "all");
   }, [run.run_ref]);
 
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
+        const initial = !initialWindowLoaded.current;
         const [nextRun, nextLogs, nextMetrics] = await Promise.all([
           getTrainingRun(run.run_ref),
-          getTrainingRunLogs(run.run_ref, lastLogSeq.current),
-          getTrainingRunMetrics(run.run_ref, lastMetricSeq.current),
+          getTrainingRunLogs(run.run_ref, lastLogSeq.current, undefined, initial ? { tail: true, limit: recentLogLimit } : { limit: recentLogLimit }),
+          getTrainingRunMetrics(run.run_ref, lastMetricSeq.current, undefined, initial ? { tail: true, limit: metricWindowLimit } : { limit: metricWindowLimit }),
         ]);
         if (!alive) return;
+        initialWindowLoaded.current = true;
         onRunChange(nextRun);
         setLoadError(null);
+        if (initial) setOlderLogCursor(nextLogs.next_before ?? (nextLogs.length === recentLogLimit ? nextLogs[0]?.seq ?? null : null));
         if (nextLogs.length) {
           lastLogSeq.current = Math.max(lastLogSeq.current, ...nextLogs.map((item) => item.seq));
-          setLogs((current) => [...current, ...nextLogs.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq));
+          setLogs((current) => [...current, ...nextLogs.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq).slice(-liveLogWindowLimit));
         }
         if (nextMetrics.length) {
           lastMetricSeq.current = Math.max(lastMetricSeq.current, ...nextMetrics.map((item) => item.seq));
-          setMetrics((current) => [...current, ...nextMetrics.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq));
+          setMetrics((current) => [...current, ...nextMetrics.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq).slice(-metricWindowLimit));
         }
       } catch (caught) {
         if (alive) setLoadError(errorText(caught));
@@ -304,18 +359,82 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
     return () => { alive = false; window.clearInterval(interval); };
   }, [onRunChange, refreshRevision, run.run_ref, run.status]);
 
+  useEffect(() => {
+    if (run.status !== "failed" && run.status !== "lost") { setDiagnosticLogs([]); return; }
+    let alive = true;
+    void getTrainingRunLogs(run.run_ref, 0, undefined, { tail: true, limit: 5, levels: ["error", "warning"] })
+      .then((items) => { if (alive) setDiagnosticLogs(items); })
+      .catch(() => { if (alive) setDiagnosticLogs([]); });
+    return () => { alive = false; };
+  }, [run.run_ref, run.status, run.state_revision]);
+
   const selectedStage = run.stages.find((stage) => stage.stage_ref === selectedStageRef)
     ?? run.stages.find((stage) => stage.stage_number === run.current_stage_number)
     ?? run.stages[0];
   const effectiveStageRef = selectedStage?.stage_ref ?? "";
-  const stageMetrics = useMemo(() => selectedStage ? metrics.filter((item) => !item.stage_ref || item.stage_ref === selectedStage.stage_ref) : metrics, [metrics, selectedStage]);
+  const stageMetrics = useMemo(() => {
+    const start = metricWindowStart(chartWindow);
+    return metrics.filter((item) => (!selectedStage || !item.stage_ref || item.stage_ref === selectedStage.stage_ref) && (start == null || new Date(item.created_at).getTime() >= start));
+  }, [chartWindow, metrics, selectedStage]);
   const stageLogs = useMemo(() => selectedStage ? logs.filter((item) => !item.stage_ref || item.stage_ref === selectedStage.stage_ref) : logs, [logs, selectedStage]);
+  const visibleLogs = useMemo(() => collapseDistributedLogs(stageLogs.filter((item) => {
+    if (importantLogsOnly && item.level === "info") return false;
+    return !logQuery.trim() || item.message.toLocaleLowerCase().includes(logQuery.trim().toLocaleLowerCase());
+  })), [importantLogsOnly, logQuery, stageLogs]);
 
   useEffect(() => {
     if (!followLogs) return;
     const viewport = logViewportRef.current;
     if (viewport) viewport.scrollTop = viewport.scrollHeight;
-  }, [followLogs, stageLogs.length, effectiveStageRef]);
+  }, [followLogs, visibleLogs.length, effectiveStageRef]);
+
+  const loadOlderLogs = useCallback(async () => {
+    if (!olderLogCursor || loadingOlderLogs) return;
+    setLoadingOlderLogs(true);
+    try {
+      const older = await getTrainingRunLogs(run.run_ref, 0, undefined, { beforeSeq: olderLogCursor, limit: recentLogLimit });
+      setOlderLogCursor(older.next_before ?? null);
+      setLogs((current) => [...older, ...current.filter((item) => !older.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq).slice(-expandedLogWindowLimit));
+      setFollowLogs(false);
+    } catch (caught) {
+      setLoadError(errorText(caught));
+    } finally {
+      setLoadingOlderLogs(false);
+    }
+  }, [loadingOlderLogs, olderLogCursor, run.run_ref]);
+
+  const locateDiagnosticLog = useCallback(async () => {
+    const target = diagnosticLogs[diagnosticLogs.length - 1];
+    if (!target) return;
+    if (target.stage_ref) setSelectedStageRef(target.stage_ref);
+    if (!logs.some((item) => item.seq === target.seq)) {
+      const around = await getTrainingRunLogs(run.run_ref, 0, undefined, { beforeSeq: target.seq + 1, limit: recentLogLimit });
+      setLogs((current) => [...current, ...around.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq).slice(-expandedLogWindowLimit));
+    }
+    setImportantLogsOnly(true);
+    setLogQuery("");
+    setFollowLogs(false);
+    window.requestAnimationFrame(() => document.getElementById(`training-log-${target.seq}`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+  }, [diagnosticLogs, logs, run.run_ref]);
+
+  const searchHistoricalLogs = useCallback(async () => {
+    if (!logQuery.trim() && !importantLogsOnly) return;
+    setSearchingHistoricalLogs(true);
+    try {
+      const matches = await getTrainingRunLogs(run.run_ref, 0, selectedStage?.stage_ref, {
+        tail: true,
+        limit: recentLogLimit,
+        levels: importantLogsOnly ? ["error", "warning"] : undefined,
+        query: logQuery,
+      });
+      setLogs((current) => [...current, ...matches.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq).slice(-expandedLogWindowLimit));
+      setFollowLogs(false);
+    } catch (caught) {
+      setLoadError(errorText(caught));
+    } finally {
+      setSearchingHistoricalLogs(false);
+    }
+  }, [importantLogsOnly, logQuery, run.run_ref, selectedStage?.stage_ref]);
 
   const stop = useCallback(async () => {
     if (!canStop) return;
@@ -367,7 +486,7 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
           </div>
           <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-xs text-console-muted">
             <span className="font-mono text-console-text">任务 {run.run_ref}</span>
-            <span>节点 <span className="text-console-text">{run.server_ref}</span></span>
+            <span>节点 <span className="text-console-text">{run.server_name ?? run.server_ref}</span></span>
             <span>GPU <span className="text-console-text">{run.gpu_uuids.length ? `${run.gpu_uuids.length} 张` : "--"}</span></span>
             <span>创建于 <span className="text-console-text">{formatDateTime(run.created_at)}</span></span>
           </div>
@@ -406,8 +525,16 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
       {run.failure_message && !selectedStage?.failure_message && !selectedStage?.failure?.message ? <div role="alert" className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"><span className="font-medium">任务失败：</span>{run.failure_message}{run.failure_code ? <span className="ml-2 font-mono text-xs">({run.failure_code})</span> : null}</div> : null}
     </section>
 
+    {(run.status === "failed" || run.status === "lost") ? <section className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3" aria-labelledby="training-failure-diagnosis-title">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0"><div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 shrink-0 text-rose-600" /><h2 id="training-failure-diagnosis-title" className="font-semibold text-rose-900">失败诊断</h2></div><p className="mt-1 text-sm text-rose-800">{run.failure_message || selectedStage?.failure_message || "训练进程异常结束，请结合下方错误日志定位原因。"}</p></div>
+        {diagnosticLogs.length ? <ConsoleButton className="shrink-0 border-rose-200 text-rose-700 hover:bg-white" onClick={() => void locateDiagnosticLog()}><Search className="h-4 w-4" />定位到错误日志</ConsoleButton> : null}
+      </div>
+      {diagnosticLogs.length ? <ol className="mt-3 space-y-1.5 border-t border-rose-200 pt-3 font-mono text-xs text-rose-900">{diagnosticLogs.map((item) => <li key={item.seq} className="flex gap-2"><span className="shrink-0 text-rose-500">{formatClock(item.created_at)}</span><span className="shrink-0 font-semibold">{item.level.toUpperCase()}</span><span className="min-w-0 break-all">{item.message}</span></li>)}</ol> : <p className="mt-3 border-t border-rose-200 pt-3 text-xs text-rose-700">最近日志中没有结构化 error / warning；请查看完整训练日志。</p>}
+    </section> : null}
+
     <section className="mt-6">
-      <div className="mb-3 flex items-baseline justify-between gap-3"><h2 className="font-semibold text-console-text">训练指标</h2><span className="text-xs text-console-muted">{selectedStage?.stage_name} · 横轴优先使用 Step</span></div>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3"><div><h2 className="font-semibold text-console-text">训练指标</h2><span className="text-xs text-console-muted">{selectedStage?.stage_name} · 横轴优先使用 Step</span></div><label className="flex items-center gap-2 text-xs text-console-muted"><span>时间窗口</span><select aria-label="指标时间窗口" className="h-8 rounded-md border border-console-line bg-white px-2 text-xs text-console-text" value={chartWindow} onChange={(event) => setChartWindow(event.target.value as ChartWindow)}><option value="5m">最近 5 分钟</option><option value="15m">最近 15 分钟</option><option value="1h">最近 1 小时</option><option value="all">全部已加载</option></select></label></div>
       <div className="grid gap-4 lg:grid-cols-2">
         <MetricCard title="Loss 曲线" value={formatNumber(latestLoss)} data={lossData} />
         <MetricCard title="学习率曲线" value={formatNumber(latestLearningRate, 7)} data={learningRateData} />
@@ -427,12 +554,12 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
     </section>
 
     <section className="mt-6">
-      <div className="mb-3 flex items-baseline justify-between gap-3"><h2 className="font-semibold text-console-text">训练日志</h2><span className="text-xs text-console-muted">{activeStatuses.has(run.status) ? "实时增量更新" : "任务日志"} · 敏感参数已遮蔽</span></div>
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3"><h2 className="font-semibold text-console-text">训练日志</h2><span className="text-xs text-console-muted">{activeStatuses.has(run.status) ? "实时增量更新" : "任务日志"} · 默认保留最近 {recentLogLimit} 条 · 敏感参数已遮蔽</span></div>
       <div className="overflow-hidden rounded-lg border border-console-line bg-white">
-        <div className="flex items-center justify-between gap-3 border-b border-console-line px-4 py-2.5 text-xs"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-console-cyan" /><span className="font-medium text-console-text">{selectedStage?.stage_name}日志</span></div><span className="text-console-muted">{followLogs ? "自动跟随最新" : "已暂停自动滚动"}</span></div>
+        <div className="flex flex-col gap-2 border-b border-console-line px-4 py-2.5 text-xs lg:flex-row lg:items-center lg:justify-between"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-console-cyan" /><span className="font-medium text-console-text">{selectedStage?.stage_name}日志</span><span className="text-console-muted">{followLogs ? "自动跟随最新" : "已暂停自动滚动"}</span></div><div className="flex flex-wrap items-center gap-2"><label className="relative"><Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-console-muted" /><input aria-label="搜索训练日志" className="h-8 w-56 rounded-md border border-console-line bg-white pl-8 pr-2 text-xs text-console-text outline-none focus:border-console-cyan" placeholder="搜索日志" value={logQuery} onChange={(event) => setLogQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void searchHistoricalLogs(); }} /></label><label className="inline-flex h-8 items-center gap-1.5 rounded-md border border-console-line bg-white px-2 text-console-text"><input type="checkbox" checked={importantLogsOnly} onChange={(event) => setImportantLogsOnly(event.target.checked)} />只看错误 / 警告</label><ConsoleButton className="h-8 px-2 text-xs" disabled={searchingHistoricalLogs || (!logQuery.trim() && !importantLogsOnly)} onClick={() => void searchHistoricalLogs()}><Search className="h-3.5 w-3.5" />{searchingHistoricalLogs ? "搜索中…" : "搜索历史"}</ConsoleButton>{olderLogCursor ? <ConsoleButton className="h-8 px-2 text-xs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}><History className="h-3.5 w-3.5" />{loadingOlderLogs ? "加载中…" : "加载更早日志"}</ConsoleButton> : null}</div></div>
         <div className="relative">
           <div ref={logViewportRef} aria-label="训练日志" className="h-80 overflow-y-auto bg-slate-950 px-4 py-3 font-mono text-xs leading-6 text-slate-200" onScroll={(event) => { const element = event.currentTarget; setFollowLogs(element.scrollHeight - element.scrollTop - element.clientHeight < 32); }}>
-            {stageLogs.length ? stageLogs.map((item) => <p key={item.seq} className={cn(item.level === "error" ? "text-rose-300" : item.level === "warning" ? "text-amber-300" : "text-slate-200")}><span className="mr-2 text-slate-500">{formatClock(item.created_at)}</span><span className="mr-2 inline-block w-12 font-semibold">{item.level.toUpperCase()}</span><span className="whitespace-pre-wrap break-all">{item.message}</span></p>) : <div className="flex h-full items-center justify-center text-slate-500">等待日志…</div>}
+            {visibleLogs.length ? visibleLogs.map((item) => <p id={`training-log-${item.seq}`} key={item.seq} className={cn("scroll-mt-20", item.level === "error" ? "text-rose-300" : item.level === "warning" ? "text-amber-300" : "text-slate-200")}><span className="mr-2 text-slate-500">{formatClock(item.created_at)}</span><span className="mr-2 inline-block w-12 font-semibold">{item.level.toUpperCase()}</span><span className="whitespace-pre-wrap break-all">{item.message}</span>{item.repeatCount > 1 ? <span className="ml-2 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-300">重复 {item.repeatCount} 次</span> : null}</p>) : <div className="flex h-full items-center justify-center text-slate-500">{stageLogs.length ? "当前筛选条件下没有日志" : "等待日志…"}</div>}
           </div>
           {!followLogs ? <button type="button" className="absolute bottom-3 right-3 rounded-full border border-console-line bg-white px-3 py-1.5 text-xs font-medium text-console-text shadow-lg hover:bg-slate-50" onClick={() => { setFollowLogs(true); const viewport = logViewportRef.current; if (viewport) viewport.scrollTop = viewport.scrollHeight; }}>↓ 回到最新</button> : null}
         </div>
@@ -457,7 +584,7 @@ export function TrainingRunDetail({ run, canStop, onBack, onRunChange }: { run: 
       <div className="space-y-5 border-t border-console-line px-4 py-4">
         <dl className="grid gap-x-6 gap-y-2 text-sm md:grid-cols-[10rem_1fr_10rem_1fr]">
           <dt className="text-console-muted">Run ID</dt><dd className="break-all font-mono text-xs text-console-text">{run.run_ref}</dd>
-          <dt className="text-console-muted">训练节点</dt><dd className="break-all text-console-text">{run.server_ref}</dd>
+          <dt className="text-console-muted">训练节点</dt><dd className="break-all text-console-text">{run.server_name ?? run.server_ref}<span className="ml-2 font-mono text-xs text-console-muted">{run.server_ref}</span></dd>
           <dt className="text-console-muted">GPU UUID</dt><dd className="break-all font-mono text-xs text-console-text">{run.gpu_uuids.join(", ") || "--"}</dd>
           <dt className="text-console-muted">最后执行心跳</dt><dd className="text-console-text">{formatDateTime(run.last_execution_heartbeat_at)}</dd>
           <dt className="text-console-muted">阶段输出目录</dt><dd className="break-all font-mono text-xs text-console-text">{selectedStage?.output_directory ?? "尚未生成"}</dd>

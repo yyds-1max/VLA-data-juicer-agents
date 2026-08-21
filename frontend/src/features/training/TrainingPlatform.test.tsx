@@ -4,7 +4,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as trainingApi from "../../api/client";
-import type { TrainingCapabilities, TrainingDatasetTransfer, TrainingEvent, TrainingModel, TrainingNode, TrainingRun, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingDatasetTransfer, TrainingEvent, TrainingModel, TrainingNode, TrainingRun, TrainingRunLog, TrainingServer, TrainingServerResources } from "../../api/types";
 import { validateParameterDefinitions } from "./ParameterDefinitionEditor";
 import { datasetTransferDestination, TrainingDatasetTransferMonitor } from "./TrainingDatasetTransferDialog";
 import { TrainingPlatform } from "./TrainingPlatform";
@@ -1388,6 +1388,23 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("NaVILA v2-20260806")).toBeVisible();
   });
 
+  it("uses the node name and follows server pagination cursors", async () => {
+    const firstPage = [{ ...runningRun, server_name: "NaVILA 测试训练节点" }] as TrainingRun[] & { next_after?: string | null };
+    firstPage.next_after = "42";
+    const secondPage = [{ ...succeededRun, server_name: "NaVILA 测试训练节点" }] as TrainingRun[] & { next_after?: string | null };
+    secondPage.next_after = null;
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingRuns).mockImplementation(async (options) => options?.after === "42" ? secondPage : firstPage);
+    renderPlatform();
+
+    expect(await screen.findByText("NaVILA 测试训练节点")).toBeVisible();
+    expect(screen.queryByText(runningRun.server_ref)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(await screen.findByText("NaVILA v2-20260806")).toBeVisible();
+    await waitFor(() => expect(trainingApi.listTrainingRuns).toHaveBeenCalledWith(expect.objectContaining({ after: "42", limit: 20 })));
+    expect(screen.getByText("第 2 页 · 每页最多 20 项")).toBeVisible();
+  });
+
   it("shows an epoch total only when the run is governed by epochs", async () => {
     const epochStage = {
       ...runningStage,
@@ -1464,6 +1481,38 @@ describe("TrainingPlatform", () => {
     expect(screen.getByRole("heading", { name: "GPU 利用率" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "GPU 显存" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "停止任务" })).not.toBeInTheDocument();
+  });
+
+  it("collapses distributed duplicates and exposes failure diagnosis and historical error search", async () => {
+    const failedRun: TrainingRun = { ...runningRun, status: "failed", failure_code: "training_process_failed", failure_message: "训练进程异常退出" };
+    const recent = [
+      { seq: 10, created_at: "2026-08-21T00:01:00Z", level: "error" as const, message: "[rank0] CUDA out of memory" },
+      { seq: 11, created_at: "2026-08-21T00:01:01Z", level: "error" as const, message: "[rank1] CUDA out of memory" },
+    ] as TrainingRunLog[] & { next_before?: number | null };
+    recent.next_before = 10;
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([failedRun]);
+    vi.mocked(trainingApi.getTrainingRun).mockResolvedValue(failedRun);
+    vi.mocked(trainingApi.getTrainingRunLogs).mockImplementation(async (_runRef, _after, _stage, options) => {
+      if (options?.beforeSeq) return [{ seq: 9, created_at: "2026-08-21T00:00:59Z", level: "warning", message: "allocator warning" }];
+      if (options?.levels) return recent;
+      return recent;
+    });
+    vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
+    renderPlatform();
+    fireEvent.click(await screen.findByText("NaVILA v1-20260806"));
+
+    expect(await screen.findByRole("heading", { name: "失败诊断" })).toBeVisible();
+    expect(screen.getAllByText("训练进程异常退出")).toHaveLength(2);
+    expect(screen.getByText("重复 2 次")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "加载更早日志" }));
+    expect(await screen.findByText("allocator warning")).toBeVisible();
+    fireEvent.click(screen.getByLabelText("只看错误 / 警告"));
+    fireEvent.change(screen.getByLabelText("搜索训练日志"), { target: { value: "memory" } });
+    fireEvent.click(screen.getByRole("button", { name: "搜索历史" }));
+    await waitFor(() => expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 0, runningStage.stage_ref, expect.objectContaining({ query: "memory", levels: ["error", "warning"], tail: true })));
+    expect(screen.getByRole("button", { name: "定位到错误日志" })).toBeVisible();
+    expect(screen.getByLabelText("指标时间窗口")).toHaveValue("all");
   });
 
   it("switches stage-specific parameters, logs, and outputs in a multistage run detail", async () => {
@@ -1727,11 +1776,11 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByText("NaVILA v1-20260806"));
     expect(await screen.findByText(/first log/)).toBeVisible();
-    expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 0);
-    expect(trainingApi.getTrainingRunMetrics).toHaveBeenCalledWith("run-running", 0);
+    expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 0, undefined, { tail: true, limit: 200 });
+    expect(trainingApi.getTrainingRunMetrics).toHaveBeenCalledWith("run-running", 0, undefined, { tail: true, limit: 2000 });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
-    await waitFor(() => expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 4));
-    expect(trainingApi.getTrainingRunMetrics).toHaveBeenCalledWith("run-running", 7);
+    await waitFor(() => expect(trainingApi.getTrainingRunLogs).toHaveBeenCalledWith("run-running", 4, undefined, { limit: 200 }));
+    expect(trainingApi.getTrainingRunMetrics).toHaveBeenCalledWith("run-running", 7, undefined, { limit: 2000 });
     expect(await screen.findByText(/second log/)).toBeVisible();
     expect(screen.getByText(/first log/)).toBeVisible();
   });

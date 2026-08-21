@@ -26,6 +26,8 @@ type LineChartProps = {
   title: string;
   data: SeriesChart;
   className?: string;
+  showXAxisLabels?: boolean;
+  densePointThreshold?: number;
 };
 
 type BarChartProps = {
@@ -193,10 +195,11 @@ function DonutChart({ title, data, className, progress: rawProgress }: DonutChar
   );
 }
 
-function LineChart({ title, data, className }: LineChartProps) {
+function LineChart({ title, data, className, showXAxisLabels = true, densePointThreshold }: LineChartProps) {
   const path = toLinePath(data);
   const { min, span } = chartScale(data.data);
   const step = (SVG_WIDTH - PADDING * 2) / Math.max(data.data.length - 1, 1);
+  const showEveryPoint = densePointThreshold == null || data.data.length <= densePointThreshold;
 
   return (
     <div className={cn("space-y-3", className)}>
@@ -213,16 +216,20 @@ function LineChart({ title, data, className }: LineChartProps) {
             return null;
           }
 
+          if (!showEveryPoint && index !== data.data.length - 1) {
+            return null;
+          }
+
           const x = PADDING + index * step;
           const y = SVG_HEIGHT - PADDING - ((value - min) / span) * (SVG_HEIGHT - PADDING * 2);
 
-          return <circle key={`${data.labels[index]}-${value}`} cx={x} cy={y} r="3.5" fill={data.color} stroke="#ffffff" strokeWidth="2" />;
+          return <circle key={`${data.labels[index]}-${value}`} cx={x} cy={y} r="3.5" fill={data.color} stroke="#ffffff" strokeWidth="2"><title>{`${data.labels[index]} · ${value}`}</title></circle>;
         })}
-        {data.labels.map((label, index) => (
+        {showXAxisLabels ? data.labels.map((label, index) => (
           <text key={label} x={PADDING + index * step} y={SVG_HEIGHT - 6} textAnchor="middle" className="fill-console-muted text-[9px]">
             {label}
           </text>
-        ))}
+        )) : null}
       </svg>
     </div>
   );

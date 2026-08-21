@@ -714,6 +714,7 @@ export interface TrainingRun {
   last_execution_heartbeat_at?: string | null;
   state_revision: number;
   server_ref: string;
+  server_name?: string | null;
   gpu_uuids: string[];
   progress_percent: number;
   current_step: number;

@@ -26,6 +26,7 @@ from .resources import ResourceCollector
 _SAFE_REF = re.compile(r"[A-Za-z0-9_.:-]{1,255}\Z")
 _SAFE_ENVIRONMENT = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 VERSION_MARKER = ".datapilot-training-version.json"
 SUPERVISOR_CONTRACT = "datapilot_training_supervisor_v1"
 MAX_LOG_LINE_BYTES = 16 * 1024
@@ -942,17 +943,24 @@ class TrainingExecutionManager:
         lines: list[str] = []
         metrics: list[dict[str, object]] = []
         for raw_line in raw_lines:
-            line = raw_line.rstrip(b"\r\n")[:MAX_LOG_LINE_BYTES].decode(
+            raw_text = raw_line.rstrip(b"\r\n")[:MAX_LOG_LINE_BYTES].decode(
                 "utf-8", errors="replace"
             )
             for secret in run.get("redactions", []):
                 if isinstance(secret, str) and secret:
-                    line = line.replace(secret, "********")
-            lines.append(line)
-            event = _parse_event(line, str(run.get("monitoring_format") or "plain"))
+                    raw_text = raw_text.replace(secret, "********")
+            # Parse the untouched terminal record so an event remains visible even
+            # when a progress-bar refresh follows it.  Only the public Web log is
+            # normalised; the complete byte stream stays in the node log file.
+            event = _parse_event(
+                raw_text, str(run.get("monitoring_format") or "plain")
+            )
             if event is not None:
                 if event.get("kind") != "checkpoint" or _checkpoint_exists(event, run):
                     metrics.append(event)
+            line = _normalise_terminal_record(raw_text)
+            if line:
+                lines.append(line)
         if not lines:
             return
         self.ledger.update_log_offset(str(run["run_ref"]), end_offset)
@@ -994,6 +1002,15 @@ class TrainingExecutionManager:
             except CenterClientError:
                 return
             self.ledger.acknowledge_updates(run_ref, owner_epoch, worker_seq)
+
+
+def _normalise_terminal_record(value: str) -> str:
+    """Render one newline-delimited record using ordinary terminal semantics."""
+
+    # tqdm and similar progress renderers use carriage returns to replace the
+    # current terminal row.  A browser cannot perform that cursor operation, so
+    # expose only the final row and remove colour/style control sequences.
+    return _ANSI_CSI.sub("", value.rsplit("\r", 1)[-1])
 
 
 def _parse_event(line: str, monitoring_format: str) -> dict[str, object] | None:

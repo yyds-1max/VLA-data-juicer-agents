@@ -1209,6 +1209,96 @@ def test_metrics_stop_release_leases_and_event_cursor(service: TrainingService) 
     assert {event["type"] for event in events} >= {"run.updated", "run.metric.appended", "run.log.appended"}
 
 
+def test_run_listing_uses_node_name_and_server_pagination(service: TrainingService) -> None:
+    client = _client(service, admin=True)
+    family_ref = str(_create_model(client)["family_ref"])
+    created_refs: list[str] = []
+    for index in range(3):
+        response = client.post(
+            "/api/training/runs",
+            json=_run_payload(family_ref, gpu_uuids=[f"fake-a100-0{index}"]),
+            headers={"Idempotency-Key": f"paged-run-{index}"},
+        )
+        assert response.status_code == 201, response.text
+        created_refs.append(response.json()["run"]["run_ref"])
+    with service.store.transaction() as db:
+        db.execute(
+            """INSERT INTO training_nodes(
+            node_ref,name,address,ssh_port,ssh_username,status,created_at,updated_at)
+            VALUES('fake-local','NaVILA 测试训练节点','127.0.0.1',22,'trainer','online',?,?)""",
+            ("2026-08-21T00:00:00+00:00", "2026-08-21T00:00:00+00:00"),
+        )
+
+    first = client.get("/api/training/runs?status=active&limit=2").json()
+    assert len(first["runs"]) == 2
+    assert first["next_after"]
+    assert {run["server_name"] for run in first["runs"]} == {"NaVILA 测试训练节点"}
+    second = client.get(
+        "/api/training/runs",
+        params={"status": "active", "limit": 2, "after": first["next_after"]},
+    ).json()
+    assert len(second["runs"]) == 1
+    assert second["next_after"] is None
+    searched = client.get(
+        "/api/training/runs", params={"query": created_refs[0], "limit": 20}
+    ).json()
+    assert [run["run_ref"] for run in searched["runs"]] == [created_refs[0]]
+
+
+def test_log_tail_history_and_error_search(service: TrainingService) -> None:
+    client = _client(service, admin=True)
+    family_ref = str(_create_model(client)["family_ref"])
+    created = client.post(
+        "/api/training/runs",
+        json=_run_payload(family_ref, gpu_uuids=["fake-a100-00"]),
+        headers={"Idempotency-Key": "log-window-run"},
+    ).json()["run"]
+    with service.store.transaction() as db:
+        run_row = db.execute(
+            "SELECT id FROM training_runs WHERE run_ref=?", (created["run_ref"],)
+        ).fetchone()
+        assert run_row is not None
+        for index, (level, message) in enumerate(
+            [
+                ("info", "rank 0 initialized"),
+                ("warning", "dataloader is slow"),
+                ("info", "rank 1 initialized"),
+                ("error", "CUDA out of memory"),
+                ("warning", "training will stop"),
+            ],
+            start=1,
+        ):
+            service.store._log(
+                db,
+                int(run_row["id"]),
+                level,
+                message,
+                f"2026-08-21T00:00:0{index}+00:00",
+            )
+
+    tail = client.get(
+        f"/api/training/runs/{created['run_ref']}/logs",
+        params={"tail": True, "limit": 2},
+    ).json()
+    assert [item["message"] for item in tail["logs"]] == [
+        "CUDA out of memory",
+        "training will stop",
+    ]
+    assert tail["next_before"]
+    history = client.get(
+        f"/api/training/runs/{created['run_ref']}/logs",
+        params={"before_seq": tail["next_before"], "limit": 2},
+    ).json()
+    assert history["logs"]
+    matches = client.get(
+        f"/api/training/runs/{created['run_ref']}/logs",
+        params=[("tail", "true"), ("levels", "error"), ("levels", "warning"), ("query", "memory")],
+    ).json()
+    assert [(item["level"], item["message"]) for item in matches["logs"]] == [
+        ("error", "CUDA out of memory")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_fake_worker_success_failure_and_lost_recovery(
     service: TrainingService,

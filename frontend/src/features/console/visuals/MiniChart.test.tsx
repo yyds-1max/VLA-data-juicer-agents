@@ -136,3 +136,26 @@ test("radar chart renders rings axes labels and value polygon", () => {
   expect(svg.innerHTML).not.toContain("NaN");
   expect(svg.innerHTML).not.toContain("Infinity");
 });
+
+test("line chart can hide dense x-axis labels while retaining accessible point details", () => {
+  render(
+    <MiniChart
+      type="line"
+      title="训练 Loss"
+      showXAxisLabels={false}
+      densePointThreshold={2}
+      data={{
+        labels: ["10:00:00", "10:00:05", "10:00:10"],
+        data: [1, 0.8, 0.6],
+        label: "Loss",
+        color: "#3156c8",
+      }}
+    />,
+  );
+
+  const svg = screen.getByRole("img", { name: "训练 Loss" });
+  expect(within(svg).queryByText("10:00:00")).not.toBeInTheDocument();
+  expect(within(svg).queryByText("10:00:05")).not.toBeInTheDocument();
+  expect(within(svg).getByText("10:00:10 · 0.6")).toBeInTheDocument();
+  expect(svg.querySelectorAll("circle")).toHaveLength(1);
+});

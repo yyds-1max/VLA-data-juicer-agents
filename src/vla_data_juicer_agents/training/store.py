@@ -1656,10 +1656,31 @@ class TrainingStore:
         names = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
         return f"第{names[number - 1]}阶段"
 
-    def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:
+    def list_runs(
+        self,
+        *,
+        status: str | None,
+        query: str | None,
+        after: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
         clauses, values = [], []
-        if status:
-            clauses.append("run.status=?"); values.append(status)
+        if status == "active":
+            clauses.append(
+                "run.status IN ('queued','preparing','running','stop_requested')"
+            )
+        elif status:
+            clauses.append("run.status=?")
+            values.append(status)
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(run.run_ref LIKE ? ESCAPE '\\' OR family.name LIKE ? ESCAPE '\\' "
+                "OR version.version_label LIKE ? ESCAPE '\\' OR run.server_ref LIKE ? ESCAPE '\\' "
+                "OR COALESCE(node.name,'') LIKE ? ESCAPE '\\')"
+            )
+            values.extend([pattern] * 5)
         if after:
             try: cursor_id = int(after)
             except ValueError: cursor_id = 0
@@ -1697,6 +1718,7 @@ class TrainingStore:
       version.version_date,version.version_label,version.description AS version_description,
       snapshot.snapshot_ref,snapshot.manifest_json AS dataset_manifest_json,
       version_artifact.path AS version_model_path,
+      node.name AS server_name,
       node.status AS execution_node_status,
       node.last_heartbeat_at AS execution_node_heartbeat_at
       FROM training_runs AS run
@@ -1782,6 +1804,7 @@ class TrainingStore:
             ),
             "last_execution_heartbeat_at": row["execution_last_heartbeat_at"],
             "server_ref": row["server_ref"],
+            "server_name": row["server_name"] or row["server_ref"],
             "gpu_uuids": json.loads(row["gpu_uuids_json"]),
             "model_ref": row["model_ref"],
             "family_ref": row["family_ref"],
@@ -2895,39 +2918,89 @@ class TrainingStore:
                 self._finish_in(db, row, "lost", timestamp, "worker_lease_expired", "The simulation worker lease expired.")
             return len(rows)
 
-    def list_logs(self, run_ref: str, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]:
+    def list_logs(
+        self,
+        run_ref: str,
+        after_seq: int,
+        limit: int,
+        stage_ref: str | None = None,
+        *,
+        before_seq: int | None = None,
+        tail: bool = False,
+        levels: tuple[str, ...] = (),
+        query: str | None = None,
+    ) -> dict[str, Any]:
         with self.connection() as db:
             row = db.execute("SELECT id FROM training_runs WHERE run_ref=?", (run_ref,)).fetchone()
             if row is None: raise TrainingNotFoundError("run_not_found", "Training run was not found.")
-            values: list[Any] = [row["id"], after_seq]
-            stage_clause = ""
+            clauses = ["log.run_id=?"]
+            values: list[Any] = [row["id"]]
+            descending = tail or before_seq is not None or bool(levels) or bool(query)
+            if before_seq is not None:
+                clauses.append("log.seq<?")
+                values.append(before_seq)
+            elif not descending:
+                clauses.append("log.seq>?")
+                values.append(after_seq)
             if stage_ref is not None:
-                stage_clause = " AND stage.stage_ref=?"
+                clauses.append("stage.stage_ref=?")
                 values.append(stage_ref)
+            if levels:
+                clauses.append(f"log.level IN ({','.join('?' for _ in levels)})")
+                values.extend(levels)
+            if query:
+                escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                clauses.append("log.message LIKE ? ESCAPE '\\'")
+                values.append(f"%{escaped}%")
             values.append(limit + 1)
             items = [dict(item) for item in db.execute(f"""SELECT log.seq,log.level,
                 log.message,log.created_at,stage.stage_ref,stage.stage_number
                 FROM run_logs AS log
                 LEFT JOIN training_stages AS stage ON stage.id=log.stage_id
-                WHERE log.run_id=? AND log.seq>?{stage_clause}
-                ORDER BY log.seq LIMIT ?""", tuple(values)).fetchall()]
-        return {"items": items[:limit], "next_after": items[limit-1]["seq"] if len(items) > limit else None}
+                WHERE {' AND '.join(clauses)}
+                ORDER BY log.seq {'DESC' if descending else 'ASC'} LIMIT ?""", tuple(values)).fetchall()]
+        has_more = len(items) > limit
+        items = items[:limit]
+        if descending:
+            items.reverse()
+        return {
+            "items": items,
+            "next_after": items[-1]["seq"] if not descending and has_more and items else None,
+            "next_before": items[0]["seq"] if descending and has_more and items else None,
+        }
 
-    def list_metrics(self, run_ref: str, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]:
+    def list_metrics(
+        self,
+        run_ref: str,
+        after_seq: int,
+        limit: int,
+        stage_ref: str | None = None,
+        *,
+        tail: bool = False,
+        since: str | None = None,
+    ) -> dict[str, Any]:
         with self.connection() as db:
             row = db.execute("SELECT id FROM training_runs WHERE run_ref=?", (run_ref,)).fetchone()
             if row is None: raise TrainingNotFoundError("run_not_found", "Training run was not found.")
-            values: list[Any] = [row["id"], after_seq]
-            stage_clause = ""
+            clauses = ["metric.run_id=?"]
+            values: list[Any] = [row["id"]]
+            if not tail:
+                clauses.append("metric.seq>?")
+                values.append(after_seq)
             if stage_ref is not None:
-                stage_clause = " AND stage.stage_ref=?"
+                clauses.append("stage.stage_ref=?")
                 values.append(stage_ref)
+            if since is not None:
+                clauses.append("metric.created_at>=?")
+                values.append(since)
             values.append(limit + 1)
             rows = db.execute(f"""SELECT metric.*,stage.stage_ref,stage.stage_number
                 FROM metric_samples AS metric
                 LEFT JOIN training_stages AS stage ON stage.id=metric.stage_id
-                WHERE metric.run_id=? AND metric.seq>?{stage_clause}
-                ORDER BY metric.seq LIMIT ?""", tuple(values)).fetchall()
+                WHERE {' AND '.join(clauses)}
+                ORDER BY metric.seq {'DESC' if tail else 'ASC'} LIMIT ?""", tuple(values)).fetchall()
+        if tail:
+            rows = list(reversed(rows[:limit]))
         items = []
         for item in rows:
             projected = {
@@ -2949,7 +3022,7 @@ class TrainingStore:
                 ):
                     projected[key] = payload.get(key)
             items.append(projected)
-        return {"items": items[:limit], "next_after": items[limit-1]["seq"] if len(items) > limit else None}
+        return {"items": items[:limit], "next_after": items[limit-1]["seq"] if not tail and len(items) > limit else None}
 
     def list_recent_metrics(
         self, run_ref: str, limit: int, stage_ref: str | None = None

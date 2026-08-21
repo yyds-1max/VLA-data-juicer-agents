@@ -77,6 +77,7 @@ sessions.sqlite
 .superpowers
 .worktrees/
 .artifacts/
+/real-training-validation-status.local.md
 
 # OS and editor files
 .DS_Store

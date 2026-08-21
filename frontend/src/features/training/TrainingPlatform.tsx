@@ -542,17 +542,10 @@ function TrainingRunDescriptionPopover({ run }: { run: TrainingRun }) {
   </Popover>;
 }
 
-function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; canCreate: boolean; onCreate: () => void; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
-  const [statusFilter, setStatusFilter] = useState<TrainingRunStatusFilter>("all");
-  const [query, setQuery] = useState("");
+function RunsPanel({ runs, selectedRun, canStop, canCreate, query, statusFilter, page, hasPreviousPage, hasNextPage, onQueryChange, onStatusFilterChange, onPreviousPage, onNextPage, onCreate, onSelect, onRunChange }: { runs: TrainingRun[]; selectedRun: TrainingRun | null; canStop: boolean; canCreate: boolean; query: string; statusFilter: TrainingRunStatusFilter; page: number; hasPreviousPage: boolean; hasNextPage: boolean; onQueryChange: (value: string) => void; onStatusFilterChange: (value: TrainingRunStatusFilter) => void; onPreviousPage: () => void; onNextPage: () => void; onCreate: () => void; onSelect: (run: TrainingRun | null) => void; onRunChange: (run: TrainingRun) => void }) {
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  // 搜索和筛选只改变当前表格的呈现，完整任务投影仍用于状态统计和深链详情。
-  const filteredRuns = runs.filter((run) => {
-    if (!matchesRunStatusFilter(run.status, statusFilter)) return false;
-    if (!normalizedQuery) return true;
-    return [runModelDisplayName(run), run.family_name, run.version_ref, run.run_ref, run.server_ref]
-      .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
-  });
+  // 服务端负责完整查询；本地同步过滤让输入和筛选在下一次请求完成前立即响应。
+  const filteredRuns = runs.filter((run) => matchesRunStatusFilter(run.status, statusFilter) && (!normalizedQuery || [runModelDisplayName(run), run.family_name, run.version_ref, run.run_ref, run.server_name ?? "", run.server_ref].some((value) => value.toLocaleLowerCase().includes(normalizedQuery))));
 
   if (selectedRun) {
     return (
@@ -579,7 +572,7 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
               type="search"
               aria-label="搜索训练任务"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => onQueryChange(event.target.value)}
               placeholder="搜索任务、模型或服务器"
               className="h-9 w-full rounded-md border border-console-line bg-console-panel pl-9 pr-3 text-sm text-console-text outline-none transition-[border-color,box-shadow] duration-180 placeholder:text-console-muted/70 focus-visible:border-console-cyan focus-visible:ring-2 focus-visible:ring-console-cyan/15 motion-reduce:transition-none"
             />
@@ -590,7 +583,7 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
               aria-label="状态筛选"
               className="h-9 w-full rounded-md border border-console-line bg-console-panel px-3 text-sm text-console-text outline-none focus-visible:border-console-cyan focus-visible:ring-2 focus-visible:ring-console-cyan/15 sm:w-36"
               value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value as TrainingRunStatusFilter)}
+              onChange={(event) => onStatusFilterChange(event.target.value as TrainingRunStatusFilter)}
             >
               <option value="all">全部状态</option>
               {runStatusFilterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
@@ -623,7 +616,7 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
                   </button>
                 </td>
                 <td className="px-4 py-3.5 align-middle text-console-muted">
-                  <span className="block truncate text-console-text">{run.server_ref}</span>
+                  <span className="block truncate text-console-text" title={run.server_name ?? run.server_ref}>{run.server_name ?? run.server_ref}</span>
                   <span className="mt-1 block text-xs">GPU {run.gpu_uuids.length} 张</span>
                 </td>
                 <td className="px-4 py-3.5 align-middle">
@@ -653,10 +646,14 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
       {!filteredRuns.length ? (
         <div className="border-t border-console-line py-16 text-center">
           <FileText className="mx-auto h-8 w-8 text-console-muted" aria-hidden="true" />
-          <p className="mt-3 text-sm font-medium text-console-text">{runs.length ? "没有符合筛选条件的任务" : "还没有训练任务"}</p>
-          {runs.length ? <p className="mt-1 text-sm text-console-muted">请调整搜索内容或状态筛选。</p> : <><p className="mt-1 text-sm text-console-muted">选择已登记模型和 GPU，创建第一项训练。</p>{canCreate ? <ConsoleButton className="mt-4" variant="primary" onClick={onCreate}><Plus className="h-4 w-4" />新建训练任务</ConsoleButton> : null}</>}
+          <p className="mt-3 text-sm font-medium text-console-text">{query.trim() || statusFilter !== "all" ? "没有符合筛选条件的任务" : "还没有训练任务"}</p>
+          {query.trim() || statusFilter !== "all" ? <p className="mt-1 text-sm text-console-muted">请调整搜索内容或状态筛选。</p> : <><p className="mt-1 text-sm text-console-muted">选择已登记模型和 GPU，创建第一项训练。</p>{canCreate ? <ConsoleButton className="mt-4" variant="primary" onClick={onCreate}><Plus className="h-4 w-4" />新建训练任务</ConsoleButton> : null}</>}
         </div>
       ) : null}
+      {filteredRuns.length || hasPreviousPage ? <footer className="flex items-center justify-between border-t border-console-line px-4 py-3 text-sm">
+        <span className="text-console-muted">第 {page} 页 · 每页最多 20 项</span>
+        <div className="flex gap-2"><ConsoleButton disabled={!hasPreviousPage} onClick={onPreviousPage}>上一页</ConsoleButton><ConsoleButton disabled={!hasNextPage} onClick={onNextPage}>下一页</ConsoleButton></div>
+      </footer> : null}
     </section>
   );
 }
@@ -978,6 +975,11 @@ export function TrainingPlatform() {
   const location = useLocation(); const navigate = useNavigate();
   const deepRunRef = useMemo(() => /^\/model\/runs\/([^/]+)\/?$/.exec(location.pathname)?.[1], [location.pathname]);
   const [tab, setTab] = useState<TrainingTab>("runs"); const [capabilities, setCapabilities] = useState<TrainingCapabilities | null>(null); const [models, setModels] = useState<TrainingModel[]>([]); const [nodes, setNodes] = useState<TrainingNode[]>([]); const [servers, setServers] = useState<TrainingServer[]>([]); const [resourcesByServer, setResourcesByServer] = useState<Record<string, TrainingServerResources>>({}); const [resourceErrors, setResourceErrors] = useState<Record<string, string>>({}); const [runs, setRuns] = useState<TrainingRun[]>([]); const [selectedRun, setSelectedRun] = useState<TrainingRun | null>(null); const [error, setError] = useState<string | null>(null); const [eventStreamDisconnected, setEventStreamDisconnected] = useState(false); const [datasetEventRevision, setDatasetEventRevision] = useState(0);
+  const [runQuery, setRunQuery] = useState("");
+  const [runQueryForRequest, setRunQueryForRequest] = useState("");
+  const [runStatusFilter, setRunStatusFilter] = useState<TrainingRunStatusFilter>("all");
+  const [runCursorHistory, setRunCursorHistory] = useState<string[]>([""]);
+  const [runNextAfter, setRunNextAfter] = useState<string | null>(null);
   const [datasetTransfers, setDatasetTransfers] = useState<TrainingDatasetTransfer[]>([]);
   const [trackedTransferRefs, setTrackedTransferRefs] = useState<Set<string>>(new Set());
   const [datasetTransferError, setDatasetTransferError] = useState<string | null>(null);
@@ -987,6 +989,16 @@ export function TrainingPlatform() {
   const transferStatuses = useRef(new Map<string, TrainingDatasetTransfer["status"]>());
   const transferStatusInitialized = useRef(false);
   const transferNoticeSequence = useRef(0);
+  const runAfter = runCursorHistory[runCursorHistory.length - 1] || undefined;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setRunQueryForRequest(runQuery.trim()), 300);
+    return () => window.clearTimeout(timer);
+  }, [runQuery]);
+
+  useEffect(() => {
+    setRunCursorHistory([""]);
+  }, [runQueryForRequest, runStatusFilter]);
 
   const showDatasetTransferNotice = useCallback((message: string, tone: DatasetTransferNotice["tone"] = "info") => {
     transferNoticeSequence.current += 1;
@@ -1062,7 +1074,7 @@ export function TrainingPlatform() {
   }, [mergeDatasetTransfers, showDatasetTransferNotice]);
   const load = useCallback(async () => {
     try {
-      const [nextCapabilities, nextModels, nextNodes, nextServers, nextRuns] = await Promise.all([getTrainingCapabilities(), listTrainingModels(), listTrainingNodes(), listTrainingServers(), listTrainingRuns()]);
+      const [nextCapabilities, nextModels, nextNodes, nextServers, nextRuns] = await Promise.all([getTrainingCapabilities(), listTrainingModels(), listTrainingNodes(), listTrainingServers(), listTrainingRuns({ status: runStatusFilter, query: runQueryForRequest, after: runAfter, limit: 20 })]);
       // 各服务器资源独立请求，单台服务器不可达时仍保留其他服务器的监控数据。
       const resourceResults = await Promise.allSettled(nextServers.map(async (server) => ({ serverRef: server.server_ref, resources: await getTrainingServerResources(server.server_ref) })));
       const nextResources: Record<string, TrainingServerResources> = {};
@@ -1075,11 +1087,11 @@ export function TrainingPlatform() {
       setCapabilities(nextCapabilities); setModels(nextModels); setNodes((current) => nextNodes.map((node) => {
         const local = current.find((item) => item.node_ref === node.node_ref);
         return local && local.state_revision > node.state_revision ? local : node;
-      })); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns);
+      })); setServers(nextServers); setResourcesByServer(nextResources); setResourceErrors(nextResourceErrors); setRuns(nextRuns); setRunNextAfter(nextRuns.next_after ?? null);
       setSelectedRun((current) => current ? nextRuns.find((item) => item.run_ref === current.run_ref) ?? current : null);
       setError(null);
     } catch (caught) { setError(errorText(caught)); }
-  }, []);
+  }, [runAfter, runQueryForRequest, runStatusFilter]);
   useEffect(() => { void load(); const interval = window.setInterval(() => void load(), 2000); return () => window.clearInterval(interval); }, [load]);
   const hasActiveDatasetTransfers = datasetTransfers.some((transfer) => activeTransferStatuses.has(transfer.status));
   useEffect(() => {
@@ -1153,7 +1165,7 @@ export function TrainingPlatform() {
       <TrainingDatasetTransferMonitor transfers={visibleDatasetTransfers} error={datasetTransferError} onPause={(transfer) => void handlePauseDatasetTransfer(transfer)} onCancel={(transfer) => void handleCancelDatasetTransfer(transfer)} onRetry={(transfer) => void handleRetryDatasetTransfer(transfer)} />
 
       <div id="training-platform-panel-runs" role="tabpanel" aria-labelledby="training-platform-tab-runs" hidden={tab !== "runs"}>
-        <RunsPanel runs={runs} selectedRun={selectedRun} canStop={can(capabilities, "training:stop_runs")} canCreate={can(capabilities, "training:create_runs")} onCreate={() => changeTab("new")} onSelect={selectRun} onRunChange={updateRun} />
+        <RunsPanel runs={runs} selectedRun={selectedRun} canStop={can(capabilities, "training:stop_runs")} canCreate={can(capabilities, "training:create_runs")} query={runQuery} statusFilter={runStatusFilter} page={runCursorHistory.length} hasPreviousPage={runCursorHistory.length > 1} hasNextPage={Boolean(runNextAfter)} onQueryChange={setRunQuery} onStatusFilterChange={setRunStatusFilter} onPreviousPage={() => setRunCursorHistory((current) => current.length > 1 ? current.slice(0, -1) : current)} onNextPage={() => { if (runNextAfter) setRunCursorHistory((current) => [...current, runNextAfter]); }} onCreate={() => changeTab("new")} onSelect={selectRun} onRunChange={updateRun} />
       </div>
       <div id="training-platform-panel-new" role="tabpanel" aria-labelledby="training-platform-tab-new" hidden={tab !== "new"}>
         <NewRunPanel models={models} servers={servers} nodes={nodes} resourcesByServer={resourcesByServer} capabilities={capabilities} canCreate={can(capabilities, "training:create_runs")} datasetEventRevision={datasetEventRevision} datasetTransfers={datasetTransfers} onCancel={() => changeTab("runs")} onTransfersCreated={handleTransfersCreated} onCreated={(run) => { setModels((current) => current.map((model) => model.family_ref === run.family_ref ? { ...model, trained_version_count: model.trained_version_count + 1 } : model)); updateRun(run); setTab("runs"); selectRun(run); }} />

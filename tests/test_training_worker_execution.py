@@ -160,6 +160,52 @@ def test_real_executor_launches_without_shell_and_reports_log_metric_and_exit(
     assert ledger.pending_run_refs() == []
 
 
+def test_public_log_collapses_terminal_progress_refreshes_but_keeps_raw_log(
+    tmp_path: Path,
+) -> None:
+    manager, ledger, center = _manager(tmp_path)
+    action = _start_action(
+        tmp_path,
+        code=(
+            "import sys; "
+            'sys.stdout.write("\\x1b[31m10% old\\x1b[0m\\r50% middle\\r'
+            "100% latest {'loss': 0.4, 'learning_rate': 1e-5, "
+            "'epoch': 0.5, 'step': 1, 'total_steps': 1}\\n\"); "
+            "sys.stdout.flush()"
+        ),
+    )
+
+    assert manager.handle_action(action)["status"] == "succeeded"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        manager.tick()
+        row = ledger.get_run("run_real_one")
+        if row is not None and row["state"] == "succeeded":
+            break
+        time.sleep(0.05)
+
+    version_root = tmp_path / "outputs" / "family_navila" / "v1-20260820"
+    raw_log = (version_root / "stage-01" / ".datapilot-training.log").read_text()
+    assert "10% old" in raw_log
+    assert "50% middle" in raw_log
+
+    updates = [
+        item for _, envelope in center.updates for item in envelope["updates"]  # type: ignore[index]
+    ]
+    public_log = "\n".join(
+        str(item["message"]) for item in updates if item["kind"] == "log"
+    )
+    assert "10% old" not in public_log
+    assert "50% middle" not in public_log
+    assert "100% latest" in public_log
+    assert "\x1b[" not in public_log
+    metric = next(
+        item for item in updates if item["kind"] == "metric" and "loss" in item
+    )
+    assert metric["loss"] == 0.4
+    assert metric["step"] == 1
+
+
 def test_real_executor_validates_and_writes_managed_dataset_manifest(
     tmp_path: Path,
 ) -> None:

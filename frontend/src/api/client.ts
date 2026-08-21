@@ -390,9 +390,18 @@ export async function createTrainingRun(payload: TrainingRunRequest): Promise<Tr
   return data.run;
 }
 
-export async function listTrainingRuns(): Promise<TrainingRun[]> {
-  const data = await requestJson<{ runs: TrainingRun[] }>(`${trainingPath}/runs`);
-  return data.runs;
+export type TrainingRunList = TrainingRun[] & { next_after?: string | null };
+
+export async function listTrainingRuns(options: { status?: string; query?: string; after?: string; limit?: number } = {}): Promise<TrainingRunList> {
+  const query = new URLSearchParams();
+  if (options.status && options.status !== "all") query.set("status", options.status);
+  if (options.query?.trim()) query.set("query", options.query.trim());
+  if (options.after) query.set("after", options.after);
+  query.set("limit", String(options.limit ?? 20));
+  const data = await requestJson<{ runs: TrainingRun[]; next_after?: string | null }>(`${trainingPath}/runs?${query}`);
+  const runs = data.runs as TrainingRunList;
+  runs.next_after = data.next_after ?? null;
+  return runs;
 }
 
 export async function getTrainingRun(runRef: string): Promise<TrainingRun> {
@@ -405,16 +414,38 @@ export async function stopTrainingRun(runRef: string, expectedRevision: number):
   return data.run;
 }
 
-export async function getTrainingRunLogs(runRef: string, afterSeq = 0, stageRef?: string): Promise<TrainingRunLog[]> {
+export type TrainingRunLogList = TrainingRunLog[] & { next_before?: number | null };
+
+export async function getTrainingRunLogs(
+  runRef: string,
+  afterSeq = 0,
+  stageRef?: string,
+  options: { beforeSeq?: number; tail?: boolean; limit?: number; levels?: Array<TrainingRunLog["level"]>; query?: string } = {},
+): Promise<TrainingRunLogList> {
   const query = new URLSearchParams({ after_seq: String(afterSeq) });
   if (stageRef) query.set("stage_ref", stageRef);
-  const data = await requestJson<{ logs: TrainingRunLog[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/logs?${query}`);
-  return data.logs;
+  if (options.beforeSeq != null) { query.delete("after_seq"); query.set("before_seq", String(options.beforeSeq)); }
+  if (options.tail) query.set("tail", "true");
+  if (options.limit) query.set("limit", String(options.limit));
+  options.levels?.forEach((level) => query.append("levels", level));
+  if (options.query?.trim()) query.set("query", options.query.trim());
+  const data = await requestJson<{ logs: TrainingRunLog[]; next_before?: number | null }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/logs?${query}`);
+  const logs = data.logs as TrainingRunLogList;
+  logs.next_before = data.next_before ?? null;
+  return logs;
 }
 
-export async function getTrainingRunMetrics(runRef: string, afterSeq = 0, stageRef?: string): Promise<TrainingMetricSample[]> {
+export async function getTrainingRunMetrics(
+  runRef: string,
+  afterSeq = 0,
+  stageRef?: string,
+  options: { tail?: boolean; limit?: number; since?: string } = {},
+): Promise<TrainingMetricSample[]> {
   const query = new URLSearchParams({ after_seq: String(afterSeq) });
   if (stageRef) query.set("stage_ref", stageRef);
+  if (options.tail) query.set("tail", "true");
+  if (options.limit) query.set("limit", String(options.limit));
+  if (options.since) query.set("since", options.since);
   const data = await requestJson<{ metrics: TrainingMetricSample[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/metrics?${query}`);
   return data.metrics;
 }

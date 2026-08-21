@@ -154,7 +154,12 @@ class TrainingServiceProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def list_runs(
-        self, *, status: str | None, after: str | None, limit: int
+        self,
+        *,
+        status: str | None,
+        query: str | None,
+        after: str | None,
+        limit: int,
     ) -> dict[str, Any]: ...
 
     def get_run(self, run_ref: str) -> dict[str, Any]: ...
@@ -168,11 +173,14 @@ class TrainingServiceProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def list_logs(
-        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None
+        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None,
+        before_seq: int | None = None, tail: bool = False,
+        levels: tuple[str, ...] = (), query: str | None = None,
     ) -> dict[str, Any]: ...
 
     def list_metrics(
-        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None
+        self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None,
+        tail: bool = False, since: str | None = None,
     ) -> dict[str, Any]: ...
 
     def list_events(self, *, after_seq: int, limit: int) -> dict[str, Any]: ...
@@ -1687,12 +1695,14 @@ def create_training_router(
     @router.get("/runs")
     def list_runs(
         status: str | None = Query(default=None, max_length=30),
+        query: str | None = Query(default=None, max_length=200),
         after: str | None = Query(default=None, max_length=200),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> dict[str, Any]:
         page = _translate(
             service.list_runs,
             status=status,
+            query=query.strip() if query else None,
             after=after,
             limit=limit,
         )
@@ -1734,22 +1744,39 @@ def create_training_router(
     def run_logs(
         run_ref: str,
         after_seq: int = Query(default=0, ge=0),
+        before_seq: int | None = Query(default=None, ge=1),
+        tail: bool = Query(default=False),
         limit: int = Query(default=500, ge=1, le=2000),
         stage_ref: str | None = Query(default=None, max_length=200),
+        levels: list[Literal["info", "warning", "error"]] = Query(default=[]),
+        query: str | None = Query(default=None, max_length=200),
     ) -> dict[str, Any]:
+        if before_seq is not None and after_seq > 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_log_cursor", "message": "before_seq and after_seq cannot be used together."},
+            )
         page = _translate(
             service.list_logs,
             run_ref,
             after_seq=after_seq,
+            before_seq=before_seq,
+            tail=tail,
             limit=limit,
             stage_ref=stage_ref,
+            levels=tuple(levels),
+            query=query.strip() if query else None,
         )
-        return _page_projection(page, "logs")
+        projection = _page_projection(page, "logs")
+        projection["next_before"] = page.get("next_before")
+        return projection
 
     @router.get("/runs/{run_ref}/metrics")
     def run_metrics(
         run_ref: str,
         after_seq: int = Query(default=0, ge=0),
+        tail: bool = Query(default=False),
+        since: datetime | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=2000),
         stage_ref: str | None = Query(default=None, max_length=200),
     ) -> dict[str, Any]:
@@ -1757,6 +1784,8 @@ def create_training_router(
             service.list_metrics,
             run_ref,
             after_seq=after_seq,
+            tail=tail,
+            since=since.astimezone(UTC).isoformat(timespec="milliseconds") if since else None,
             limit=limit,
             stage_ref=stage_ref,
         )
@@ -2225,6 +2254,7 @@ def _normalize_run(run: dict[str, Any]) -> dict[str, Any]:
         "last_execution_heartbeat_at": run.get("last_execution_heartbeat_at"),
         "state_revision": int(run.get("state_revision", 1)),
         "server_ref": run.get("server_ref", ""),
+        "server_name": run.get("server_name", run.get("server_ref", "")),
         "gpu_uuids": run.get("gpu_uuids", []),
         "progress_percent": round(float(progress), 4),
         "current_step": int(run.get("current_step", 0)),

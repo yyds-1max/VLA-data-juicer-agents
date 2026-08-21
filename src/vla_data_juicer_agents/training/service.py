@@ -1185,11 +1185,61 @@ class TrainingService:
             "audit_events": self.store.list_audit_events(run["run_ref"]),
         }
 
-    def list_runs(self, *, status: str | None, after: str | None, limit: int) -> dict[str, Any]:
-        page = self.store.list_runs(status=status, after=after, limit=limit); page["items"] = [self._project_run(item) for item in page["items"]]; return page
+    def list_runs(
+        self,
+        *,
+        status: str | None,
+        query: str | None,
+        after: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        page = self.store.list_runs(
+            status=status, query=query, after=after, limit=limit
+        )
+        page["items"] = [self._project_run(item) for item in page["items"]]
+        return page
     def get_run(self, run_ref: str) -> dict[str, Any]: return self._project_run(self.store.get_run(run_ref))
     def stop_run(self, run_ref: str, expected_revision: int, idempotency_key: str, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_STOP_RUNS); return self._project_run(self.store.stop_run(run_ref, expected_revision, idempotency_key, principal.subject))
-    def list_logs(self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]: return self.store.list_logs(run_ref, after_seq, limit, stage_ref=stage_ref)
-    def list_metrics(self, run_ref: str, *, after_seq: int, limit: int, stage_ref: str | None = None) -> dict[str, Any]: return self.store.list_metrics(run_ref, after_seq, limit, stage_ref=stage_ref)
+    def list_logs(
+        self,
+        run_ref: str,
+        *,
+        after_seq: int,
+        limit: int,
+        stage_ref: str | None = None,
+        before_seq: int | None = None,
+        tail: bool = False,
+        levels: tuple[str, ...] = (),
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.list_logs(
+            run_ref,
+            after_seq,
+            limit,
+            stage_ref=stage_ref,
+            before_seq=before_seq,
+            tail=tail,
+            levels=levels,
+            query=query,
+        )
+
+    def list_metrics(
+        self,
+        run_ref: str,
+        *,
+        after_seq: int,
+        limit: int,
+        stage_ref: str | None = None,
+        tail: bool = False,
+        since: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.list_metrics(
+            run_ref,
+            after_seq,
+            limit,
+            stage_ref=stage_ref,
+            tail=tail,
+            since=since,
+        )
     def list_events(self, *, after_seq: int, limit: int) -> dict[str, Any]: return self.store.list_events(after_seq, limit)
