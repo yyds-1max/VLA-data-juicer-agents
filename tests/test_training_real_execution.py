@@ -572,7 +572,7 @@ def test_v11_database_upgrades_through_v13_and_reopens(tmp_path: Path) -> None:
     with sqlite3.connect(path) as db:
         assert db.execute(
             "SELECT MAX(version) FROM training_schema_migrations"
-        ).fetchone()[0] == 13
+        ).fetchone()[0] == 14
         columns = {
             row[1] for row in db.execute("PRAGMA table_info(training_runs)")
         }

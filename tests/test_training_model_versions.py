@@ -86,7 +86,7 @@ def test_v12_to_v13_preserves_existing_node_commands_and_is_repeatable(
     with sqlite3.connect(path) as db:
         assert db.execute(
             "SELECT version,name FROM training_schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (13, "model_version_library_m13")
+        ).fetchone() == (14, "dataset_replica_node_recovery_m14")
         command = db.execute(
             """SELECT command_ref,node_ref_snapshot,kind,status,request_json,
             worker_instance_id,lease_expires_at,claim_token_sha256

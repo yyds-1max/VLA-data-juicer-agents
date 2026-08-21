@@ -399,6 +399,7 @@ class NodeCapabilities(StrictRequest):
     cuda_version: str | None = Field(default=None, max_length=64)
     conda_environments: list[str] = Field(default_factory=list, max_length=100)
     worker_features: list[str] = Field(default_factory=list, max_length=100)
+    dataset_replica_recovery_v1: bool = False
     training_execution_v1: bool = False
     training_artifact_inspection_v1: bool = False
 

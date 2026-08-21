@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 13
+LATEST_TRAINING_SCHEMA_VERSION = 14
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -121,6 +122,58 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
             ("model_version_library_m13", applied_at),
         )
         connection.commit()
+        versions.append(13)
+    if 14 not in versions:
+        connection.executescript(_MIGRATION_014)
+        _backfill_dataset_replica_node_identities(connection)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(14,?,?)",
+            ("dataset_replica_node_recovery_m14", applied_at),
+        )
+        connection.commit()
+
+
+def _backfill_dataset_replica_node_identities(
+    connection: sqlite3.Connection,
+) -> None:
+    """Preserve the physical host identity after a node record was deleted.
+
+    Active replicas can read the fingerprint from their current node.  Older
+    detached replicas need the last confirmed deployment fingerprint from the
+    audit ledger because their node row was intentionally removed.
+    """
+
+    rows = connection.execute(
+        """SELECT replica.id,replica.node_id,replica.node_ref_snapshot,
+        node.host_key_fingerprint
+        FROM dataset_replicas AS replica
+        LEFT JOIN training_nodes AS node ON node.id=replica.node_id
+        WHERE replica.node_host_key_fingerprint_snapshot IS NULL"""
+    ).fetchall()
+    for replica_id, _node_id, node_ref, current_fingerprint in rows:
+        fingerprint = current_fingerprint
+        if not fingerprint:
+            audit_rows = connection.execute(
+                """SELECT payload_json FROM audit_events
+                WHERE action='node.deployment_started' AND target_ref=?
+                ORDER BY seq DESC""",
+                (node_ref,),
+            ).fetchall()
+            for (payload_json,) in audit_rows:
+                try:
+                    payload = json.loads(payload_json)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                candidate = payload.get("host_key_fingerprint")
+                if isinstance(candidate, str) and candidate:
+                    fingerprint = candidate
+                    break
+        if fingerprint:
+            connection.execute(
+                """UPDATE dataset_replicas
+                SET node_host_key_fingerprint_snapshot=? WHERE id=?""",
+                (fingerprint, replica_id),
+            )
 
 
 _MIGRATION_001 = """
@@ -869,6 +922,24 @@ CREATE UNIQUE INDEX idx_training_artifact_inspections_active
 
 CREATE INDEX idx_metric_samples_run_stage_seq
   ON metric_samples(run_id,stage_id,seq DESC);
+
+COMMIT;
+"""
+
+
+_MIGRATION_014 = """
+BEGIN IMMEDIATE;
+
+ALTER TABLE dataset_replicas
+  ADD COLUMN node_host_key_fingerprint_snapshot TEXT;
+ALTER TABLE dataset_transfers
+  ADD COLUMN recovery_replica_id INTEGER
+  REFERENCES dataset_replicas(id) ON DELETE SET NULL;
+
+CREATE INDEX idx_dataset_replicas_detached_identity
+  ON dataset_replicas(node_host_key_fingerprint_snapshot,node_id,status,id);
+CREATE INDEX idx_dataset_transfers_recovery_replica
+  ON dataset_transfers(recovery_replica_id,id DESC);
 
 COMMIT;
 """

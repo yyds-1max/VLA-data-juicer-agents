@@ -493,6 +493,7 @@ describe("TrainingPlatform", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "删除训练节点 测试训练节点" }));
     expect(await screen.findByRole("heading", { name: "再次确认删除训练节点" })).toBeVisible();
+    expect(screen.getByText(/重新登记同一服务器时，系统会核验并恢复原有托管数据/)).toBeVisible();
     expect(screen.queryByLabelText("删除操作 SSH 登录用户名")).not.toBeInTheDocument();
     expect(trainingApi.deleteTrainingNode).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "确认删除训练节点" }));

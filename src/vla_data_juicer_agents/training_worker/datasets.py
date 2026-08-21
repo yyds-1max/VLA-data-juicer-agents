@@ -314,7 +314,7 @@ class DatasetTransferManager:
             local_root = _final_replica_root(
                 destination_parent, dataset_date, release_ref
             )
-            existing = _matching_replica(local_root, release_ref, inventory.inventory_sha256)
+            existing = _matching_replica(local_root, inventory)
             if existing:
                 publish(_transfer_success_payload(transfer_ref, inventory, local_root))
                 return
@@ -728,23 +728,71 @@ def _read_marker(root: Path) -> dict[str, object]:
     return payload
 
 
-def _matching_replica(root: Path, release_ref: str, digest: str) -> bool:
+def _matching_replica(root: Path, inventory: DatasetInventory) -> bool:
     if not root.exists():
         return False
-    if root.is_symlink() or not root.is_dir():
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or not root.is_absolute()
+        or root.parent.name != "datapilot-managed"
+        or root.resolve(strict=True) != root
+        or root.name
+        != f"{inventory.dataset_date}-{_short_ref(inventory.release_ref)}"
+        or not os.access(root, os.R_OK | os.X_OK)
+    ):
         raise DatasetCommandError(
             "dataset_destination_exists", "The final dataset destination already exists."
         )
     marker = _read_marker(root)
     if (
         marker.get("contract") == DATASET_MARKER_CONTRACT
-        and marker.get("release_ref") == release_ref
-        and marker.get("inventory_sha256") == digest
+        and marker.get("release_ref") == inventory.release_ref
+        and marker.get("dataset_date") == inventory.dataset_date
+        and marker.get("inventory_sha256") == inventory.inventory_sha256
+        and marker.get("file_count") == len(inventory.files)
+        and marker.get("total_bytes") == inventory.total_bytes
     ):
+        _verify_existing_replica_tree(root)
         return True
     raise DatasetCommandError(
         "dataset_destination_exists", "The final dataset destination already exists."
     )
+
+
+def _verify_existing_replica_tree(root: Path) -> None:
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries: Iterable[os.DirEntry[str]] = os.scandir(directory)
+            with entries as scan:
+                for entry in scan:
+                    if entry.is_symlink():
+                        raise DatasetCommandError(
+                            "dataset_destination_unsafe",
+                            "The existing managed dataset contains a symbolic link.",
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        child = Path(entry.path)
+                        if not os.access(child, os.R_OK | os.X_OK):
+                            raise DatasetCommandError(
+                                "dataset_destination_unreadable",
+                                "The Worker cannot read the existing managed dataset.",
+                            )
+                        pending.append(child)
+                    elif not entry.is_file(follow_symlinks=False):
+                        raise DatasetCommandError(
+                            "dataset_destination_unsafe",
+                            "The existing managed dataset contains an unsupported file type.",
+                        )
+        except DatasetCommandError:
+            raise
+        except OSError as exc:
+            raise DatasetCommandError(
+                "dataset_destination_unreadable",
+                "The Worker cannot read the existing managed dataset.",
+            ) from exc
 
 
 def _raise_if_cancelled(cancel_event: threading.Event) -> None:

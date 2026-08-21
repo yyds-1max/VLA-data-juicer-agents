@@ -457,7 +457,7 @@ export function TrainingNodesPanel({
       </Dialog>
       <AlertDialog open={removalConfirmOpen} onOpenChange={(open) => !busy && setRemovalConfirmOpen(open)}>
         <AlertDialogContent>
-          <AlertDialogHeader><AlertDialogTitle>{removalPurpose === "node" ? "再次确认删除训练节点" : "再次确认卸载 Worker"}</AlertDialogTitle><AlertDialogDescription>{removalPurpose === "node" ? "删除后，该节点不会再出现在平台中，也不能用于创建训练。模型工程、数据集、训练产物和 SSH 登录账号不会被删除。" : "卸载后，节点记录仍会保留，但在重新部署 Worker 前不能用于训练。"}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogHeader><AlertDialogTitle>{removalPurpose === "node" ? "再次确认删除训练节点" : "再次确认卸载 Worker"}</AlertDialogTitle><AlertDialogDescription>{removalPurpose === "node" ? "删除后，该节点不会再出现在平台中，也不能用于创建训练。训练节点磁盘中的托管数据、模型工程和训练产物不会被删除；以后重新登记同一服务器时，系统会核验并恢复原有托管数据。" : "卸载后，节点记录仍会保留，但在重新部署 Worker 前不能用于训练。"}</AlertDialogDescription></AlertDialogHeader>
           <AlertDialogFooter><AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={busy} onClick={(event) => { event.preventDefault(); void completeRemoval(); }}>{removalPurpose === "node" ? "确认删除训练节点" : "确认卸载 Worker"}</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

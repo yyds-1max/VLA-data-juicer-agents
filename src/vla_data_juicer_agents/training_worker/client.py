@@ -518,6 +518,7 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
         "nvidia_driver_version": None,
         "cuda_version": None,
         "conda_environments": [],
+        "dataset_replica_recovery_v1": True,
         "training_execution_v1": True,
         "training_artifact_inspection_v1": True,
         "worker_features": [
@@ -526,6 +527,7 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
             "model_configuration_verification",
             "directory_browser_v1",
             "dataset_transfer_v1",
+            "dataset_replica_recovery_v1",
             "training_execution_v1",
             "training_artifact_inspection_v1",
         ],

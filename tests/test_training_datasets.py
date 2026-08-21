@@ -83,10 +83,17 @@ def _setup(tmp_path: Path, dates: tuple[str, ...] = ("20260806",)) -> tuple[Trai
             """INSERT INTO training_nodes(
             node_ref,name,address,ssh_port,ssh_username,status,state_revision,
             deployment_status,heartbeat_revision,worker_instance_id,
-            worker_token_sha256,capabilities_json,created_at,updated_at)
+            worker_token_sha256,capabilities_json,host_key_fingerprint,
+            created_at,updated_at)
             VALUES('fake-local','Data node','127.0.0.1',22,'worker','online',1,
-            'succeeded',1,'worker-1',?,?,?,?)""",
-            (hashlib.sha256(token.encode()).hexdigest(), canonical_json({"worker_features": ["directory_browser_v1", "dataset_transfer_v1"]}), timestamp, timestamp),
+            'succeeded',1,'worker-1',?,?,?,?,?)""",
+            (
+                hashlib.sha256(token.encode()).hexdigest(),
+                canonical_json({"worker_features": ["directory_browser_v1", "dataset_transfer_v1", "dataset_replica_recovery_v1"]}),
+                "SHA256:same-physical-host",
+                timestamp,
+                timestamp,
+            ),
         )
     return store, service, TestClient(app), catalog, token
 
@@ -201,6 +208,22 @@ def test_existing_v9_database_migrates_commands_and_old_cancellation_to_pause(tm
             '/data/datapilot-managed/20260416-existing',3,0,?,?,?,?)""",
             (applied_at, applied_at, applied_at, applied_at),
         )
+        db.execute(
+            """INSERT INTO dataset_replicas(
+            replica_ref,node_id,node_ref_snapshot,source_manifest_id,status,
+            local_root,inventory_sha256,file_count,total_bytes,created_at,updated_at)
+            VALUES('replica_detached',NULL,'node_deleted',1,'ready',
+            '/data/datapilot-managed/20260416-existing',?,1,5,?,?)""",
+            ("f" * 64, applied_at, applied_at),
+        )
+        db.execute(
+            """INSERT INTO audit_events(actor,action,target_ref,payload_json,created_at)
+            VALUES('tester','node.deployment_started','node_deleted',?,?)""",
+            (
+                canonical_json({"host_key_fingerprint": "SHA256:historical-host"}),
+                applied_at,
+            ),
+        )
         db.commit()
 
     TrainingStore(path)
@@ -220,15 +243,20 @@ def test_existing_v9_database_migrates_commands_and_old_cancellation_to_pause(tm
         migrated_transfer = db.execute(
             "SELECT transfer_ref,status,bytes_transferred FROM dataset_transfers"
         ).fetchone()
+        recovered_identity = db.execute(
+            """SELECT node_host_key_fingerprint_snapshot
+            FROM dataset_replicas WHERE replica_ref='replica_detached'"""
+        ).fetchone()
     assert ledger[-4:] == [
-        (10, "training_node_command_claim_tokens_m10"),
         (11, "dataset_transfer_pause_cancel_m11"),
         (12, "real_training_execution_m12"),
         (13, "model_version_library_m13"),
+        (14, "dataset_replica_node_recovery_m14"),
     ]
     assert "claim_token_sha256" in columns
     assert existing == [("command_existing", "queued")]
     assert migrated_transfer == ("transfer_existing", "paused", 3)
+    assert recovered_identity == ("SHA256:historical-host",)
 
 
 def test_directory_listing_and_transfer_result_create_ready_replica(tmp_path: Path) -> None:
@@ -265,6 +293,144 @@ def test_directory_listing_and_transfer_result_create_ready_replica(tmp_path: Pa
     replicas = client.get("/api/training/nodes/fake-local/dataset-replicas").json()["replicas"]
     assert len(replicas) == 1
     assert replicas[0]["status"] == "ready"
+
+
+def test_same_physical_host_recovers_detached_replica_without_new_download(
+    tmp_path: Path,
+) -> None:
+    store, _service, client, catalog, token = _setup(tmp_path)
+    response = client.post(
+        "/api/training/dataset-transfers",
+        headers={"Idempotency-Key": "recover-source"},
+        json={
+            "node_ref": "fake-local",
+            "release_refs": ["dataset_release_20260806"],
+            "target_parent_directory": "/data/free",
+        },
+    )
+    assert response.status_code == 202
+    DatasetManifestPreparationWorker(store, catalog).run_once()
+    transfer_command = _poll(client, token)[0]
+    _result(
+        client,
+        token,
+        transfer_command,
+        {
+            "status": "succeeded",
+            "transfer_ref": transfer_command["payload"]["transfer_ref"],
+            "replica": {},
+        },
+    )
+    original = store.list_dataset_replicas("fake-local")[0]
+    store.delete_node("fake-local", 1, "tester")
+
+    new_token = "worker_" + "b" * 48
+    timestamp = now_iso()
+    with store.transaction() as db:
+        db.execute(
+            """INSERT INTO training_nodes(
+            node_ref,name,address,ssh_port,ssh_username,status,state_revision,
+            deployment_status,heartbeat_revision,worker_instance_id,
+            worker_token_sha256,capabilities_json,host_key_fingerprint,
+            created_at,updated_at)
+            VALUES('fake-local-new','Data node again','127.0.0.1',22,'worker',
+            'online',1,'succeeded',1,'worker-2',?,?,?,?,?)""",
+            (
+                hashlib.sha256(new_token.encode()).hexdigest(),
+                canonical_json({"worker_features": ["dataset_transfer_v1", "dataset_replica_recovery_v1"]}),
+                "SHA256:same-physical-host",
+                timestamp,
+                timestamp,
+            ),
+        )
+    store.record_node_heartbeat(
+        "fake-local-new",
+        new_token,
+        {
+            "worker_instance_id": "worker-2",
+            "worker_version": "0.2.0",
+            "protocol_version": 1,
+            "health": "healthy",
+            "health_message": None,
+            "capabilities": {"worker_features": ["dataset_transfer_v1", "dataset_replica_recovery_v1"]},
+            "resources": {},
+        },
+    )
+    commands = store.claim_node_commands(
+        "fake-local-new", new_token, "worker-2", 1
+    )
+    assert len(commands) == 1
+    recovery = commands[0]
+    assert recovery["kind"] == "transfer_dataset"
+    assert recovery["payload"]["recovery_replica_ref"] == original["replica_ref"]
+    assert recovery["payload"]["destination_parent"] == "/data/free"
+
+    store.finish_node_command(
+        "fake-local-new",
+        new_token,
+        recovery["command_ref"],
+        {
+            "worker_instance_id": "worker-2",
+            "claim_token": recovery["claim_token"],
+            "status": "succeeded",
+            "transfer_ref": recovery["payload"]["transfer_ref"],
+            "replica": {
+                "local_root": original["local_root"],
+                "inventory_sha256": original["inventory_sha256"],
+                "file_count": original["file_count"],
+                "total_bytes": original["total_bytes"],
+            },
+        },
+    )
+
+    recovered = store.list_dataset_replicas("fake-local-new")
+    assert [item["replica_ref"] for item in recovered] == [original["replica_ref"]]
+    assert recovered[0]["local_root"] == original["local_root"]
+
+
+def test_different_host_fingerprint_never_claims_detached_replica(
+    tmp_path: Path,
+) -> None:
+    store, _service, _client, _catalog, token = _setup(tmp_path)
+    timestamp = now_iso()
+    with store.transaction() as db:
+        source_id = db.execute(
+            """INSERT INTO dataset_source_manifests(
+            manifest_ref,release_ref,domain,dataset_date,status,inventory_sha256,
+            file_count,total_bytes,created_at,updated_at)
+            VALUES('manifest_old','release_old','navigation','20260416','ready',?,
+            1,5,?,?) RETURNING id""",
+            ("f" * 64, timestamp, timestamp),
+        ).fetchone()[0]
+        db.execute(
+            """INSERT INTO dataset_replicas(
+            replica_ref,node_id,node_ref_snapshot,source_manifest_id,status,
+            local_root,inventory_sha256,file_count,total_bytes,created_at,updated_at,
+            node_host_key_fingerprint_snapshot)
+            VALUES('replica_old',NULL,'deleted-node',?,'ready',
+            '/data/datapilot-managed/20260416-old',?,1,5,?,?,?)""",
+            (
+                source_id,
+                "f" * 64,
+                timestamp,
+                timestamp,
+                "SHA256:another-physical-host",
+            ),
+        )
+    store.record_node_heartbeat(
+        "fake-local",
+        token,
+        {
+            "worker_instance_id": "worker-1",
+            "worker_version": "0.2.0",
+            "protocol_version": 1,
+            "health": "healthy",
+            "health_message": None,
+            "capabilities": {"worker_features": ["dataset_transfer_v1", "dataset_replica_recovery_v1"]},
+            "resources": {},
+        },
+    )
+    assert store.claim_node_commands("fake-local", token, "worker-1", 10) == []
 
 
 def test_batch_transfers_are_claimed_serially_and_manifest_is_paginated(tmp_path: Path) -> None:

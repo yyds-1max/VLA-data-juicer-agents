@@ -314,6 +314,14 @@ class TrainingStore:
                     row["id"],
                 ),
             )
+            if row["host_key_fingerprint"]:
+                db.execute(
+                    """UPDATE dataset_replicas
+                    SET node_host_key_fingerprint_snapshot=COALESCE(
+                      node_host_key_fingerprint_snapshot,?
+                    ) WHERE node_id=?""",
+                    (row["host_key_fingerprint"], row["id"]),
+                )
             self._audit(db, actor, "node.deleted", node_ref, {}, timestamp)
             db.execute("DELETE FROM training_nodes WHERE id=?", (row["id"],))
 
@@ -763,6 +771,23 @@ class TrainingStore:
                 )""",
                 (row["id"], row["id"]),
             )
+            capabilities = json.loads(capabilities_json) if capabilities_json else {}
+            features = capabilities.get("worker_features") or []
+            if (
+                status == TrainingNodeStatus.ONLINE.value
+                and row["host_key_fingerprint"]
+                and (
+                    capabilities.get("dataset_replica_recovery_v1") is True
+                    or "dataset_replica_recovery_v1" in features
+                )
+            ):
+                self._queue_detached_dataset_replica_recovery(
+                    db,
+                    node=row,
+                    host_key_fingerprint=str(row["host_key_fingerprint"]),
+                    actor=f"worker:{data['worker_instance_id']}",
+                    timestamp=timestamp,
+                )
         return self.get_node(node_ref)
 
     def claim_model_verification(
@@ -4272,6 +4297,109 @@ class TrainingStore:
             self._audit(db, actor, "dataset.transfer_retried", transfer_ref, {}, timestamp)
             return self._get_dataset_transfer_in(db, transfer_ref)
 
+    def _queue_detached_dataset_replica_recovery(
+        self,
+        db: sqlite3.Connection,
+        *,
+        node: sqlite3.Row,
+        host_key_fingerprint: str,
+        actor: str,
+        timestamp: str,
+    ) -> str | None:
+        """Queue one marker-verified recovery for the same physical host.
+
+        The center never trusts an address or a path by itself.  A detached
+        replica is considered only when its last confirmed SSH host key is the
+        same as the newly registered node.  The Worker still has to verify the
+        exact managed directory and marker before the database is rebound.
+        """
+
+        active = db.execute(
+            """SELECT 1 FROM dataset_transfers
+            WHERE node_id=? AND status IN (
+              'preparing','queued','running','pause_requested','cancel_requested'
+            ) LIMIT 1""",
+            (node["id"],),
+        ).fetchone()
+        if active is not None:
+            return None
+        replica = db.execute(
+            """SELECT replica.*,source.release_ref,source.dataset_date,
+            source.status AS source_status
+            FROM dataset_replicas AS replica
+            JOIN dataset_source_manifests AS source
+              ON source.id=replica.source_manifest_id
+            WHERE replica.node_id IS NULL AND replica.status='ready'
+              AND replica.node_host_key_fingerprint_snapshot=?
+              AND source.status='ready'
+              AND NOT EXISTS (
+                SELECT 1 FROM dataset_replicas AS current
+                WHERE current.node_id=?
+                  AND current.source_manifest_id=replica.source_manifest_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM dataset_transfers AS attempted
+                WHERE attempted.recovery_replica_id=replica.id
+              )
+            ORDER BY replica.id LIMIT 1""",
+            (host_key_fingerprint, node["id"]),
+        ).fetchone()
+        if replica is None:
+            return None
+        local_root = Path(str(replica["local_root"]))
+        if (
+            not local_root.is_absolute()
+            or local_root.parent.name != "datapilot-managed"
+            or local_root.parent.parent == local_root.parent
+        ):
+            return None
+        target_parent = str(local_root.parent.parent)
+        transfer_ref = new_ref("transfer")
+        db.execute(
+            """INSERT INTO dataset_transfers(
+            transfer_ref,node_id,node_ref_snapshot,source_manifest_id,status,
+            target_parent_directory,final_directory,error_code,error_message,
+            created_at,updated_at,finished_at,recovery_replica_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                transfer_ref,
+                node["id"],
+                node["node_ref"],
+                replica["source_manifest_id"],
+                "queued",
+                target_parent,
+                str(local_root),
+                None,
+                None,
+                timestamp,
+                timestamp,
+                None,
+                replica["id"],
+            ),
+        )
+        self._insert_node_command(
+            db,
+            node,
+            "transfer_dataset",
+            {
+                "transfer_ref": transfer_ref,
+                "release_ref": replica["release_ref"],
+                "dataset_date": replica["dataset_date"],
+                "destination_parent": target_parent,
+                "recovery_replica_ref": replica["replica_ref"],
+            },
+            timestamp,
+        )
+        self._audit(
+            db,
+            actor,
+            "dataset.replica_recovery_requested",
+            replica["replica_ref"],
+            {"node_ref": node["node_ref"]},
+            timestamp,
+        )
+        return transfer_ref
+
     def list_dataset_replicas(self, node_ref: str) -> list[dict[str, Any]]:
         with self.connection() as db:
             rows = db.execute(
@@ -4651,25 +4779,116 @@ class TrainingStore:
             result_status = data.get("status")
             transfer_status = "succeeded" if final == "succeeded" else result_status if result_status in {"paused", "cancelled"} else "failed"
             progress = data.get("progress") or {}
+            replica_data = data.get("replica") or {}
+            recovery_replica = None
+            recovery_error: tuple[str, str] | None = None
+            node = db.execute(
+                "SELECT * FROM training_nodes WHERE id=?",
+                (transfer["node_id"],),
+            ).fetchone()
+            if final == "succeeded" and transfer["recovery_replica_id"] is not None:
+                recovery_replica = db.execute(
+                    """SELECT * FROM dataset_replicas
+                    WHERE id=? AND node_id IS NULL AND status='ready'""",
+                    (transfer["recovery_replica_id"],),
+                ).fetchone()
+                if (
+                    recovery_replica is None
+                    or node is None
+                    or not node["host_key_fingerprint"]
+                    or recovery_replica["node_host_key_fingerprint_snapshot"]
+                    != node["host_key_fingerprint"]
+                    or replica_data.get("local_root") != recovery_replica["local_root"]
+                    or replica_data.get("inventory_sha256")
+                    != recovery_replica["inventory_sha256"]
+                ):
+                    transfer_status = "failed"
+                    recovery_error = (
+                        "dataset_replica_recovery_mismatch",
+                        "The existing managed dataset did not match its registered identity.",
+                    )
             db.execute(
                 """UPDATE dataset_transfers SET status=?,bytes_transferred=?,files_completed=?,
                 error_code=?,error_message=?,finished_at=?,updated_at=? WHERE id=?""",
-                (transfer_status, int(progress.get("bytes_transferred", transfer["total_bytes"] if final == "succeeded" else transfer["bytes_transferred"])), int(progress.get("files_completed", transfer["file_count"] if final == "succeeded" else transfer["files_completed"])), error.get("code"), error.get("message"), timestamp, timestamp, transfer["id"]),
+                (
+                    transfer_status,
+                    int(progress.get("bytes_transferred", transfer["total_bytes"] if transfer_status == "succeeded" else transfer["bytes_transferred"])),
+                    int(progress.get("files_completed", transfer["file_count"] if transfer_status == "succeeded" else transfer["files_completed"])),
+                    recovery_error[0] if recovery_error else error.get("code"),
+                    recovery_error[1] if recovery_error else error.get("message"),
+                    timestamp,
+                    timestamp,
+                    transfer["id"],
+                ),
             )
-            if final == "succeeded":
-                replica_data = data.get("replica") or {}
+            if transfer_status == "succeeded" and recovery_replica is not None:
+                db.execute(
+                    """UPDATE dataset_replicas SET node_id=?,node_ref_snapshot=?,
+                    node_host_key_fingerprint_snapshot=?,updated_at=? WHERE id=?""",
+                    (
+                        transfer["node_id"],
+                        transfer["node_ref_snapshot"],
+                        node["host_key_fingerprint"],
+                        timestamp,
+                        recovery_replica["id"],
+                    ),
+                )
+                self._audit(
+                    db,
+                    f"worker:{command['worker_instance_id']}",
+                    "dataset.replica_recovered",
+                    recovery_replica["replica_ref"],
+                    {"node_ref": transfer["node_ref_snapshot"]},
+                    timestamp,
+                )
+                self._event(
+                    db,
+                    "dataset.replica.ready",
+                    None,
+                    {
+                        "replica_ref": recovery_replica["replica_ref"],
+                        "release_ref": transfer["release_ref"],
+                        "recovered": True,
+                    },
+                    timestamp,
+                )
+            elif transfer_status == "succeeded":
                 replica_ref = new_ref("replica")
                 db.execute(
                     """INSERT INTO dataset_replicas(replica_ref,node_id,node_ref_snapshot,
                     source_manifest_id,status,local_root,inventory_sha256,file_count,total_bytes,
-                    created_at,updated_at) VALUES(?,?,?,?,'ready',?,?,?,?,?,?)
+                    created_at,updated_at,node_host_key_fingerprint_snapshot)
+                    VALUES(?,?,?,?,'ready',?,?,?,?,?,?,?)
                     ON CONFLICT(node_id,source_manifest_id) DO UPDATE SET status='ready',
                     local_root=excluded.local_root,inventory_sha256=excluded.inventory_sha256,
-                    file_count=excluded.file_count,total_bytes=excluded.total_bytes,updated_at=excluded.updated_at""",
-                    (replica_ref, transfer["node_id"], transfer["node_ref_snapshot"], transfer["source_manifest_id"], replica_data.get("local_root", transfer["final_directory"]), replica_data.get("inventory_sha256", transfer["inventory_sha256"]), int(replica_data.get("file_count", transfer["file_count"])), int(replica_data.get("total_bytes", transfer["total_bytes"])), timestamp, timestamp),
+                    file_count=excluded.file_count,total_bytes=excluded.total_bytes,
+                    node_ref_snapshot=excluded.node_ref_snapshot,
+                    node_host_key_fingerprint_snapshot=excluded.node_host_key_fingerprint_snapshot,
+                    updated_at=excluded.updated_at""",
+                    (
+                        replica_ref,
+                        transfer["node_id"],
+                        transfer["node_ref_snapshot"],
+                        transfer["source_manifest_id"],
+                        replica_data.get("local_root", transfer["final_directory"]),
+                        replica_data.get("inventory_sha256", transfer["inventory_sha256"]),
+                        int(replica_data.get("file_count", transfer["file_count"])),
+                        int(replica_data.get("total_bytes", transfer["total_bytes"])),
+                        timestamp,
+                        timestamp,
+                        node["host_key_fingerprint"] if node is not None else None,
+                    ),
                 )
                 self._event(db, "dataset.replica.ready", None, {"transfer_ref": request["transfer_ref"], "release_ref": transfer["release_ref"]}, timestamp)
             self._event(db, "dataset.transfer.updated", None, {"transfer_ref": request["transfer_ref"], "status": transfer_status}, timestamp)
+            if transfer["recovery_replica_id"] is not None and node is not None:
+                self._queue_detached_dataset_replica_recovery(
+                    db,
+                    node=node,
+                    host_key_fingerprint=str(node["host_key_fingerprint"] or ""),
+                    actor=f"worker:{command['worker_instance_id']}",
+                    timestamp=timestamp,
+                )
         elif command["kind"] == "remove_dataset_replica":
             if final == "succeeded":
                 db.execute("DELETE FROM dataset_replicas WHERE replica_ref=?", (request["replica_ref"],))

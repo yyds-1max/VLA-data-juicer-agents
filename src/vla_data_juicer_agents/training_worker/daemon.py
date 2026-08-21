@@ -88,6 +88,7 @@ class TrainingWorkerDaemon:
                 "restart_reconciliation": True,
                 "directory_browser_v1": True,
                 "dataset_transfer_v1": True,
+                "dataset_replica_recovery_v1": True,
                 "training_execution": True,
                 "training_execution_v1": True,
                 "training_artifact_inspection_v1": True,

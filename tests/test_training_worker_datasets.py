@@ -205,6 +205,98 @@ def test_transfer_resumes_partial_file_checksums_and_atomically_publishes_marker
     assert results[-1][1]["replica"]["local_root"] == str(final_root)  # type: ignore[index]
 
 
+def test_existing_managed_replica_is_verified_and_reused_without_file_download(
+    tmp_path: Path,
+) -> None:
+    content = b"already-present"
+    source = _MemoryDatasetSource({"file_1": ("sample.bin", content)})
+    destination = tmp_path / "data"
+    final_root = destination / "datapilot-managed" / "20260806-12345678"
+    final_root.mkdir(parents=True)
+    (final_root / "sample.bin").write_bytes(content)
+    (final_root / DATASET_MARKER_NAME).write_text(
+        json.dumps(
+            {
+                "contract": DATASET_MARKER_CONTRACT,
+                "transfer_ref": "transfer_original",
+                "release_ref": source.release_ref,
+                "dataset_date": source.dataset_date,
+                "inventory_sha256": "a" * 64,
+                "total_bytes": len(content),
+                "file_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    results: list[dict[str, object]] = []
+    manager = DatasetTransferManager(
+        source_client=source,
+        publish_result=lambda _ref, payload: results.append(dict(payload)),
+    )
+
+    manager.start(
+        "command_recovery",
+        {
+            "transfer_ref": "transfer_recovery",
+            "release_ref": source.release_ref,
+            "dataset_date": source.dataset_date,
+            "destination_parent": str(destination),
+            "recovery_replica_ref": "replica_original",
+        },
+        claim_token="claim_" + "r" * 40,
+    )
+
+    assert manager.wait(5)
+    assert source.requests == []
+    assert results[-1]["status"] == "succeeded"
+    assert results[-1]["replica"]["local_root"] == str(final_root)  # type: ignore[index]
+
+
+def test_existing_managed_replica_with_internal_symlink_is_never_recovered(
+    tmp_path: Path,
+) -> None:
+    source = _MemoryDatasetSource({"file_1": ("sample.bin", b"data")})
+    destination = tmp_path / "data"
+    final_root = destination / "datapilot-managed" / "20260806-12345678"
+    final_root.mkdir(parents=True)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"secret")
+    (final_root / "sample.bin").symlink_to(outside)
+    (final_root / DATASET_MARKER_NAME).write_text(
+        json.dumps(
+            {
+                "contract": DATASET_MARKER_CONTRACT,
+                "release_ref": source.release_ref,
+                "dataset_date": source.dataset_date,
+                "inventory_sha256": "a" * 64,
+                "total_bytes": 4,
+                "file_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    results: list[dict[str, object]] = []
+    manager = DatasetTransferManager(
+        source_client=source,
+        publish_result=lambda _ref, payload: results.append(dict(payload)),
+    )
+
+    manager.start(
+        "command_recovery",
+        {
+            "transfer_ref": "transfer_recovery",
+            "release_ref": source.release_ref,
+            "dataset_date": source.dataset_date,
+            "destination_parent": str(destination),
+        },
+    )
+
+    assert manager.wait(5)
+    assert results[-1]["status"] == "failed"
+    assert results[-1]["error"]["code"] == "dataset_destination_unsafe"  # type: ignore[index]
+    assert outside.read_bytes() == b"secret"
+
+
 def test_checksum_failure_keeps_partial_data_but_never_publishes_replica(
     tmp_path: Path,
 ) -> None:
