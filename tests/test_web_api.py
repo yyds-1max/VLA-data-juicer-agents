@@ -110,10 +110,10 @@ def test_https_center_configuration_enables_worker_deployment(
     assert capabilities.json()["node_deployment_disabled_reason"] is None
 
 
-def test_real_training_switch_reaches_training_service(
+def test_real_training_is_enabled_by_default_in_web_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("VLA_TRAINING_REAL_EXECUTION_ENABLED", "true")
+    monkeypatch.delenv("VLA_TRAINING_REAL_EXECUTION_ENABLED", raising=False)
     client = make_client(tmp_path)
 
     capabilities = client.get("/api/training/capabilities")

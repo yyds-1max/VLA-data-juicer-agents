@@ -15,6 +15,7 @@ from vla_data_juicer_agents.training.auth import (
 def test_training_auth_defaults_to_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VLA_TRAINING_DEV_ADMIN", raising=False)
     monkeypatch.delenv("VLA_TRAINING_SIMULATION_ENABLED", raising=False)
+    monkeypatch.delenv("VLA_TRAINING_REAL_EXECUTION_ENABLED", raising=False)
     monkeypatch.delenv("VLA_TRAINING_CENTER_BASE_URL", raising=False)
     monkeypatch.delenv("VLA_TRAINING_CENTER_CA_CERT_PATH", raising=False)
 
@@ -22,8 +23,17 @@ def test_training_auth_defaults_to_read_only(monkeypatch: pytest.MonkeyPatch) ->
     principal = settings.principal()
 
     assert settings.simulation_enabled is True
+    assert settings.real_execution_enabled is True
     assert principal.subject == "anonymous-read-only"
     assert principal.permissions == frozenset({TRAINING_VIEW})
+
+
+def test_training_real_execution_can_be_explicitly_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLA_TRAINING_REAL_EXECUTION_ENABLED", "false")
+
+    assert TrainingSettings.from_env().real_execution_enabled is False
 
 
 def test_training_dev_admin_is_explicit_and_simulation_only(

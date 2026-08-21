@@ -1196,12 +1196,8 @@ export function TrainingPlatform() {
   if (!capabilities && !error) return <LoadingCard />;
   return (
     <section className="w-full space-y-5 px-4 py-3 md:px-6 xl:px-8">
-      <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-2 border-b border-console-line">
+      <div className="border-b border-console-line">
         <TrainingSectionTabs value={tab === "new" || tab === "models" ? "runs" : tab} onChange={changeTab} />
-        <div className="flex shrink-0 items-center gap-2 pb-2">
-          <StatusTag tone={capabilities?.real_execution_enabled ? "success" : "warning"}>{capabilities?.real_execution_enabled ? "真实训练已启用" : "真实训练未启用"}</StatusTag>
-          <StatusTag tone={capabilities?.simulation_enabled ? "success" : "danger"}>{capabilities?.simulation_enabled ? "模拟模式" : "模拟不可用"}</StatusTag>
-        </div>
       </div>
 
       {eventStreamDisconnected ? <div role="status" className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-800"><AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />事件流已断开，正在使用轮询恢复。</div> : null}

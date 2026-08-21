@@ -112,9 +112,10 @@ describe("TrainingPlatform", () => {
     })).toBe("/data/caiji_test/datapilot-managed/20260416-f0e579a7");
   });
 
-  it("shows a real-execution disabled notice and keeps write flows disabled for a read-only principal", async () => {
+  it("hides development execution-mode badges and keeps write flows disabled for a read-only principal", async () => {
     renderPlatform();
-    expect(await screen.findByText("真实训练未启用")).toBeVisible();
+    expect(await screen.findByRole("tab", { name: "训练任务" })).toBeVisible();
+    expect(screen.queryByText("真实训练未启用")).not.toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "模型注册" })).not.toBeInTheDocument();
     expect((await screen.findAllByRole("button", { name: "新建训练任务" }))[0]).toBeDisabled();
   });

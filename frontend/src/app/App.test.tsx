@@ -445,7 +445,7 @@ test("dashboard placeholder controls acknowledge clicks and dashboard links navi
 
   fireEvent.click(screen.getByRole("button", { name: "查看训练详情" }));
   expect(window.location.pathname).toBe("/model");
-  expect(await screen.findByText("真实训练未启用")).toBeVisible();
+  expect(await screen.findByRole("tab", { name: "训练任务" })).toBeVisible();
 });
 
 test("sidebar navigation switches console pages", async () => {
@@ -467,7 +467,7 @@ test("direct page deep links keep the console shell eager while the page loads",
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
   expect(screen.getByRole("button", { name: "模型训练" })).toHaveAttribute("aria-current", "page");
   expect(window.location.pathname).toBe("/model");
-  expect(await screen.findByText("真实训练未启用")).toBeVisible();
+  expect(await screen.findByRole("tab", { name: "训练任务" })).toBeVisible();
 });
 
 test("desktop sidebar collapse follows navigation and persists across remounts", async () => {
@@ -1368,12 +1368,12 @@ test("annotation shortcut submits a new session despite another session's active
   expect(screen.queryByLabelText("当天处理标定")).not.toBeInTheDocument();
 });
 
-test("model iteration page renders the simulation-only training platform", async () => {
+test("model iteration page renders the training platform", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "模型训练" }));
-  expect(await screen.findByText("真实训练未启用")).toBeVisible();
-  expect(screen.getByRole("tab", { name: "训练任务" })).toBeVisible();
+  expect(await screen.findByRole("tab", { name: "训练任务" })).toBeVisible();
+  expect(screen.queryByText("真实训练未启用")).not.toBeInTheDocument();
   expect(screen.getByText("还没有训练任务")).toBeVisible();
   expect(screen.getByText("选择已登记模型和 GPU，创建第一项训练。")).toBeVisible();
 
