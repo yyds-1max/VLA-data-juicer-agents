@@ -251,6 +251,46 @@ def test_real_executor_stop_terminates_process_group_and_reports_cancelled(
     assert any(item["kind"] == "exited" and item["status"] == "cancelled" for item in updates)
 
 
+def test_running_supervisor_that_disappears_is_reported_lost(tmp_path: Path) -> None:
+    manager, ledger, center = _manager(tmp_path)
+    state_path = tmp_path / "supervisor.json"
+    missing_pid = 2_000_000_000
+    state_path.write_text(
+        json.dumps(
+            {
+                "contract": "datapilot_training_supervisor_v1",
+                "status": "running",
+                "supervisor_pid": missing_pid,
+                "child_pid": missing_pid + 1,
+                "exit_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger.record_process_observation(
+        run_ref="run_missing_supervisor",
+        state="running",
+        pid=missing_pid,
+        stage_ref="stage_missing",
+        owner_epoch=1,
+        supervisor_state_path=str(state_path),
+    )
+
+    manager.tick()
+
+    assert ledger.get_run("run_missing_supervisor")["state"] == "unknown"  # type: ignore[index]
+    updates = [item for _, envelope in center.updates for item in envelope["updates"]]  # type: ignore[index]
+    assert any(
+        item == {
+            "kind": "reconciliation",
+            "stage_ref": "stage_missing",
+            "status": "lost",
+            "reason": "supervisor_missing",
+        }
+        for item in updates
+    )
+
+
 def test_worker_ledger_migrates_v1_to_v2_and_persists_outbox(tmp_path: Path) -> None:
     path = tmp_path / "ledger.sqlite"
     ledger = WorkerLedger(path)

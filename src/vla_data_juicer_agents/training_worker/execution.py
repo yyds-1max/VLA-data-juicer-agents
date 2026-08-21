@@ -140,18 +140,22 @@ class TrainingExecutionManager:
         for run in self.ledger.list_active_runs():
             self._collect_log(run)
             self._observe_supervisor(run)
-            if run["state"] in {"running", "stopping"}:
+            run_ref = str(run["run_ref"])
+            current = self.ledger.get_run(run_ref)
+            if current is not None and current["state"] in {"running", "stopping"}:
                 now = self._clock()
-                run_ref = str(run["run_ref"])
                 if now - self._last_heartbeat.get(run_ref, -10_000.0) >= 5.0:
-                    self._queue(run, {"kind": "heartbeat", "stage_ref": run.get("stage_ref")})
-                    gpu_samples = self._gpu_samples(run.get("gpu_uuids", []))
+                    self._queue(
+                        current,
+                        {"kind": "heartbeat", "stage_ref": current.get("stage_ref")},
+                    )
+                    gpu_samples = self._gpu_samples(current.get("gpu_uuids", []))
                     if gpu_samples:
                         self._queue(
-                            run,
+                            current,
                             {
                                 "kind": "metric",
-                                "stage_ref": run.get("stage_ref"),
+                                "stage_ref": current.get("stage_ref"),
                                 "gpus": gpu_samples,
                             },
                         )
@@ -570,6 +574,16 @@ class TrainingExecutionManager:
                 "stage_number": request.stage_number,
             },
         )
+        gpu_samples = self._gpu_samples(request.gpu_uuids)
+        if gpu_samples:
+            self._queue(
+                row,
+                {
+                    "kind": "metric",
+                    "stage_ref": request.stage_ref,
+                    "gpus": gpu_samples,
+                },
+            )
 
     def _prepare_version_root(self, request: StartRequest, version_root: Path) -> None:
         _assert_no_symlink_components(version_root)
@@ -842,7 +856,27 @@ class TrainingExecutionManager:
             state = _read_json(Path(raw_path), 16_384)
         except TrainingExecutionError:
             return
-        if state.get("contract") != SUPERVISOR_CONTRACT or state.get("status") != "exited":
+        if state.get("contract") != SUPERVISOR_CONTRACT:
+            return
+        if state.get("status") != "exited":
+            supervisor_pid = state.get("supervisor_pid")
+            if not isinstance(supervisor_pid, int) or _process_exists(supervisor_pid):
+                return
+            child_pid = state.get("child_pid")
+            child_exists = isinstance(child_pid, int) and _process_exists(child_pid)
+            run_ref = str(run["run_ref"])
+            self.ledger.update_run_state(run_ref, "unknown")
+            latest = self.ledger.get_run(run_ref)
+            assert latest is not None
+            self._queue(
+                latest,
+                {
+                    "kind": "reconciliation",
+                    "stage_ref": latest.get("stage_ref"),
+                    "status": "unresolved" if child_exists else "lost",
+                    "reason": "supervisor_missing",
+                },
+            )
             return
         exit_code = state.get("exit_code")
         if not isinstance(exit_code, int):
