@@ -54,7 +54,7 @@ export function trainingParameterGroupFor(parameter: TrainingParameterDefinition
     order: parameter.display_group_order ?? 600,
     collapsed: true,
     custom: true,
-    hint: "模型注册时创建的自定义参数分组。",
+    hint: "配置模型族时创建的自定义参数分组。",
   };
 }
 

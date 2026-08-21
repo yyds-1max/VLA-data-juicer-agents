@@ -8,6 +8,12 @@ export type TrainingOperationState = {
   detail?: string;
   steps?: string[];
   activeStep?: number;
+  checks?: Array<{
+    code: string;
+    label: string;
+    status: "passed" | "warning" | "failed";
+    detail: string;
+  }>;
 };
 
 export function TrainingOperationFeedback({ operation, className }: { operation: TrainingOperationState | null; className?: string }) {
@@ -45,6 +51,16 @@ export function TrainingOperationFeedback({ operation, className }: { operation:
             </li>;
           })}
         </ol>
+      ) : null}
+      {operation.checks?.length ? (
+        <ul className="mt-3 space-y-2 border-t border-current/15 pt-3" aria-label="配置验证结果">
+          {operation.checks.map((check) => (
+            <li key={check.code} className="flex items-start justify-between gap-3 text-xs">
+              <span className="font-medium">{check.label}</span>
+              <span className="min-w-0 flex-1 text-right opacity-80">{check.detail}</span>
+            </li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );

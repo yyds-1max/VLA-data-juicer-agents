@@ -18,10 +18,10 @@ export function TrainingOperationDialog({
   open: boolean;
   operation: TrainingOperationState | null;
   onOpenChange: (open: boolean) => void;
-  autoCloseMs?: number;
+  autoCloseMs?: number | null;
 }) {
   useEffect(() => {
-    if (!open || operation?.status !== "success") return;
+    if (!open || operation?.status !== "success" || autoCloseMs == null || autoCloseMs <= 0) return;
     const timer = window.setTimeout(() => onOpenChange(false), autoCloseMs);
     return () => window.clearTimeout(timer);
   }, [autoCloseMs, onOpenChange, open, operation?.status]);
@@ -34,7 +34,7 @@ export function TrainingOperationDialog({
           <DialogDescription>显示当前操作的执行进度和结果。</DialogDescription>
         </DialogHeader>
         <TrainingOperationFeedback operation={operation} className="border-0 bg-transparent p-1" />
-        {operation?.status === "success" ? <p className="text-center text-xs text-console-muted">窗口即将自动关闭</p> : null}
+        {operation?.status === "success" && autoCloseMs != null && autoCloseMs > 0 ? <p className="text-center text-xs text-console-muted">窗口即将自动关闭</p> : null}
       </DialogContent>
     </Dialog>
   );

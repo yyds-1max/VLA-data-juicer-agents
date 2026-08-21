@@ -366,7 +366,7 @@ export function ParameterDefinitionEditor({ definitions, disabled = false, onCha
     let suffix = 1;
     while (groupOptions.some((group) => group.key === `custom_group_${suffix}`)) suffix += 1;
     const middleOrders = groupOptions.filter((group) => group.key !== "common" && group.key !== "other").map((group) => group.order);
-    const group: TrainingParameterGroup = { key: `custom_group_${suffix}`, label: name, order: Math.min(990, Math.max(500, ...middleOrders) + 10), collapsed: true, custom: true, hint: "模型注册时创建的自定义参数分组。" };
+    const group: TrainingParameterGroup = { key: `custom_group_${suffix}`, label: name, order: Math.min(990, Math.max(500, ...middleOrders) + 10), collapsed: true, custom: true, hint: "配置模型族时创建的自定义参数分组。" };
     onChange(definitions.map((parameter) => parameter === target ? assignTrainingParameterGroup(parameter, group) : parameter));
     setOpenGroups((current) => ({ ...current, [group.key]: true }));
     setNewGroupTargetKey(null);
