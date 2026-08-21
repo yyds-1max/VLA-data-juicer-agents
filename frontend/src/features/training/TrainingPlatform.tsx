@@ -14,7 +14,6 @@ import {
   RefreshCw,
   Search,
   Server,
-  Square,
   Terminal,
   UploadCloud,
   X,
@@ -28,8 +27,6 @@ import {
   createTrainingRun,
   getTrainingCapabilities,
   getTrainingRun,
-  getTrainingRunLogs,
-  getTrainingRunMetrics,
   getTrainingServerResources,
   listTrainingModels,
   listTrainingDatasetReplicas,
@@ -42,11 +39,10 @@ import {
   pauseTrainingDatasetTransfer,
   previewTrainingRun,
   retryTrainingDatasetTransfer,
-  stopTrainingRun,
   updateTrainingModel,
   verifyTrainingModel,
 } from "../../api/client";
-import type { TrainingCapabilities, TrainingDataAccessMode, TrainingDatasetReplica, TrainingDatasetTransfer, TrainingGpuResource, TrainingMetricSample, TrainingModel, TrainingNode, TrainingParameterDefinition, TrainingRun, TrainingRunLog, TrainingRunPreview, TrainingServer, TrainingServerResources, TrainingStageInputSource } from "../../api/types";
+import type { TrainingCapabilities, TrainingDataAccessMode, TrainingDatasetReplica, TrainingDatasetTransfer, TrainingGpuResource, TrainingModel, TrainingNode, TrainingParameterDefinition, TrainingRun, TrainingRunPreview, TrainingServer, TrainingServerResources, TrainingStageInputSource } from "../../api/types";
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
 import { ProgressBar } from "../../components/console/ProgressBar";
@@ -68,6 +64,7 @@ import { actionableTransferStatuses, activeTransferStatuses, TrainingDatasetTran
 import { TrainingDataReviewPanel } from "./TrainingDataReviewPanel";
 import { TrainingOperationFeedback, type TrainingOperationState } from "./TrainingOperationFeedback";
 import { TrainingOperationDialog } from "./TrainingOperationDialog";
+import { TrainingRunDetail } from "./TrainingRunDetail";
 
 type TrainingTab = "runs" | "new" | "data" | "models" | "nodes" | "resources";
 const tabs = [
@@ -528,37 +525,6 @@ function NewRunPanel({ models, servers, nodes, resourcesByServer, capabilities, 
   </div>;
 }
 
-function RunDetail({ run, canStop, onRunChange }: { run: TrainingRun; canStop: boolean; onRunChange: (run: TrainingRun) => void }) {
-  const [logs, setLogs] = useState<TrainingRunLog[]>([]); const [metrics, setMetrics] = useState<TrainingMetricSample[]>([]); const [error, setError] = useState<string | null>(null); const [busy, setBusy] = useState(false);
-  const [selectedStageRef, setSelectedStageRef] = useState("");
-  const lastLogSeq = useRef(0); const lastMetricSeq = useRef(0);
-  useEffect(() => { setLogs([]); setMetrics([]); lastLogSeq.current = 0; lastMetricSeq.current = 0; setError(null); setSelectedStageRef(""); }, [run.run_ref]);
-  useEffect(() => { let alive = true; const load = async () => { try { const [nextRun, nextLogs, nextMetrics] = await Promise.all([getTrainingRun(run.run_ref), getTrainingRunLogs(run.run_ref, lastLogSeq.current), getTrainingRunMetrics(run.run_ref, lastMetricSeq.current)]); if (!alive) return; onRunChange(nextRun); if (nextLogs.length) { lastLogSeq.current = Math.max(lastLogSeq.current, ...nextLogs.map((item) => item.seq)); setLogs((current) => [...current, ...nextLogs.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq)); } if (nextMetrics.length) { lastMetricSeq.current = Math.max(lastMetricSeq.current, ...nextMetrics.map((item) => item.seq)); setMetrics((current) => [...current, ...nextMetrics.filter((item) => !current.some((known) => known.seq === item.seq))].sort((a, b) => a.seq - b.seq)); } } catch (caught) { if (alive) setError(errorText(caught)); } }; void load(); const interval = window.setInterval(() => void load(), activeStatuses.has(run.status) ? 2000 : 8000); return () => { alive = false; window.clearInterval(interval); }; }, [run.run_ref, run.status, onRunChange]);
-  const selectedStage = run.stages.find((stage) => stage.stage_ref === selectedStageRef) ?? run.stages.find((stage) => stage.stage_number === run.current_stage_number) ?? run.stages[0];
-  const stageMetrics = selectedStage ? metrics.filter((item) => !item.stage_ref || item.stage_ref === selectedStage.stage_ref) : metrics;
-  const stageLogs = selectedStage ? logs.filter((item) => !item.stage_ref || item.stage_ref === selectedStage.stage_ref) : logs;
-  const stop = async () => { if (!canStop || !window.confirm("确定停止此训练任务吗？系统会终止当前阶段，并取消所有尚未执行的阶段；已写入的指标、日志和 checkpoint 会保留。")) return; setBusy(true); try { onRunChange(await stopTrainingRun(run.run_ref, run.state_revision)); } catch (caught) { setError(errorText(caught)); } finally { setBusy(false); } };
-  const lossMetrics = stageMetrics.filter((item) => item.loss != null);
-  const learningRateMetrics = stageMetrics.filter((item) => item.learning_rate != null);
-  const gpuUtilizationMetrics = stageMetrics.filter((item) => item.gpu_utilization_percent != null);
-  const gpuMemoryMetrics = stageMetrics.filter((item) => item.gpu_memory_mib != null);
-  const metricLabel = (item: TrainingMetricSample) => item.step != null ? String(item.step) : `#${item.seq}`;
-  const lossData = lossMetrics.length ? { labels: lossMetrics.map(metricLabel), data: lossMetrics.map((item) => item.loss ?? 0), label: "Loss", color: "#6d5bd0" } : null;
-  const lrData = learningRateMetrics.length ? { labels: learningRateMetrics.map(metricLabel), data: learningRateMetrics.map((item) => item.learning_rate ?? 0), label: "Learning rate", color: "#b7791f" } : null;
-  const gpuUtilizationData = gpuUtilizationMetrics.length ? { labels: gpuUtilizationMetrics.map(metricLabel), data: gpuUtilizationMetrics.map((item) => item.gpu_utilization_percent ?? 0), label: "GPU 利用率", color: "#0284c7" } : null;
-  const gpuMemoryData = gpuMemoryMetrics.length ? { labels: gpuMemoryMetrics.map(metricLabel), data: gpuMemoryMetrics.map((item) => item.gpu_memory_mib ?? 0), label: "GPU 显存 MiB", color: "#059669" } : null;
-  const stageArtifacts = (run.artifacts ?? []).filter((artifact) => !selectedStage || !artifact.stage_ref || artifact.stage_ref === selectedStage.stage_ref);
-  const stepLimited = usesStepLimit(run);
-  return <div className="space-y-4"><ConsoleCard className="shadow-none"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2"><h2 className="text-lg font-semibold text-console-text">{runModelDisplayName(run)}</h2><StatusTag tone={statusMeta[run.status].tone}>{statusMeta[run.status].label}</StatusTag></div><p className="mt-1 text-sm text-console-muted">任务 {run.run_ref}</p></div>{canStop && activeStatuses.has(run.status) ? <ConsoleButton variant="ghost" onClick={() => void stop()} disabled={busy}><Square className="h-4 w-4" />停止训练</ConsoleButton> : null}</div>{run.execution_mode === "real" && run.execution_control_status && run.execution_control_status !== "connected" ? <div role="status" className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"><span className="font-medium">Worker 状态待确认：</span>{run.execution_control_status === "unresolved" ? "Worker 重启后尚未确认训练进程身份，平台不会擅自启动新的进程或释放资源。" : "Worker 与中心服务暂时失联，训练可能仍在节点继续执行。"}{run.execution_control_message ? ` ${run.execution_control_message}` : ""}</div> : null}{error ? <p role="alert" className="mt-3 text-sm text-rose-700">{error}</p> : null}<div className="mt-4 rounded-md border border-console-line bg-console-panel2 px-3 py-3"><p className="text-xs font-medium text-console-muted">本次训练说明</p><p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-console-text">{run.version_description?.trim() || "历史任务未填写训练说明。"}</p></div><div className={cn("mt-5 grid divide-y divide-console-line border-y border-console-line sm:grid-cols-2 sm:divide-x sm:divide-y-0", stepLimited ? "xl:grid-cols-3" : "xl:grid-cols-4")}>{!stepLimited ? <div className="py-3 sm:px-4 sm:first:pl-0"><p className="text-xs text-console-muted">Epoch</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatEpoch(run.current_epoch)}/{run.total_epochs > 0 ? formatEpoch(run.total_epochs) : "--"}</p></div> : null}<div className="py-3 sm:px-4 sm:first:pl-0"><p className="text-xs text-console-muted">Step</p><p className="text-xl font-semibold tabular-nums text-console-text">{run.current_step}/{run.total_steps}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">最新 Loss</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.loss)}</p></div><div className="py-3 sm:px-4"><p className="text-xs text-console-muted">学习率</p><p className="text-xl font-semibold tabular-nums text-console-text">{formatNumber(run.latest_metric?.learning_rate, 7)}</p></div></div><ProgressBar className="mt-4" value={run.progress_percent} tone="purple" label={`训练进度 ${run.progress_percent.toFixed(1)}%`} /></ConsoleCard>
-    <ConsoleCard><div className="flex flex-wrap gap-2" role="tablist" aria-label="任务训练阶段">{run.stages.map((stage) => <button key={stage.stage_ref} type="button" role="tab" aria-selected={selectedStage?.stage_ref === stage.stage_ref} className={cn("rounded-md border px-3 py-2 text-sm", selectedStage?.stage_ref === stage.stage_ref ? "border-console-cyan bg-blue-50 text-console-cyan" : "border-console-line text-console-muted")} onClick={() => setSelectedStageRef(stage.stage_ref)}>{stage.stage_name} · {stageStatusLabels[stage.status]}</button>)}</div>{selectedStage ? <><div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm text-console-muted"><span>阶段进度 <b className="text-console-text">{(selectedStage.progress_percent ?? (selectedStage.progress ?? 0) * 100).toFixed(1)}%</b></span><span>输出目录 <b className="font-mono text-console-text">{selectedStage.output_directory ?? "尚未生成"}</b></span></div>{selectedStage.failure_message ? <div role="alert" className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"><span className="font-medium">阶段失败：</span>{selectedStage.failure_message}</div> : null}</> : null}{run.version_model ? <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"><span className="font-medium">版本模型：</span><span className="font-mono">{run.version_model.output_directory}</span></div> : null}</ConsoleCard>
-    <div className="grid gap-4 xl:grid-cols-2">{lossData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">{selectedStage?.stage_name} · Loss</h3><MiniChart type="line" title="Loss" data={lossData} /></ConsoleCard> : <ConsoleCard><p className="text-sm text-console-muted">当前阶段暂无指标。</p></ConsoleCard>}{lrData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">学习率</h3><MiniChart type="line" title="学习率" data={lrData} /></ConsoleCard> : null}</div>
-    <div className="grid gap-4 xl:grid-cols-2">{gpuUtilizationData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">GPU 利用率</h3><MiniChart type="line" title="GPU 利用率" data={gpuUtilizationData} /></ConsoleCard> : null}{gpuMemoryData ? <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">GPU 显存</h3><MiniChart type="line" title="GPU 显存" data={gpuMemoryData} /></ConsoleCard> : null}</div>
-    <div className="grid gap-4 xl:grid-cols-2"><ConsoleCard><h3 className="mb-3 font-semibold text-console-text">{selectedStage?.stage_name}参数快照</h3><dl className="grid gap-2 text-sm sm:grid-cols-2">{Object.entries(selectedStage?.parameters ?? {}).map(([key, value]) => <div key={key} className="rounded-md bg-console-panel2 p-2"><dt className="text-console-muted">{key}</dt><dd className="mt-1 font-mono text-console-text">{String(value)}</dd></div>)}{!Object.keys(selectedStage?.parameters ?? {}).length ? <p className="text-console-muted">无可展示参数。</p> : null}</dl></ConsoleCard><ConsoleCard><h3 className="mb-3 font-semibold text-console-text">审计摘要</h3><div className="space-y-2 text-sm">{run.audit_events?.map((event, index) => <div key={`${event.created_at}-${index}`} className="rounded-md bg-console-panel2 p-2"><p className="font-medium text-console-text">{event.action}</p><p className="mt-1 text-console-muted">{event.summary} · {event.created_at}</p></div>)}{!run.audit_events?.length ? <p className="text-console-muted">暂无审计事件。</p> : null}</div></ConsoleCard></div>
-    <ConsoleCard><h3 className="mb-3 font-semibold text-console-text">训练产物</h3><div className="grid gap-2 text-sm sm:grid-cols-2">{stageArtifacts.map((artifact, index) => <div key={artifact.artifact_ref ?? `${artifact.kind}-${artifact.relative_path ?? artifact.output_directory ?? artifact.path ?? index}`} className="rounded-md bg-console-panel2 p-2"><p className="font-medium text-console-text">{artifact.kind === "checkpoint" ? "Checkpoint" : artifact.kind === "version_model" ? "版本模型" : "阶段输出"}{artifact.step != null ? ` · step ${artifact.step}` : ""}</p><p className="mt-1 break-all font-mono text-xs text-console-muted">{artifact.relative_path ?? artifact.output_directory ?? artifact.path ?? "路径待 Worker 上报"}</p></div>)}{!stageArtifacts.length && run.version_model ? <div className="rounded-md bg-console-panel2 p-2"><p className="font-medium text-console-text">版本模型</p><p className="mt-1 break-all font-mono text-xs text-console-muted">{run.version_model.output_directory}</p></div> : null}{!stageArtifacts.length && !run.version_model ? <p className="text-console-muted">当前阶段尚未上报训练产物。</p> : null}</div></ConsoleCard>
-    <ConsoleCard><div className="mb-3 flex items-center gap-2"><Terminal className="h-4 w-4 text-console-cyan" /><h3 className="font-semibold text-console-text">{selectedStage?.stage_name}训练日志</h3></div><div className="max-h-64 overflow-auto rounded-md bg-slate-950 p-3 font-mono text-xs leading-6 text-slate-100">{stageLogs.length ? stageLogs.map((item) => <p key={item.seq}><span className="text-slate-500">[{item.seq}]</span> {item.message}</p>) : "等待日志…"}</div></ConsoleCard>
-  </div>;
-}
-
 function TrainingRunDescriptionPopover({ run }: { run: TrainingRun }) {
   return <Popover>
     <PopoverTrigger asChild>
@@ -590,10 +556,7 @@ function RunsPanel({ runs, selectedRun, canStop, canCreate, onCreate, onSelect, 
 
   if (selectedRun) {
     return (
-      <div>
-        <ConsoleButton variant="ghost" className="mb-3" onClick={() => onSelect(null)}>返回任务列表</ConsoleButton>
-        <RunDetail run={selectedRun} canStop={canStop} onRunChange={onRunChange} />
-      </div>
+      <TrainingRunDetail run={selectedRun} canStop={canStop} onBack={() => onSelect(null)} onRunChange={onRunChange} />
     );
   }
 

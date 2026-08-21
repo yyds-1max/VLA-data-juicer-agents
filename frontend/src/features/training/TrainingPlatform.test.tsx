@@ -1459,6 +1459,7 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("加入 8 月新增数据，并调整轨迹损失权重。")).toBeVisible();
     expect(screen.queryByText("Epoch")).not.toBeInTheDocument();
     expect(screen.getAllByText("num_video_frames")[0]).toBeVisible();
+    fireEvent.click(screen.getByText("技术详情与 RunSpec"));
     expect(screen.getByText("模拟训练已启动 · 2026-08-06T00:01:00Z")).toBeVisible();
     expect(screen.getByRole("heading", { name: "GPU 利用率" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "GPU 显存" })).toBeVisible();
@@ -1489,7 +1490,7 @@ describe("TrainingPlatform", () => {
     expect(screen.getByText("train_vision")).toBeVisible();
     expect(screen.getByText("vision complete")).toBeVisible();
     expect(screen.queryByText("language running")).not.toBeInTheDocument();
-    expect(screen.getByText(stageOne.output_directory)).toBeVisible();
+    expect(screen.getAllByText(stageOne.output_directory)[0]).toBeVisible();
   });
 
   it("opens a run detail from /model/runs/:runRef and returns to /model", async () => {
