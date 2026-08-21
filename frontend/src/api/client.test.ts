@@ -12,6 +12,10 @@ import {
   interruptTurn,
   requestTrainingDirectoryListing,
   listSessions,
+  listTrainingModelVersionFamilies,
+  listTrainingModelVersions,
+  getTrainingModelVersion,
+  inspectTrainingModelVersionArtifact,
   openSessionEvents,
   openTrainingEvents,
   resetNavigationDataset,
@@ -388,5 +392,27 @@ describe("api client", () => {
     expect(getSyncImageUrl("2026/06 29", "clip/1", "seq 1/left", "frame 1.png")).toBe(
       "/api/navigation/datasets/2026%2F06%2029/clips/clip%2F1/sync-images/seq%201%2Fleft/frame%201.png",
     );
+  });
+
+  it("queries model-version families and family versions with cursor pagination", async () => {
+    const fetchMock = mockFetchJson({ families: [], next_after: "family-next" });
+    await expect(listTrainingModelVersionFamilies({ query: "Na VILA", after: "family/1", limit: 20 })).resolves.toEqual({ families: [], next_after: "family-next" });
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/training/model-version-families?query=Na+VILA&after=family%2F1&limit=20", { headers: { "content-type": "application/json" } });
+
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK", text: () => Promise.resolve(JSON.stringify({ versions: [], next_after: null })) });
+    await expect(listTrainingModelVersions("family/with space", { after: "version/1", limit: 6 })).resolves.toEqual({ versions: [], next_after: null });
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/training/model-version-families/family%2Fwith%20space/versions?after=version%2F1&limit=6", { headers: { "content-type": "application/json" } });
+  });
+
+  it("gets a model version and starts an idempotent artifact inspection", async () => {
+    const version = { version_ref: "version/7" };
+    const fetchMock = mockFetchJson({ version });
+    await expect(getTrainingModelVersion("version/7")).resolves.toEqual(version);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/training/model-versions/version%2F7", { headers: { "content-type": "application/json" } });
+
+    const result = { inspection: { inspection_ref: "inspection-1" } };
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, statusText: "OK", text: () => Promise.resolve(JSON.stringify(result)) });
+    await expect(inspectTrainingModelVersionArtifact("version/7")).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/training/model-versions/version%2F7/artifact-checks", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "Idempotency-Key": expect.any(String), "content-type": "application/json" }) }));
   });
 });

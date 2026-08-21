@@ -130,6 +130,25 @@ class TrainingServiceProtocol(Protocol):
         self, family_ref: str, *, include_private: bool = False
     ) -> dict[str, Any]: ...
 
+    def list_model_version_families(
+        self, *, query: str | None, after: str | None, limit: int,
+        principal: TrainingPrincipal,
+    ) -> dict[str, Any]: ...
+
+    def list_model_versions(
+        self, family_ref: str, *, after: str | None, limit: int,
+        principal: TrainingPrincipal,
+    ) -> dict[str, Any]: ...
+
+    def get_model_version(
+        self, version_ref: str, principal: TrainingPrincipal
+    ) -> dict[str, Any]: ...
+
+    def request_model_version_artifact_inspection(
+        self, version_ref: str, idempotency_key: str,
+        principal: TrainingPrincipal,
+    ) -> dict[str, Any]: ...
+
     def create_model(
         self, payload: Any, principal: TrainingPrincipal
     ) -> dict[str, Any]: ...
@@ -381,6 +400,7 @@ class NodeCapabilities(StrictRequest):
     conda_environments: list[str] = Field(default_factory=list, max_length=100)
     worker_features: list[str] = Field(default_factory=list, max_length=100)
     training_execution_v1: bool = False
+    training_artifact_inspection_v1: bool = False
 
     @field_validator(
         "hostname",
@@ -595,6 +615,14 @@ class WorkerCommandResultRequest(StrictRequest):
     directories: list[dict[str, Any]] | None = Field(default=None, max_length=10000)
     progress: dict[str, Any] | None = None
     replica: dict[str, Any] | None = None
+    artifact_ref: str | None = Field(default=None, max_length=200)
+    version_ref: str | None = Field(default=None, max_length=200)
+    availability: Literal[
+        "available", "missing", "unreadable", "unsafe", "check_failed"
+    ] | None = None
+    file_count: Annotated[int, Field(strict=True, ge=0)] | None = None
+    total_bytes: Annotated[int, Field(strict=True, ge=0)] | None = None
+    reason: str | None = Field(default=None, max_length=200)
     error: dict[str, Any] | None = None
 
 
@@ -1622,6 +1650,78 @@ def create_training_router(
             ]
         }
 
+    @router.get("/model-version-families")
+    def list_model_version_families(
+        query: str | None = Query(default=None, max_length=200),
+        after: str | None = Query(default=None, max_length=200),
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        principal = get_principal()
+        page = _translate(
+            service.list_model_version_families,
+            query=query.strip() if query else None,
+            after=after,
+            limit=limit,
+            principal=principal,
+        )
+        families = page.get("families") if isinstance(page, dict) else None
+        if not isinstance(families, list):
+            raise TypeError("training service returned an invalid version family page")
+        return {
+            "families": [
+                _model_version_family_projection(item, principal)
+                for item in families
+                if isinstance(item, dict)
+            ],
+            "next_after": page.get("next_after"),
+        }
+
+    @router.get("/model-version-families/{family_ref}/versions")
+    def list_model_versions(
+        family_ref: str,
+        after: str | None = Query(default=None, max_length=200),
+        limit: int = Query(default=6, ge=1, le=100),
+    ) -> dict[str, Any]:
+        principal = get_principal()
+        page = _translate(
+            service.list_model_versions,
+            family_ref,
+            after=after,
+            limit=limit,
+            principal=principal,
+        )
+        versions = page.get("versions") if isinstance(page, dict) else None
+        if not isinstance(versions, list):
+            raise TypeError("training service returned an invalid model version page")
+        return {
+            "versions": [
+                _model_version_projection(item, principal)
+                for item in versions
+                if isinstance(item, dict)
+            ],
+            "next_after": page.get("next_after"),
+        }
+
+    @router.get("/model-versions/{version_ref}")
+    def get_model_version(version_ref: str) -> dict[str, Any]:
+        principal = get_principal()
+        version = _translate(service.get_model_version, version_ref, principal)
+        if not isinstance(version, dict):
+            raise TypeError("training service returned an invalid model version")
+        return {"version": _model_version_projection(version, principal)}
+
+    @router.post("/model-versions/{version_ref}/artifact-checks", status_code=202)
+    def request_model_version_artifact_inspection(
+        version_ref: str, idempotency_key: IdempotencyKey
+    ) -> dict[str, Any]:
+        inspection = _translate(
+            service.request_model_version_artifact_inspection,
+            version_ref,
+            idempotency_key,
+            get_principal(),
+        )
+        return {"inspection": inspection}
+
     @router.get("/models/{family_ref}")
     def get_model(family_ref: str) -> dict[str, Any]:
         principal = get_principal()
@@ -2075,6 +2175,7 @@ def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
         "status": model.get("status", "draft"),
         "edit_revision": int(model.get("edit_revision", 1)),
         "trained_version_count": int(model.get("trained_version_count", 0)),
+        "available_version_count": int(model.get("available_version_count", 0)),
         "created_at": model.get("created_at"),
         "updated_at": model.get("updated_at"),
         "data_access_mode": model.get("data_access_mode", "self_managed"),
@@ -2340,10 +2441,12 @@ def _safe_event(raw_event: Any) -> dict[str, Any]:
         "dataset.replica.ready",
         "dataset.replica.removed",
     }
+    model_version_event_types = {"model.version.artifact.updated"}
     if (
         type(event_id) is not int
         or event_id < 1
-        or event_type not in run_event_types | dataset_event_types
+        or event_type
+        not in run_event_types | dataset_event_types | model_version_event_types
         or (event_type in run_event_types and not isinstance(run_ref, str))
     ):
         raise TypeError("training service returned an invalid event")
@@ -2353,6 +2456,16 @@ def _safe_event(raw_event: Any) -> dict[str, Any]:
     }
     if event_type in run_event_types:
         event["run_ref"] = run_ref
+    elif event_type in model_version_event_types:
+        version_ref = raw_event.get("version_ref", payload.get("version_ref"))
+        if not isinstance(version_ref, str) or not _SAFE_REF.fullmatch(version_ref):
+            raise TypeError("training service returned an invalid event")
+        event["version_ref"] = version_ref
+        for field in ("status", "availability"):
+            value = raw_event.get(field, payload.get(field))
+            if isinstance(value, str) and len(value) <= 50:
+                event[field] = value
+        return event
     else:
         for field in ("transfer_ref", "replica_ref", "release_ref", "status"):
             value = raw_event.get(field, payload.get(field))
@@ -2431,6 +2544,65 @@ def _model_projection(
                 if key in template
             }
         projected["configuration"] = safe_configuration
+    return projected
+
+
+def _model_version_family_projection(
+    family: dict[str, Any], principal: TrainingPrincipal
+) -> dict[str, Any]:
+    projected = dict(family)
+    latest = projected.get("latest_version")
+    if isinstance(latest, dict):
+        safe_latest = _model_version_projection(latest, principal)
+        projected["latest_version"] = {
+            key: safe_latest.get(key)
+            for key in (
+                "version_ref", "version_label", "version_description", "finished_at"
+            )
+        }
+    return projected
+
+
+def _model_version_projection(
+    version: dict[str, Any], principal: TrainingPrincipal
+) -> dict[str, Any]:
+    projected = dict(version)
+    if principal.can("training:create_runs"):
+        return projected
+    artifact = projected.get("default_artifact")
+    if isinstance(artifact, dict):
+        safe_artifact = dict(artifact)
+        safe_artifact.pop("path", None)
+        safe_artifact.pop("message", None)
+        projected["default_artifact"] = safe_artifact
+    stages = projected.get("stages")
+    if isinstance(stages, list):
+        projected["stages"] = [
+            {
+                key: stage.get(key)
+                for key in (
+                    "stage_ref", "stage_number", "stage_name", "status",
+                    "current_step", "total_steps", "progress", "failure_code",
+                    "failure_message", "started_at", "finished_at"
+                )
+            }
+            for stage in stages
+            if isinstance(stage, dict)
+        ]
+    artifacts = projected.get("artifacts")
+    if isinstance(artifacts, list):
+        projected["artifacts"] = [
+            {
+                key: artifact_item.get(key)
+                for key in (
+                    "artifact_ref", "kind", "stage_ref", "stage_number", "step",
+                    "relative_path", "created_at"
+                )
+                if key in artifact_item
+            }
+            for artifact_item in artifacts
+            if isinstance(artifact_item, dict)
+        ]
     return projected
 
 

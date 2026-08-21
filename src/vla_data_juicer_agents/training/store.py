@@ -1206,6 +1206,17 @@ class TrainingStore:
     _MODEL_SELECT = """SELECT model.*,family.family_ref,family.name AS family_name,
       (SELECT COUNT(*) FROM model_versions AS version
        WHERE version.family_id=family.id) AS trained_version_count,
+      (SELECT COUNT(*) FROM model_versions AS available_version
+       JOIN training_runs AS available_run ON available_run.id=available_version.run_id
+       WHERE available_version.family_id=family.id
+         AND available_run.execution_mode='real'
+         AND available_run.status='succeeded'
+         AND EXISTS(
+           SELECT 1 FROM training_artifacts AS available_artifact
+           WHERE available_artifact.version_id=available_version.id
+             AND available_artifact.kind='version_model'
+             AND available_artifact.simulated=0
+         )) AS available_version_count,
       verification.verification_ref AS verification_ref,
       verification.status AS verification_status,
       verification.result_json AS verification_result_json,
@@ -1231,6 +1242,7 @@ class TrainingStore:
             "status": row["status"],
             "edit_revision": int(row["current_revision"]),
             "trained_version_count": int(row["trained_version_count"]),
+            "available_version_count": int(row["available_version_count"]),
             "configuration_editable": row["status"] != "disabled",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1700,6 +1712,457 @@ class TrainingStore:
     def get_run(self, run_ref: str) -> dict[str, Any]:
         with self.connection() as db:
             return self._get_run_in(db, run_ref)
+
+    def list_model_version_families(
+        self, *, query: str | None, after: str | None, limit: int
+    ) -> dict[str, Any]:
+        offset = self._offset_cursor(after)
+        values: list[Any] = []
+        where = ""
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where = "WHERE family.name LIKE ? ESCAPE '\\'"
+            values.append(f"%{escaped}%")
+        with self.connection() as db:
+            rows = db.execute(
+                f"""SELECT family.family_ref,family.name AS family_name,
+                COUNT(version.id) AS available_version_count,
+                MAX(run.finished_at) AS latest_finished_at
+                FROM model_families AS family
+                LEFT JOIN model_versions AS version ON version.family_id=family.id
+                  AND EXISTS(
+                    SELECT 1 FROM training_runs AS candidate_run
+                    JOIN training_artifacts AS candidate_artifact
+                      ON candidate_artifact.version_id=version.id
+                     AND candidate_artifact.kind='version_model'
+                     AND candidate_artifact.simulated=0
+                    WHERE candidate_run.id=version.run_id
+                      AND candidate_run.execution_mode='real'
+                      AND candidate_run.status='succeeded'
+                  )
+                LEFT JOIN training_runs AS run ON run.id=version.run_id
+                {where}
+                GROUP BY family.id
+                ORDER BY (MAX(run.finished_at) IS NULL),MAX(run.finished_at) DESC,
+                         family.updated_at DESC,family.id DESC
+                LIMIT ? OFFSET ?""",
+                (*values, limit + 1, offset),
+            ).fetchall()
+            families: list[dict[str, Any]] = []
+            for row in rows[:limit]:
+                latest_rows = self._version_library_rows_in(
+                    db, str(row["family_ref"]), offset=0, limit=1
+                )
+                families.append(
+                    {
+                        "family_ref": row["family_ref"],
+                        "family_name": row["family_name"],
+                        "available_version_count": int(row["available_version_count"]),
+                        "latest_finished_at": row["latest_finished_at"],
+                        "latest_version": (
+                            self._model_version_projection_in(db, latest_rows[0], detail=False)
+                            if latest_rows
+                            else None
+                        ),
+                    }
+                )
+        return {
+            "families": families,
+            "next_after": str(offset + limit) if len(rows) > limit else None,
+        }
+
+    def list_model_versions(
+        self, family_ref: str, *, after: str | None, limit: int
+    ) -> dict[str, Any]:
+        offset = self._offset_cursor(after)
+        with self.connection() as db:
+            family = db.execute(
+                "SELECT id FROM model_families WHERE family_ref=?", (family_ref,)
+            ).fetchone()
+            if family is None:
+                raise TrainingNotFoundError(
+                    "model_family_not_found", "The model family was not found."
+                )
+            rows = self._version_library_rows_in(
+                db, family_ref, offset=offset, limit=limit + 1
+            )
+            versions = [
+                self._model_version_projection_in(db, row, detail=False)
+                for row in rows[:limit]
+            ]
+        return {
+            "versions": versions,
+            "next_after": str(offset + limit) if len(rows) > limit else None,
+        }
+
+    def get_model_version(self, version_ref: str) -> dict[str, Any]:
+        with self.connection() as db:
+            row = db.execute(
+                self._VERSION_LIBRARY_SELECT + " AND version.version_ref=?",
+                (version_ref,),
+            ).fetchone()
+            if row is None:
+                raise TrainingNotFoundError(
+                    "model_version_not_found",
+                    "The available model version was not found.",
+                )
+            return self._model_version_projection_in(db, row, detail=True)
+
+    @staticmethod
+    def _offset_cursor(after: str | None) -> int:
+        if not after:
+            return 0
+        try:
+            return max(0, int(after))
+        except ValueError as exc:
+            raise TrainingConflictError(
+                "invalid_pagination_cursor", "The pagination cursor is invalid."
+            ) from exc
+
+    _VERSION_LIBRARY_SELECT = """SELECT
+      version.id AS version_id,version.version_ref,version.version_number,
+      version.version_date,version.version_label,version.description,
+      family.family_ref,family.name AS family_name,
+      run.id AS run_id,run.run_ref,run.server_ref,run.gpu_uuids_json,
+      run.started_at,run.finished_at,run.created_at,
+      artifact.id AS artifact_id,artifact.artifact_ref,artifact.path AS artifact_path,
+      artifact.created_at AS artifact_created_at
+      FROM model_versions AS version
+      JOIN model_families AS family ON family.id=version.family_id
+      JOIN training_runs AS run ON run.id=version.run_id
+      JOIN training_artifacts AS artifact ON artifact.id=(
+        SELECT latest.id FROM training_artifacts AS latest
+        WHERE latest.version_id=version.id AND latest.kind='version_model'
+          AND latest.simulated=0 ORDER BY latest.id DESC LIMIT 1
+      )
+      WHERE run.execution_mode='real' AND run.status='succeeded'"""
+
+    def _version_library_rows_in(
+        self,
+        db: sqlite3.Connection,
+        family_ref: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        return db.execute(
+            self._VERSION_LIBRARY_SELECT
+            + " AND family.family_ref=? ORDER BY version.version_number DESC LIMIT ? OFFSET ?",
+            (family_ref, limit, offset),
+        ).fetchall()
+
+    def _model_version_projection_in(
+        self, db: sqlite3.Connection, row: sqlite3.Row, *, detail: bool
+    ) -> dict[str, Any]:
+        run = self._get_run_in(db, str(row["run_ref"]))
+        metric_rows = db.execute(
+            """SELECT metric_payload_json,step,total_steps,epoch,loss,learning_rate,
+            grad_norm,elapsed_seconds,created_at FROM metric_samples
+            WHERE run_id=? ORDER BY seq DESC LIMIT 2000""",
+            (row["run_id"],),
+        ).fetchall()
+        metric: dict[str, Any] = {}
+        metric_fields = (
+            "step",
+            "total_steps",
+            "epoch",
+            "loss",
+            "learning_rate",
+            "grad_norm",
+            "elapsed_seconds",
+        )
+        for candidate in metric_rows:
+            payload = (
+                json.loads(candidate["metric_payload_json"])
+                if candidate["metric_payload_json"]
+                else {}
+            )
+            if not isinstance(payload, dict) or not any(
+                payload.get(key) is not None
+                for key in ("step", "loss", "learning_rate", "epoch", "grad_norm")
+            ):
+                continue
+            metric.setdefault("created_at", candidate["created_at"])
+            for key in metric_fields:
+                if key not in metric and payload.get(key) is not None:
+                    metric[key] = payload[key]
+            if all(key in metric for key in metric_fields):
+                break
+        if metric:
+            for key in metric_fields:
+                metric.setdefault(key, None)
+        if not metric:
+            final_stage = run["stages"][-1] if run.get("stages") else {}
+            metric = {
+                "step": final_stage.get("current_step"),
+                "total_steps": final_stage.get("total_steps"),
+                "loss": None,
+                "learning_rate": None,
+            }
+
+        manifest = ((run.get("dataset_snapshot") or {}).get("manifest") or {})
+        splits = manifest.get("splits") if isinstance(manifest, dict) else {}
+        splits = splits if isinstance(splits, dict) else {}
+        train_dates = self._dataset_dates(splits.get("train"))
+        test_dates = self._dataset_dates(splits.get("test"))
+        artifacts = list(run.get("artifacts") or [])
+        checkpoints = [item for item in artifacts if item.get("kind") == "checkpoint"]
+        inspection = db.execute(
+            """SELECT * FROM training_artifact_inspections
+            WHERE artifact_id=? ORDER BY id DESC LIMIT 1""",
+            (row["artifact_id"],),
+        ).fetchone()
+        artifact = self._artifact_projection(row, inspection)
+        node_row = db.execute(
+            "SELECT * FROM training_nodes WHERE node_ref=?", (row["server_ref"],)
+        ).fetchone()
+        node = self._safe_node(node_row) if node_row is not None else None
+        capabilities = (node or {}).get("capabilities") or {}
+        features = capabilities.get("worker_features") or []
+        inspection_supported = bool(
+            capabilities.get("training_artifact_inspection_v1") is True
+            or "training_artifact_inspection_v1" in features
+        )
+        duration_seconds = self._duration_seconds(row["started_at"], row["finished_at"])
+        result: dict[str, Any] = {
+            "version_ref": row["version_ref"],
+            "version_number": int(row["version_number"]),
+            "version_date": row["version_date"],
+            "version_label": row["version_label"],
+            "version_description": row["description"],
+            "family_ref": row["family_ref"],
+            "family_name": row["family_name"],
+            "run_ref": row["run_ref"],
+            "server_ref": row["server_ref"],
+            "server_name": run.get("server_name", row["server_ref"]),
+            "gpu_uuids": json.loads(row["gpu_uuids_json"]),
+            "finished_at": row["finished_at"],
+            "started_at": row["started_at"],
+            "duration_seconds": duration_seconds,
+            "stage_count": int(run.get("stage_count") or 0),
+            "final_step": metric.get("step"),
+            "final_total_steps": metric.get("total_steps"),
+            "final_loss": metric.get("loss"),
+            "final_learning_rate": metric.get("learning_rate"),
+            "final_epoch": metric.get("epoch"),
+            "train_date_count": len(train_dates),
+            "test_date_count": len(test_dates),
+            "checkpoint_count": len(checkpoints),
+            "default_artifact": artifact,
+            "node_status": (node or {}).get("status", "offline"),
+            "artifact_inspection_supported": inspection_supported,
+        }
+        if detail:
+            result.update(
+                {
+                    "dataset_snapshot": {
+                        "snapshot_ref": (run.get("dataset_snapshot") or {}).get("snapshot_ref"),
+                        "train_dates": train_dates,
+                        "test_dates": test_dates,
+                    },
+                    "stages": run.get("stages") or [],
+                    "artifacts": artifacts,
+                    "final_metric": metric,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _dataset_dates(entries: Any) -> list[str]:
+        if not isinstance(entries, list):
+            return []
+        return [
+            str(item["dataset_date"])
+            for item in entries
+            if isinstance(item, dict) and item.get("dataset_date") is not None
+        ]
+
+    @staticmethod
+    def _duration_seconds(started_at: Any, finished_at: Any) -> float | None:
+        if not started_at or not finished_at:
+            return None
+        try:
+            return max(
+                0.0,
+                (datetime.fromisoformat(str(finished_at)) - datetime.fromisoformat(str(started_at))).total_seconds(),
+            )
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _artifact_projection(
+        version_row: sqlite3.Row, inspection: sqlite3.Row | None
+    ) -> dict[str, Any]:
+        availability = "unchecked"
+        if inspection is not None:
+            if inspection["status"] in {"queued", "running"}:
+                availability = "checking"
+            elif inspection["status"] == "failed":
+                availability = "check_failed"
+            else:
+                availability = inspection["availability"]
+        return {
+            "artifact_ref": version_row["artifact_ref"],
+            "kind": "version_model",
+            "path": version_row["artifact_path"],
+            "status": availability,
+            "file_count": inspection["file_count"] if inspection is not None else None,
+            "total_bytes": inspection["total_bytes"] if inspection is not None else None,
+            "checked_at": inspection["finished_at"] if inspection is not None else None,
+            "message": inspection["error_message"] if inspection is not None else None,
+            "inspection_ref": inspection["inspection_ref"] if inspection is not None else None,
+        }
+
+    def request_model_version_artifact_inspection(
+        self, version_ref: str, idempotency_key: str, actor: str
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        digest = payload_hash({"version_ref": version_ref})
+        with self.transaction() as db:
+            version = db.execute(
+                self._VERSION_LIBRARY_SELECT + " AND version.version_ref=?",
+                (version_ref,),
+            ).fetchone()
+            if version is None:
+                raise TrainingNotFoundError(
+                    "model_version_not_found",
+                    "The available model version was not found.",
+                )
+            replay = db.execute(
+                """SELECT payload_sha256,response_ref FROM training_idempotency
+                WHERE scope='artifact_inspection' AND idempotency_key=?""",
+                (idempotency_key,),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload_sha256"] != digest:
+                    raise TrainingConflictError(
+                        "idempotency_conflict",
+                        "This idempotency key was already used for another artifact check.",
+                    )
+                return self._get_artifact_inspection_in(db, str(replay["response_ref"]))
+
+            active = db.execute(
+                """SELECT * FROM training_artifact_inspections
+                WHERE artifact_id=? AND status IN ('queued','running')
+                ORDER BY id DESC LIMIT 1""",
+                (version["artifact_id"],),
+            ).fetchone()
+            if active is not None:
+                inspection_ref = str(active["inspection_ref"])
+                db.execute(
+                    """INSERT INTO training_idempotency(
+                    scope,idempotency_key,payload_sha256,response_ref,created_at)
+                    VALUES('artifact_inspection',?,?,?,?)""",
+                    (idempotency_key, digest, inspection_ref, timestamp),
+                )
+                return self._get_artifact_inspection_in(db, inspection_ref)
+
+            node = self._require_online_node_in(db, str(version["server_ref"]))
+            stage = db.execute(
+                """SELECT stage.run_spec_json FROM training_stages AS stage
+                WHERE stage.run_id=? AND stage.status='succeeded'
+                ORDER BY stage.stage_number DESC LIMIT 1""",
+                (version["run_id"],),
+            ).fetchone()
+            if stage is None:
+                raise TrainingConflictError(
+                    "model_version_artifact_invalid",
+                    "The model version has no successful final training stage.",
+                )
+            spec = json.loads(stage["run_spec_json"])
+            output_root = spec.get("output_root")
+            if not isinstance(output_root, str) or not output_root:
+                raise TrainingConflictError(
+                    "model_version_artifact_invalid",
+                    "The model version output root is unavailable.",
+                )
+            command_ref = self._insert_node_command(
+                db,
+                node,
+                "inspect_training_artifact",
+                {
+                    "artifact_ref": version["artifact_ref"],
+                    "run_ref": version["run_ref"],
+                    "version_ref": version["version_ref"],
+                    "version_label": version["version_label"],
+                    "output_root": output_root,
+                    "artifact_path": version["artifact_path"],
+                },
+                timestamp,
+            )
+            inspection_ref = new_ref("artifact_inspection")
+            db.execute(
+                """INSERT INTO training_artifact_inspections(
+                inspection_ref,artifact_id,node_id,command_ref,status,availability,
+                requested_by,created_at,updated_at)
+                VALUES(?,?,?,?,'queued','unchecked',?,?,?)""",
+                (
+                    inspection_ref,
+                    version["artifact_id"],
+                    node["id"],
+                    command_ref,
+                    actor,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            db.execute(
+                """INSERT INTO training_idempotency(
+                scope,idempotency_key,payload_sha256,response_ref,created_at)
+                VALUES('artifact_inspection',?,?,?,?)""",
+                (idempotency_key, digest, inspection_ref, timestamp),
+            )
+            self._audit(
+                db,
+                actor,
+                "model.version_artifact_check_requested",
+                version_ref,
+                {"inspection_ref": inspection_ref},
+                timestamp,
+            )
+            return self._get_artifact_inspection_in(db, inspection_ref)
+
+    def _get_artifact_inspection_in(
+        self, db: sqlite3.Connection, inspection_ref: str
+    ) -> dict[str, Any]:
+        row = db.execute(
+            """SELECT inspection.*,artifact.artifact_ref,version.version_ref
+            FROM training_artifact_inspections AS inspection
+            JOIN training_artifacts AS artifact ON artifact.id=inspection.artifact_id
+            JOIN model_versions AS version ON version.id=artifact.version_id
+            WHERE inspection.inspection_ref=?""",
+            (inspection_ref,),
+        ).fetchone()
+        if row is None:
+            raise TrainingNotFoundError(
+                "artifact_inspection_not_found", "The artifact check was not found."
+            )
+        return self._safe_artifact_inspection(row)
+
+    @staticmethod
+    def _safe_artifact_inspection(row: sqlite3.Row) -> dict[str, Any]:
+        availability = (
+            "checking"
+            if row["status"] in {"queued", "running"}
+            else "check_failed"
+            if row["status"] == "failed"
+            else row["availability"]
+        )
+        return {
+            "inspection_ref": row["inspection_ref"],
+            "artifact_ref": row["artifact_ref"],
+            "version_ref": row["version_ref"],
+            "status": row["status"],
+            "availability": availability,
+            "availability_status": availability,
+            "file_count": row["file_count"],
+            "total_bytes": row["total_bytes"],
+            "message": row["error_message"],
+            "created_at": row["created_at"],
+            "requested_at": row["created_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
 
     def _get_run_in(self, db: sqlite3.Connection, run_ref: str) -> dict[str, Any]:
         row = db.execute(
@@ -3965,6 +4428,13 @@ class TrainingStore:
                     updated_at=? WHERE id=?""",
                     (timestamp, command["id"]),
                 )
+                if command["kind"] == "inspect_training_artifact":
+                    db.execute(
+                        """UPDATE training_artifact_inspections
+                        SET status='queued',availability='unchecked',started_at=NULL,
+                        updated_at=? WHERE command_ref=? AND status='running'""",
+                        (timestamp, command["command_ref"]),
+                    )
             rows = db.execute(
                 """SELECT * FROM training_node_commands AS candidate
                 WHERE candidate.node_id=? AND candidate.status='queued'
@@ -4016,6 +4486,13 @@ class TrainingStore:
                         row["id"],
                     ),
                 ).rowcount:
+                    if row["kind"] == "inspect_training_artifact":
+                        db.execute(
+                            """UPDATE training_artifact_inspections
+                            SET status='running',started_at=COALESCE(started_at,?),updated_at=?
+                            WHERE command_ref=? AND status='queued'""",
+                            (timestamp, timestamp, row["command_ref"]),
+                        )
                     claimed.append(
                         {
                             "command_ref": row["command_ref"],
@@ -4210,6 +4687,52 @@ class TrainingStore:
             ).rowcount
             if updated:
                 self._event(db, "dataset.transfer.updated", None, {"transfer_ref": request["transfer_ref"], "status": terminal_status}, timestamp)
+        elif command["kind"] == "inspect_training_artifact":
+            inspection = db.execute(
+                """SELECT inspection.*,artifact.version_id,version.version_ref
+                FROM training_artifact_inspections AS inspection
+                JOIN training_artifacts AS artifact ON artifact.id=inspection.artifact_id
+                JOIN model_versions AS version ON version.id=artifact.version_id
+                WHERE inspection.command_ref=?""",
+                (command["command_ref"],),
+            ).fetchone()
+            if inspection is None:
+                return
+            allowed = {"available", "missing", "unreadable", "unsafe", "check_failed"}
+            availability = data.get("availability")
+            if final != "succeeded" or availability not in allowed:
+                status = "failed"
+                availability = "check_failed"
+            else:
+                status = "succeeded"
+            reason = data.get("reason")
+            db.execute(
+                """UPDATE training_artifact_inspections SET status=?,availability=?,
+                file_count=?,total_bytes=?,error_code=?,error_message=?,finished_at=?,updated_at=?
+                WHERE id=?""",
+                (
+                    status,
+                    availability,
+                    data.get("file_count"),
+                    data.get("total_bytes"),
+                    error.get("code") if status == "failed" else reason,
+                    error.get("message") if status == "failed" else None,
+                    timestamp,
+                    timestamp,
+                    inspection["id"],
+                ),
+            )
+            self._event(
+                db,
+                "model.version.artifact.updated",
+                None,
+                {
+                    "version_ref": inspection["version_ref"],
+                    "status": status,
+                    "availability": availability,
+                },
+                timestamp,
+            )
 
     @staticmethod
     def _insert_node_command(db: sqlite3.Connection, node: sqlite3.Row, kind: str, request: dict[str, Any], timestamp: str) -> str:

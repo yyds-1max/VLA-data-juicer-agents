@@ -34,6 +34,10 @@ import type {
   TrainingDatasetSelection,
   TrainingParameterDefinition,
   TrainingLaunchTemplate,
+  TrainingArtifactInspection,
+  TrainingModelVersionDetail,
+  TrainingModelVersionFamily,
+  TrainingModelVersionSummary,
 } from "./types";
 
 function sessionPath(sessionId: string): string {
@@ -336,6 +340,43 @@ export async function listTrainingModels(): Promise<TrainingModel[]> {
 export async function getTrainingModel(familyRef: string): Promise<TrainingModel> {
   const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(familyRef)}`);
   return data.model;
+}
+
+export interface TrainingModelVersionFamilyPage {
+  families: TrainingModelVersionFamily[];
+  next_after: string | null;
+}
+
+export async function listTrainingModelVersionFamilies(options: { query?: string; after?: string; limit?: number } = {}): Promise<TrainingModelVersionFamilyPage> {
+  const query = new URLSearchParams();
+  if (options.query?.trim()) query.set("query", options.query.trim());
+  if (options.after) query.set("after", options.after);
+  query.set("limit", String(options.limit ?? 20));
+  return requestJson<TrainingModelVersionFamilyPage>(`${trainingPath}/model-version-families?${query}`);
+}
+
+export interface TrainingModelVersionPage {
+  versions: TrainingModelVersionSummary[];
+  next_after: string | null;
+}
+
+export async function listTrainingModelVersions(familyRef: string, options: { after?: string; limit?: number } = {}): Promise<TrainingModelVersionPage> {
+  const query = new URLSearchParams();
+  if (options.after) query.set("after", options.after);
+  query.set("limit", String(options.limit ?? 6));
+  return requestJson<TrainingModelVersionPage>(`${trainingPath}/model-version-families/${encodeURIComponent(familyRef)}/versions?${query}`);
+}
+
+export async function getTrainingModelVersion(versionRef: string): Promise<TrainingModelVersionDetail> {
+  const data = await requestJson<{ version: TrainingModelVersionDetail }>(`${trainingPath}/model-versions/${encodeURIComponent(versionRef)}`);
+  return data.version;
+}
+
+export async function inspectTrainingModelVersionArtifact(versionRef: string): Promise<{ inspection: TrainingArtifactInspection; version?: TrainingModelVersionDetail }> {
+  return requestJson<{ inspection: TrainingArtifactInspection; version?: TrainingModelVersionDetail }>(`${trainingPath}/model-versions/${encodeURIComponent(versionRef)}/artifact-checks`, {
+    method: "POST",
+    headers: { "Idempotency-Key": requestIdempotencyKey() },
+  });
 }
 
 export type TrainingModelConfigurationInput = {

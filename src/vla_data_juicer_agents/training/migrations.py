@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_TRAINING_SCHEMA_VERSION = 12
+LATEST_TRAINING_SCHEMA_VERSION = 13
 
 
 def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str) -> None:
@@ -111,6 +111,14 @@ def apply_training_migrations(connection: sqlite3.Connection, *, applied_at: str
         connection.execute(
             "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(12,?,?)",
             ("real_training_execution_m12", applied_at),
+        )
+        connection.commit()
+        versions.append(12)
+    if 13 not in versions:
+        connection.executescript(_MIGRATION_013)
+        connection.execute(
+            "INSERT INTO training_schema_migrations(version,name,applied_at) VALUES(13,?,?)",
+            ("model_version_library_m13", applied_at),
         )
         connection.commit()
 
@@ -780,6 +788,87 @@ CREATE TABLE training_run_log_storage (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES training_runs(id) ON DELETE CASCADE
 );
+
+COMMIT;
+"""
+
+
+_MIGRATION_013 = """
+BEGIN IMMEDIATE;
+
+-- SQLite cannot extend a CHECK constraint in place. Rebuild the generic
+-- Worker command table while preserving queued/running commands and claims.
+DROP INDEX idx_training_node_commands_claim;
+ALTER TABLE training_node_commands RENAME TO training_node_commands_m12;
+CREATE TABLE training_node_commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  command_ref TEXT NOT NULL UNIQUE,
+  node_id INTEGER,
+  node_ref_snapshot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'list_directories','transfer_dataset','cancel_dataset_transfer',
+    'remove_dataset_replica','inspect_training_artifact'
+  )),
+  status TEXT NOT NULL CHECK(status IN (
+    'queued','running','succeeded','failed','cancelled'
+  )),
+  request_json TEXT NOT NULL,
+  result_json TEXT,
+  worker_instance_id TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL,
+  claim_token_sha256 TEXT,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL
+);
+INSERT INTO training_node_commands(
+  id,command_ref,node_id,node_ref_snapshot,kind,status,request_json,result_json,
+  worker_instance_id,lease_expires_at,created_at,started_at,finished_at,
+  updated_at,claim_token_sha256
+)
+SELECT id,command_ref,node_id,node_ref_snapshot,kind,status,request_json,result_json,
+  worker_instance_id,lease_expires_at,created_at,started_at,finished_at,
+  updated_at,claim_token_sha256
+FROM training_node_commands_m12;
+DROP TABLE training_node_commands_m12;
+CREATE INDEX idx_training_node_commands_claim
+  ON training_node_commands(node_id,status,id);
+
+CREATE TABLE training_artifact_inspections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  inspection_ref TEXT NOT NULL UNIQUE,
+  artifact_id INTEGER NOT NULL,
+  node_id INTEGER,
+  command_ref TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK(status IN (
+    'queued','running','succeeded','failed'
+  )),
+  availability TEXT NOT NULL CHECK(availability IN (
+    'unchecked','available','missing','unreadable','unsafe','check_failed'
+  )),
+  file_count INTEGER CHECK(file_count IS NULL OR file_count >= 0),
+  total_bytes INTEGER CHECK(total_bytes IS NULL OR total_bytes >= 0),
+  error_code TEXT,
+  error_message TEXT,
+  requested_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  FOREIGN KEY(artifact_id) REFERENCES training_artifacts(id) ON DELETE CASCADE,
+  FOREIGN KEY(node_id) REFERENCES training_nodes(id) ON DELETE SET NULL,
+  FOREIGN KEY(command_ref) REFERENCES training_node_commands(command_ref)
+);
+CREATE INDEX idx_training_artifact_inspections_artifact
+  ON training_artifact_inspections(artifact_id,id DESC);
+CREATE UNIQUE INDEX idx_training_artifact_inspections_active
+  ON training_artifact_inspections(artifact_id)
+  WHERE status IN ('queued','running');
+
+CREATE INDEX idx_metric_samples_run_stage_seq
+  ON metric_samples(run_id,stage_id,seq DESC);
 
 COMMIT;
 """

@@ -539,7 +539,7 @@ def test_central_run_log_limit_appends_one_truncation_marker(
     ]
 
 
-def test_v11_database_upgrades_to_v12_and_reopens(tmp_path: Path) -> None:
+def test_v11_database_upgrades_through_v13_and_reopens(tmp_path: Path) -> None:
     path = tmp_path / "training-v11.sqlite"
     names = [
         "training_platform_m1",
@@ -572,7 +572,7 @@ def test_v11_database_upgrades_to_v12_and_reopens(tmp_path: Path) -> None:
     with sqlite3.connect(path) as db:
         assert db.execute(
             "SELECT MAX(version) FROM training_schema_migrations"
-        ).fetchone()[0] == 12
+        ).fetchone()[0] == 13
         columns = {
             row[1] for row in db.execute("PRAGMA table_info(training_runs)")
         }
@@ -582,6 +582,9 @@ def test_v11_database_upgrades_to_v12_and_reopens(tmp_path: Path) -> None:
         ).fetchone() is not None
         assert db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='training_run_log_storage'"
+        ).fetchone() is not None
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='training_artifact_inspections'"
         ).fetchone() is not None
 
 

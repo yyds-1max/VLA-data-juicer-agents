@@ -413,6 +413,8 @@ export interface TrainingModel {
   /** Admin-only optimistic concurrency token; never displayed as a model version. */
   edit_revision?: number;
   trained_version_count: number;
+  /** Successful real-training versions with a recorded version model artifact. */
+  available_version_count?: number;
   data_access_mode?: TrainingDataAccessMode;
   created_at: string;
   updated_at: string;
@@ -429,6 +431,75 @@ export interface TrainingModel {
       detail: string;
     }>;
   };
+}
+
+export type TrainingArtifactAvailabilityStatus =
+  | "unchecked"
+  | "checking"
+  | "available"
+  | "missing"
+  | "unreadable"
+  | "unsafe"
+  | "check_failed";
+
+export interface TrainingVersionArtifact {
+  artifact_ref: string;
+  status: TrainingArtifactAvailabilityStatus;
+  file_count?: number | null;
+  total_bytes?: number | null;
+  checked_at?: string | null;
+  message?: string | null;
+  /** Only principals allowed to create runs receive the physical node path. */
+  path?: string | null;
+}
+
+export interface TrainingModelVersionSummary {
+  version_ref: string;
+  family_ref: string;
+  family_name: string;
+  version_number: number;
+  version_label: string;
+  run_ref: string;
+  server_ref: string;
+  server_name?: string | null;
+  gpu_uuids: string[];
+  version_description?: string | null;
+  finished_at?: string | null;
+  duration_seconds?: number | null;
+  stage_count: number;
+  final_step?: number | null;
+  final_loss?: number | null;
+  final_learning_rate?: number | null;
+  train_date_count: number;
+  test_date_count: number;
+  checkpoint_count: number;
+  default_artifact: TrainingVersionArtifact;
+  node_status?: TrainingNodeStatus | null;
+  artifact_inspection_supported?: boolean;
+}
+
+export interface TrainingModelVersionFamily {
+  family_ref: string;
+  family_name: string;
+  available_version_count: number;
+  latest_version?: Pick<TrainingModelVersionSummary, "version_ref" | "version_label" | "version_description" | "finished_at"> | null;
+}
+
+export interface TrainingModelVersionDetail extends TrainingModelVersionSummary {
+  dataset_snapshot?: Record<string, unknown> | null;
+  stages: TrainingStage[];
+  artifacts: TrainingArtifact[];
+}
+
+export interface TrainingArtifactInspection {
+  inspection_ref: string;
+  artifact_ref: string;
+  version_ref: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  availability_status?: TrainingArtifactAvailabilityStatus | null;
+  requested_at?: string | null;
+  finished_at?: string | null;
+  message?: string | null;
 }
 
 export interface TrainingGpuResource {
@@ -772,7 +843,7 @@ export interface TrainingStage {
 
 export interface TrainingEvent {
   event_id: number;
-  type: "run.updated" | "run.log.appended" | "run.metric.appended" | "dataset.transfer.updated" | "dataset.replica.ready" | "dataset.replica.removed";
+  type: "run.updated" | "run.log.appended" | "run.metric.appended" | "dataset.transfer.updated" | "dataset.replica.ready" | "dataset.replica.removed" | "model.version.artifact.updated";
   run_ref?: string;
   transfer_ref?: string;
   replica_ref?: string;

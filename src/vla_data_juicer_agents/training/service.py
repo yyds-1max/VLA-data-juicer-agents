@@ -12,6 +12,7 @@ from .auth import (
     TRAINING_MANAGE_MODELS,
     TRAINING_MANAGE_NODES,
     TRAINING_STOP_RUNS,
+    TRAINING_VIEW,
 )
 from .datasets import DatasetReleaseCatalog, PublishedDatasetCatalog
 from .errors import (
@@ -479,6 +480,53 @@ class TrainingService:
             self.store.get_model(family_ref, include_private=include_private)
         )
 
+    def list_model_version_families(
+        self,
+        *,
+        query: str | None,
+        after: str | None,
+        limit: int,
+        principal: Any,
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_VIEW)
+        return self.store.list_model_version_families(
+            query=query, after=after, limit=limit
+        )
+
+    def list_model_versions(
+        self,
+        family_ref: str,
+        *,
+        after: str | None,
+        limit: int,
+        principal: Any,
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_VIEW)
+        return self.store.list_model_versions(
+            family_ref, after=after, limit=limit
+        )
+
+    def get_model_version(
+        self, version_ref: str, principal: Any
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_VIEW)
+        return self.store.get_model_version(version_ref)
+
+    def request_model_version_artifact_inspection(
+        self,
+        version_ref: str,
+        idempotency_key: str,
+        principal: Any,
+    ) -> dict[str, Any]:
+        self._require(principal, TRAINING_CREATE_RUNS)
+        version = self.store.get_model_version(version_ref)
+        self._require_worker_feature(
+            str(version["server_ref"]), "training_artifact_inspection_v1"
+        )
+        return self.store.request_model_version_artifact_inspection(
+            version_ref, idempotency_key, principal.subject
+        )
+
     def create_model(self, payload: Any, principal: Any) -> dict[str, Any]:
         self._require(principal, TRAINING_MANAGE_MODELS)
         data = self._adapt_model(self._data(payload))
@@ -681,13 +729,16 @@ class TrainingService:
         return self.store.remove_dataset_replica(replica_ref, principal.subject)
 
     def _require_dataset_worker_feature(self, node_ref: str, feature: str) -> None:
+        self._require_worker_feature(node_ref, feature)
+
+    def _require_worker_feature(self, node_ref: str, feature: str) -> None:
         node = self.store.get_node(node_ref)
         capabilities = node.get("capabilities") or {}
         features = capabilities.get("worker_features") or []
-        if feature not in features:
+        if capabilities.get(feature) is not True and feature not in features:
             raise TrainingConflictError(
                 "training_worker_update_required",
-                "Update the Training Worker before using managed training data.",
+                "Update the Training Worker before using this training feature.",
                 current={"node_ref": node_ref, "required_feature": feature},
             )
 

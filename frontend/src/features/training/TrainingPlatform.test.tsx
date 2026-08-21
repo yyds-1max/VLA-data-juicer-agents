@@ -4,7 +4,7 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as trainingApi from "../../api/client";
-import type { TrainingCapabilities, TrainingDatasetTransfer, TrainingEvent, TrainingModel, TrainingNode, TrainingRun, TrainingRunLog, TrainingServer, TrainingServerResources } from "../../api/types";
+import type { TrainingCapabilities, TrainingDatasetTransfer, TrainingEvent, TrainingModel, TrainingModelVersionDetail, TrainingModelVersionFamily, TrainingModelVersionSummary, TrainingNode, TrainingRun, TrainingRunLog, TrainingServer, TrainingServerResources } from "../../api/types";
 import { validateParameterDefinitions } from "./ParameterDefinitionEditor";
 import { datasetTransferDestination, TrainingDatasetTransferMonitor } from "./TrainingDatasetTransferDialog";
 import { TrainingPlatform } from "./TrainingPlatform";
@@ -25,6 +25,7 @@ vi.mock("../../api/client", () => ({
   listTrainingDatasetReleases: vi.fn(), listTrainingDatasetReplicas: vi.fn(), requestTrainingDirectoryListing: vi.fn(), getTrainingDirectoryListing: vi.fn(),
   createTrainingDatasetTransfers: vi.fn(), listTrainingDatasetTransfers: vi.fn(), getTrainingDatasetTransfer: vi.fn(), pauseTrainingDatasetTransfer: vi.fn(), cancelTrainingDatasetTransfer: vi.fn(), retryTrainingDatasetTransfer: vi.fn(), removeTrainingDatasetReplica: vi.fn(),
   getTrainingRunLogs: vi.fn(), getTrainingRunMetrics: vi.fn(), stopTrainingRun: vi.fn(),
+  listTrainingModelVersionFamilies: vi.fn(), listTrainingModelVersions: vi.fn(), getTrainingModelVersion: vi.fn(), inspectTrainingModelVersionArtifact: vi.fn(),
   openTrainingEvents: vi.fn(),
 }));
 
@@ -44,6 +45,19 @@ const runningStage = { stage_ref: "stage-1", stage_number: 1, stage_name: "第�
 const runningRun: TrainingRun = { run_ref: "run-running", family_ref: "navila-family", family_name: "NaVILA", version_ref: "version-1", version_number: 1, version_date: "20260806", version_label: "v1-20260806", version_description: "加入 8 月新增数据，并调整轨迹损失权重。", status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, stage_count: 1, current_stage_number: 1, stages: [runningStage], created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", version_ref: "version-2", version_number: 2, version_label: "v2-20260806", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20, stages: [{ ...runningStage, status: "succeeded", progress_percent: 100, current_step: 20 }] };
 const pendingNode: TrainingNode = { node_ref: "node-test", name: "测试训练节点", description: "", address: "10.0.0.12", ssh_port: 2222, ssh_username: null, status: "pending_enrollment", state_revision: 1, heartbeat_revision: 0, created_at: "2026-08-12T00:00:00Z", updated_at: "2026-08-12T00:00:00Z" };
+const versionSummary: TrainingModelVersionSummary = {
+  version_ref: "version-real-7", family_ref: "navila-family", family_name: "NaVILA", version_number: 7, version_label: "v7-20260820", run_ref: "run-real-7",
+  server_ref: "node-test", server_name: "NaVILA 测试训练节点", gpu_uuids: ["GPU-2", "GPU-3"], version_description: "加入 8 月数据并调整轨迹损失权重。",
+  finished_at: "2026-08-20T09:10:00Z", duration_seconds: 3720, stage_count: 2, final_step: 100, final_loss: 0.12, final_learning_rate: 0.00001,
+  train_date_count: 3, test_date_count: 1, checkpoint_count: 2, default_artifact: { artifact_ref: "artifact-version-7", status: "available", file_count: 18, total_bytes: 16 * 1024 ** 3, checked_at: "2026-08-20T09:11:00Z", path: "/data/caiji_test/outputs/navila-family/v7-20260820/stage-02" },
+};
+const versionFamily: TrainingModelVersionFamily = { family_ref: "navila-family", family_name: "NaVILA", available_version_count: 7, latest_version: { version_ref: versionSummary.version_ref, version_label: versionSummary.version_label, version_description: versionSummary.version_description, finished_at: versionSummary.finished_at } };
+const versionDetail: TrainingModelVersionDetail = {
+  ...versionSummary,
+  dataset_snapshot: { splits: { train: [{ dataset_date: "20260416" }, { dataset_date: "20260605" }, { dataset_date: "20260623" }], test: [{ dataset_date: "20260526" }] } },
+  stages: [{ ...runningStage, stage_ref: "stage-real-1", stage_number: 1, stage_name: "第一阶段", status: "succeeded", current_step: 100, total_steps: 100 }],
+  artifacts: [{ artifact_ref: "checkpoint-50", kind: "checkpoint", stage_ref: "stage-real-1", stage_number: 1, step: 50, relative_path: "checkpoint-50" }],
+};
 
 class TestResizeObserver {
   observe() {}
@@ -106,6 +120,79 @@ describe("TrainingPlatform", () => {
     expect(screen.getByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
     fireEvent.click(screen.getByRole("button", { name: "← 返回训练任务" }));
     expect(await screen.findByRole("heading", { name: "训练任务" })).toBeVisible();
+  });
+
+  it("presents successful model versions as a collapsed family library with lazy version cards", async () => {
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.listTrainingModelVersionFamilies).mockResolvedValue({ families: [versionFamily], next_after: null });
+    vi.mocked(trainingApi.listTrainingModelVersions).mockResolvedValue({ versions: [versionSummary], next_after: null });
+    renderPlatform();
+
+    await screen.findByRole("tab", { name: "训练任务" });
+    const tabs = screen.getAllByRole("tab").map((tab) => tab.textContent);
+    expect(tabs.slice(0, 6)).toEqual(["训练任务", "模型版本", "训练数据", "模型注册", "训练节点", "服务器资源"]);
+    fireEvent.click(screen.getByRole("tab", { name: "模型版本" }));
+
+    expect(await screen.findByRole("heading", { name: "模型版本" })).toBeVisible();
+    const familyButton = await screen.findByRole("button", { name: /NaVILA/ });
+    expect(familyButton).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("最终训练 Loss")).not.toBeInTheDocument();
+    fireEvent.click(familyButton);
+
+    expect(await screen.findByText("最终训练 Loss")).toBeVisible();
+    expect(screen.getByText("0.12")).toBeVisible();
+    expect(screen.getByText("训练 3 · 测试 1")).toBeVisible();
+    expect(screen.queryByText("真实训练")).not.toBeInTheDocument();
+    expect(screen.queryByText("模拟训练")).not.toBeInTheDocument();
+    expect(trainingApi.listTrainingModelVersions).toHaveBeenCalledWith("navila-family", { after: undefined, limit: 6 });
+  });
+
+  it("opens a model-version deep link, checks a stale artifact, and links to the original run", async () => {
+    mockApi(adminCapabilities, [model]);
+    const unchecked = { ...versionDetail, default_artifact: { ...versionDetail.default_artifact, status: "unchecked" as const, checked_at: null } };
+    vi.mocked(trainingApi.getTrainingModelVersion).mockResolvedValue(unchecked);
+    vi.mocked(trainingApi.inspectTrainingModelVersionArtifact).mockResolvedValue({ inspection: { inspection_ref: "inspection-1", artifact_ref: "artifact-version-7", version_ref: "version-real-7", status: "succeeded", availability_status: "available" }, version: versionDetail });
+    vi.mocked(trainingApi.getTrainingRun).mockResolvedValue({ ...succeededRun, run_ref: "run-real-7" });
+    vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
+    vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
+    renderPlatform("/model/versions/version-real-7");
+
+    expect(await screen.findByRole("heading", { name: "NaVILA v7-20260820" })).toBeVisible();
+    await waitFor(() => expect(trainingApi.inspectTrainingModelVersionArtifact).toHaveBeenCalledWith("version-real-7"));
+    expect(await screen.findByText("16 GiB")).toBeVisible();
+    expect(screen.getByText("20260416")).toBeVisible();
+    expect(screen.getByText("checkpoint-50")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: /查看原训练任务/ }));
+    expect(screen.getByTestId("location-path")).toHaveTextContent("/model/runs/run-real-7");
+    expect(screen.getByRole("tab", { name: "训练任务" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps physical artifact paths hidden for a read-only version viewer", async () => {
+    mockApi(readonlyCapabilities, [model]);
+    vi.mocked(trainingApi.getTrainingModelVersion).mockResolvedValue({ ...versionDetail, default_artifact: { ...versionDetail.default_artifact, path: null } });
+    renderPlatform("/model/versions/version-real-7");
+
+    expect(await screen.findByText("当前权限不显示训练节点物理路径。")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "重新检查" })).not.toBeInTheDocument();
+    expect(trainingApi.inspectTrainingModelVersionArtifact).not.toHaveBeenCalled();
+  });
+
+  it("leaves a model-version deep link when switching tabs and does not reopen it after polling", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.getTrainingModelVersion).mockResolvedValue(versionDetail);
+    vi.mocked(trainingApi.inspectTrainingModelVersionArtifact).mockResolvedValue({ inspection: { inspection_ref: "inspection-tab-switch", artifact_ref: "artifact-version-7", version_ref: "version-real-7", status: "succeeded", availability_status: "available" }, version: versionDetail });
+    renderPlatform("/model/versions/version-real-7");
+    expect(await screen.findByRole("heading", { name: "NaVILA v7-20260820" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+    expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
+    expect(screen.getByRole("tab", { name: "模型注册" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("heading", { name: "NaVILA v7-20260820" })).not.toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    expect(screen.getByRole("tab", { name: "模型注册" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("heading", { name: "NaVILA v7-20260820" })).not.toBeInTheDocument();
   });
 
   it("keeps the training-data page mounted when switching training tabs", async () => {
@@ -803,7 +890,7 @@ describe("TrainingPlatform", () => {
     renderPlatform();
     fireEvent.click(await screen.findByRole("tab", { name: "模型注册" }));
 
-    expect(screen.getByText("已训练 2 个模型版本 · 当前训练定义")).toBeVisible();
+    expect(screen.getByText("可用 2 个模型版本 · 当前训练定义")).toBeVisible();
     expect(screen.queryByRole("button", { name: "登记新版本" })).not.toBeInTheDocument();
     expect(screen.queryByText("配置已冻结")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "编辑模型配置" }));
@@ -1077,7 +1164,7 @@ describe("TrainingPlatform", () => {
     const modelsTab = screen.getByRole("tab", { name: "模型注册" });
     fireEvent.click(modelsTab);
     await waitFor(() => expect(modelsTab).toHaveAttribute("aria-selected", "true"));
-    expect(screen.getByText("已训练 1 个模型版本 · 当前训练定义")).toBeVisible();
+    expect(screen.getByText("可用 1 个模型版本 · 当前训练定义")).toBeVisible();
     expect(screen.getByRole("button", { name: "编辑模型配置" })).toBeVisible();
   });
 

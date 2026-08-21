@@ -72,6 +72,8 @@ def test_enrollment_capabilities_explicitly_advertise_real_training() -> None:
 
     assert payload["training_execution_v1"] is True
     assert "training_execution_v1" in payload["worker_features"]
+    assert payload["training_artifact_inspection_v1"] is True
+    assert "training_artifact_inspection_v1" in payload["worker_features"]
 
 
 def test_worker_identity_rejects_symlink(tmp_path: Path) -> None:
@@ -281,6 +283,7 @@ def test_daemon_health_payload_has_no_secret_and_advertises_fixed_execution(tmp_
     assert payload["health"]["execution_enabled"] is True  # type: ignore[index]
     assert payload["capabilities"]["training_execution"] is True  # type: ignore[index]
     assert payload["capabilities"]["training_execution_v1"] is True  # type: ignore[index]
+    assert payload["capabilities"]["training_artifact_inspection_v1"] is True  # type: ignore[index]
     assert payload["capabilities"]["arbitrary_command_execution"] is False  # type: ignore[index]
     assert identity.credential not in serialized
 

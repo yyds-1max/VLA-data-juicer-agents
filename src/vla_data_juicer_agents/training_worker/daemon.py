@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Callable
 
+from .artifacts import ArtifactInspectionError, inspect_training_artifact
 from .client import CenterClientError, OfflineCenterClient, WorkerCenterClient
 from .datasets import (
     DatasetCommandError,
@@ -89,6 +90,7 @@ class TrainingWorkerDaemon:
                 "dataset_transfer_v1": True,
                 "training_execution": True,
                 "training_execution_v1": True,
+                "training_artifact_inspection_v1": True,
                 "arbitrary_command_execution": False,
             },
             "resources": resource_payload,
@@ -198,6 +200,28 @@ class TrainingWorkerDaemon:
                         "The Worker could not remove the dataset replica.",
                     )
                 )
+            self.center_client.publish_command_result(
+                self.identity,
+                command_ref,
+                {"claim_token": claim_token, **result},
+            )
+            return
+        if kind == "inspect_training_artifact":
+            try:
+                result = inspect_training_artifact(command_payload)
+            except ArtifactInspectionError as exc:
+                result = {
+                    "status": "failed",
+                    "error": {"code": exc.code, "message": exc.message},
+                }
+            except Exception:
+                result = {
+                    "status": "failed",
+                    "error": {
+                        "code": "artifact_inspection_failed",
+                        "message": "The Worker could not inspect the artifact.",
+                    },
+                }
             self.center_client.publish_command_result(
                 self.identity,
                 command_ref,

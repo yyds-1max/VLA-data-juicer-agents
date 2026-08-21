@@ -519,6 +519,7 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
         "cuda_version": None,
         "conda_environments": [],
         "training_execution_v1": True,
+        "training_artifact_inspection_v1": True,
         "worker_features": [
             "resource_inventory",
             "restart_reconciliation",
@@ -526,6 +527,7 @@ def _capability_payload(resources: Mapping[str, object]) -> dict[str, object]:
             "directory_browser_v1",
             "dataset_transfer_v1",
             "training_execution_v1",
+            "training_artifact_inspection_v1",
         ],
     }
 

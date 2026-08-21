@@ -310,7 +310,8 @@ def test_training_migration_initializes_once_and_is_repeatable(tmp_path: Path) -
         (9, "training_datasets_m9"),
         (10, "training_node_command_claim_tokens_m10"),
         (11, "dataset_transfer_pause_cancel_m11"),
-        (LATEST_TRAINING_SCHEMA_VERSION, "real_training_execution_m12"),
+        (12, "real_training_execution_m12"),
+        (LATEST_TRAINING_SCHEMA_VERSION, "model_version_library_m13"),
     ]
 
 
